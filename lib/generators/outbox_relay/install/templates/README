@@ -1,0 +1,39 @@
+===============================================================================
+
+OutboxRelay has been installed! 🎉
+
+Next steps:
+
+1. Run migrations:
+   rails db:migrate
+
+2. Configure your topics and consumer groups in config/outbox_consumers.yml
+   - Define topics with partition counts
+   - Configure consumer groups with their consumer classes
+
+3. Create consumer classes that inherit from OutboxRelay::OutboxConsumer:
+
+   class MyConsumer < OutboxRelay::OutboxConsumer
+     def initialize(partition_key:)
+       super(
+         consumer_group: "my_group",
+         topic: "my_topic",
+         partition_key: partition_key
+       )
+     end
+
+     def consume_message(event)
+       # Process event
+     end
+   end
+
+4. Start the supervisor:
+   bundle exec rake outbox_relay:start
+
+5. Monitor status:
+   bundle exec rake outbox_relay:status
+   bundle exec rake outbox_relay:lag
+
+For more information, see: https://github.com/splash-brands/outbox-relay
+
+===============================================================================

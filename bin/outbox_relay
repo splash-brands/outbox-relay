@@ -1,0 +1,35 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# OutboxRelay executable wrapper with macOS fork-safety support
+#
+# This wrapper automatically sets required environment variables on macOS
+# before launching the OutboxRelay CLI. This is necessary because:
+#
+# 1. OBJC_DISABLE_INITIALIZE_FORK_SAFETY must be set BEFORE the Ruby process starts
+#    - Cannot be set programmatically in Ruby code
+#    - Must be in the shell environment when process launches
+#    - Required to prevent Objective-C fork-safety crashes on macOS
+#
+# 2. PGGSSENCMODE=disable prevents PostgreSQL GSS/Kerberos segfaults
+#    - Can be set programmatically but cleaner to set here
+#    - Prevents fork-related crashes in PostgreSQL connection
+
+# Detect macOS and set environment variables if not already set
+if RUBY_PLATFORM.include?("darwin")
+  ENV["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] ||= "YES"
+  ENV["PGGSSENCMODE"] ||= "disable"
+  
+  # Re-execute with proper environment if this is the first run
+  unless ENV["OUTBOX_RELAY_ENV_CONFIGURED"]
+    ENV["OUTBOX_RELAY_ENV_CONFIGURED"] = "1"
+    Kernel.exec(ENV, $PROGRAM_NAME, *ARGV)
+  end
+end
+
+# Load the gem
+$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+require "outbox_relay"
+
+# Run the CLI
+OutboxRelay::CLI.start(ARGV)

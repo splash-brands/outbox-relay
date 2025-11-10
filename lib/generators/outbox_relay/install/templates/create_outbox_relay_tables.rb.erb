@@ -1,0 +1,131 @@
+# frozen_string_literal: true
+
+class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Migration.current_version %>]
+  def change
+    # ============================================================================
+    # OUTBOX EVENTS TABLE
+    # ============================================================================
+    # Immutable event log - events are facts that exist, they don't have states
+    # Consumer groups track their own progress via offsets and DLQ
+
+    create_table(:outbox_relay_outbox_events) do |t|
+      # Event identification
+      t.string(:topic, null: false, index: true)
+      t.string(:event_name, index: true)
+      t.uuid(:event_id, null: false, default: -> { "gen_random_uuid()" })
+
+      # Event data (immutable)
+      t.jsonb(:payload, null: false, default: {})
+      t.jsonb(:headers, default: {})
+
+      # Ordering & partitioning
+      t.bigint(:sequence, null: false)
+      t.integer(:partition_key, null: false, default: 0)
+
+      # Expiration (optional TTL)
+      t.timestamp(:expires_at)
+
+      # Timestamps
+      t.timestamps(null: false)
+    end
+
+    # Indices for efficient queries
+    add_index(:outbox_relay_outbox_events, [:topic, :sequence], name: "idx_outbox_relay_topic_ordering")
+    add_index(:outbox_relay_outbox_events, [:partition_key, :sequence], name: "idx_outbox_partition_ordering")
+    add_index(:outbox_relay_outbox_events, :event_id, unique: true)
+    add_index(:outbox_relay_outbox_events, :expires_at, where: "expires_at IS NOT NULL")
+
+    # Sequence generator for globally ordered events
+    safety_assured do
+      execute(<<~SQL)
+        CREATE SEQUENCE IF NOT EXISTS outbox_relay_outbox_events_sequence START 1;
+      SQL
+    end
+
+    # ============================================================================
+    # CONSUMER OFFSETS TABLE
+    # ============================================================================
+    # Each consumer group tracks its progress independently (like Kafka offsets)
+    # NOTE: Partition is included in consumer_group name (e.g., "notifications_p0")
+
+    create_table(:outbox_relay_consumer_offsets) do |t|
+      # Consumer identification
+      t.string(:consumer_group, null: false)
+      t.string(:topic, null: false)
+
+      # Offset tracking
+      t.bigint(:last_consumed_sequence, null: false, default: 0)
+      t.uuid(:last_consumed_event_id)
+
+      # Processing state
+      t.timestamp(:last_consumed_at)
+      t.string(:consumer_instance_id)
+      t.timestamp(:heartbeat_at)
+
+      t.timestamps(null: false)
+    end
+
+    # Unique constraint: one offset per (consumer_group, topic)
+    add_index(
+      :outbox_relay_consumer_offsets,
+      [:consumer_group, :topic],
+      unique: true,
+      name: "idx_consumer_offset_unique"
+    )
+
+    # Index for heartbeat monitoring
+    add_index(
+      :outbox_relay_consumer_offsets,
+      [:consumer_instance_id, :heartbeat_at],
+      name: "idx_consumer_heartbeat"
+    )
+
+    # ============================================================================
+    # DEAD LETTER QUEUE TABLE
+    # ============================================================================
+    # Per-consumer-group failure tracking
+    # Events don't fail - consumers fail to process events
+
+    create_table(:outbox_relay_dead_letter_events) do |t|
+      # Reference to original event
+      t.references(:outbox_relay_outbox_event, foreign_key: true, index: true)
+
+      # Consumer that failed (per-consumer-group tracking)
+      t.string(:consumer_group, null: false, index: true)
+      t.string(:consumer_class)
+
+      # Failure details
+      t.integer(:total_retries, null: false, default: 0)
+      t.text(:error_message)
+      t.text(:error_backtrace)
+      t.jsonb(:error_context)
+
+      # Original event snapshot (for debugging)
+      t.string(:original_topic)
+      t.string(:original_event_name)
+      t.jsonb(:original_payload)
+      t.jsonb(:original_headers)
+
+      # Resolution tracking
+      # States: retrying, unresolved, resolved, reprocessed, ignored
+      t.string(:resolution_status, default: "retrying")
+      t.text(:resolution_notes)
+      t.timestamp(:resolved_at)
+
+      t.timestamps(null: false)
+    end
+
+    # Composite index for efficient DLQ queries
+    add_index(
+      :outbox_relay_dead_letter_events,
+      [:consumer_group, :outbox_relay_outbox_event_id],
+      name: "idx_dlq_consumer_event"
+    )
+
+    add_index(
+      :outbox_relay_dead_letter_events,
+      [:resolution_status, :created_at],
+      name: "idx_dlq_resolution"
+    )
+  end
+end

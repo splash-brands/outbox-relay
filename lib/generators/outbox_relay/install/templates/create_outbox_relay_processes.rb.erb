@@ -1,0 +1,30 @@
+# frozen_string_literal: true
+
+class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Migration.current_version %>]
+  def change
+    create_table :outbox_relay_processes do |t|
+      # Process identification
+      t.string :kind, null: false # "worker" or "supervisor"
+      t.string :name, null: false # Unique process name (e.g., "worker-abc123")
+      t.integer :pid, null: false # Operating system process ID
+      t.string :hostname # Server hostname (for multi-server deployments)
+
+      # Supervisor relationship
+      t.bigint :supervisor_id # Reference to supervisor process (null for supervisor itself)
+
+      # Health monitoring
+      t.datetime :last_heartbeat_at, null: false # Last time process sent heartbeat
+
+      # Process metadata (JSON)
+      # Stores consumer_class, topic, partition_key, etc.
+      t.text :metadata
+
+      t.timestamps
+
+      # Indexes for efficient queries
+      t.index :last_heartbeat_at # Find dead processes
+      t.index [:name, :supervisor_id], unique: true # Prevent duplicate registrations
+      t.index :supervisor_id # Find all workers for a supervisor
+    end
+  end
+end

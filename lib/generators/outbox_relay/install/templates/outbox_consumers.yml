@@ -1,0 +1,99 @@
+# OutboxRelay Consumer Configuration
+# Hybrid structure: Topics define domain events, Consumer Groups define processing
+#
+# Structure:
+#   topics:
+#     <topic_name>:
+#       partitions: <number>      # How many partitions for parallel processing
+#       description: <string>     # What this topic is for
+#
+#   consumer_groups:
+#     <consumer_group>:
+#       description: <string>     # What this consumer group does
+#       topics:
+#         - name: <topic_name>
+#           class: <class_name>   # Consumer class to handle events
+#           partitions: all | [0, 1, 2]  # Which partitions (defaults to "all")
+
+# ============================================================================
+# TOPICS - Domain Event Definitions
+# ============================================================================
+# Topics represent domain events in your system. Define partitioning here.
+
+topics:
+  # Product Events
+  product_updates:
+    partitions: 4
+    description: "Product update events including visibility changes, price updates, inventory changes, and attribute modifications"
+
+  # Order Events (high volume)
+  order_updates:
+    partitions: 8
+    description: "Order lifecycle events: created, updated, status changes, shipped, cancelled, refunded"
+
+  # Notification Events (low-medium volume)
+  notifications:
+    partitions: 2
+    description: "User notification events: emails, SMS, push notifications, in-app alerts"
+
+# ============================================================================
+# CONSUMER GROUPS - Processing Definitions
+# ============================================================================
+# Consumer groups define who processes which topics and how.
+
+consumer_groups:
+  # Product Processing
+  product_processor:
+    description: "Processes product update events for catalog synchronization"
+    topics:
+      - name: product_updates
+        class: "ProductUpdates::Consumer"
+        partitions: all  # Processes all 4 partitions (0-3)
+
+  # Future consumer groups (examples):
+  #
+  # order_notifications:
+  #   description: "Sends email/SMS notifications for order status changes"
+  #   topics:
+  #     - name: order_updates
+  #       class: "OrderNotifications::Consumer"
+  #       partitions: all
+  #
+  # order_analytics:
+  #   description: "Processes order events for analytics and reporting"
+  #   topics:
+  #     - name: order_updates
+  #       class: "OrderAnalytics::Consumer"
+  #       partitions: [0, 1, 2, 3]  # Process specific partitions for scaling
+
+# ============================================================================
+# Advanced Examples
+# ============================================================================
+#
+# Multiple topics per consumer group:
+# ----------------------------------
+# multi_topic_consumer:
+#   description: "Processes multiple event streams"
+#   topics:
+#     - name: order_updates
+#       class: "MultiProcessor::OrderHandler"
+#       partitions: all
+#     - name: notifications
+#       class: "MultiProcessor::NotificationHandler"
+#       partitions: all
+#
+# Partition-specific consumers (for manual scaling):
+# -------------------------------------------------
+# high_volume_worker_group_a:
+#   description: "High-volume processing - partitions 0-3"
+#   topics:
+#     - name: order_updates
+#       class: "OrderProcessor"
+#       partitions: [0, 1, 2, 3]
+#
+# high_volume_worker_group_b:
+#   description: "High-volume processing - partitions 4-7"
+#   topics:
+#     - name: order_updates
+#       class: "OrderProcessor"
+#       partitions: [4, 5, 6, 7]
