@@ -160,6 +160,17 @@ module OutboxRelay
           severity: severity
         )
       end
+
+      def self.run_error(exception, name:)
+        Instrumentation.message(
+          "process.run_error",
+          "Process run loop exited with error",
+          name: name,
+          error: exception.message,
+          error_class: exception.class.name,
+          severity: "error"
+        )
+      end
     end
 
     module Supervisor
@@ -332,19 +343,6 @@ module OutboxRelay
           "cli.start_error",
           exception,
           severity: "critical"
-        )
-      end
-    end
-
-    module Process
-      def self.run_error(exception, name:)
-        Instrumentation.message(
-          "process.run_error",
-          "Process run loop exited with error",
-          name: name,
-          error: exception.message,
-          error_class: exception.class.name,
-          severity: "error"
         )
       end
     end

@@ -655,8 +655,8 @@ module OutboxRelay
 
   # Handle event processing failure with proper error reporting and state management
   def handle_event_failure(event, error)
-    # Report to Sentry immediately for monitoring
-    report_processing_error_to_sentry(event, error)
+    # Report error to monitoring backend via ActiveSupport::Notifications
+    report_processing_error(event, error)
 
     # Attempt to update event state for retry/DLQ
     update_failed_event_state(event, error)
@@ -665,9 +665,7 @@ module OutboxRelay
     log_critical_state_error(event, error, state_error)
   end
 
-  def report_processing_error_to_sentry(event, error)
-    return unless defined?(Sentry)
-
+  def report_processing_error(event, error)
     # Get current DLQ entry for retry count
     dlq_entry = OutboxRelay::DeadLetterEvent.find_by(
       outbox_relay_outbox_event_id: event.id,
@@ -677,7 +675,7 @@ module OutboxRelay
     OutboxRelay::Instrumentation::Models.error(
       error,
       model: "OutboxConsumer",
-      operation: "build_error_context",
+      operation: "event_processing",
       event_id: event.event_id,
       consumer_group: consumer_group,
       topic: topic,
