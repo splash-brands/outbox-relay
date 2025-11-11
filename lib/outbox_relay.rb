@@ -96,6 +96,7 @@ require "outbox_relay/models/dead_letter_event"
 require "outbox_relay/process"
 
 # Load core components
+require "outbox_relay/instrumentation"
 require "outbox_relay/yaml_config_loader"
 require "outbox_relay/configuration"
 require "outbox_relay/cli"

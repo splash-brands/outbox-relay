@@ -68,11 +68,14 @@ module OutboxRelay
         backtrace: validation_error.backtrace&.first(10)&.join("\n"),
       )
 
-      Sentry.capture_exception(validation_error, extra: {
+      OutboxRelay::Instrumentation::Models.error(
+        validation_error,
+        model: "OutboxConsumer",
+        operation: "consume_event_validation",
         event_id: event.event_id,
         consumer_group: consumer_group,
-        severity: "critical",
-      }) if defined?(Sentry)
+        severity: "critical"
+      )
 
       # Add to DLQ immediately - don't retry validation errors
       move_to_dead_letter_queue(event, validation_error)
@@ -93,10 +96,12 @@ module OutboxRelay
           backtrace: e.backtrace&.first(10)&.join("\n"),
         )
 
-        Sentry.capture_exception(e, extra: {
-          event_id: event.event_id,
-          error_class: e.class.name,
-        }) if defined?(Sentry)
+        OutboxRelay::Instrumentation::Models.error(
+          e,
+          model: "OutboxConsumer",
+          operation: "consume_event_system_error",
+          event_id: event.event_id
+        )
 
         raise # Stop processing - let supervisor handle
       end
@@ -330,10 +335,13 @@ module OutboxRelay
       backtrace: e.backtrace&.first(10)&.join("\n")
     )
 
-    Sentry.capture_exception(e, extra: {
+    OutboxRelay::Instrumentation::Models.error(
+      e,
+      model: "OutboxConsumer",
+      operation: "advisory_lock",
       lock_key: lock_key,
       consumer_group: consumer_group
-    }) if defined?(Sentry)
+    )
 
     # Fail safe - if we can't acquire lock, don't process
     false
@@ -391,12 +399,15 @@ module OutboxRelay
           backtrace: e.backtrace&.first(10)&.join("\n")
         )
 
-        Sentry.capture_exception(e, extra: {
+        OutboxRelay::Instrumentation::Models.error(
+          e,
+          model: "OutboxConsumer",
+          operation: "consume_message",
           event_id: event.event_id,
           sequence: event.sequence,
           consumer_group: consumer_group,
           phase: "consume_message"
-        }) if defined?(Sentry)
+        )
 
         # Record failure in DLQ for retry/monitoring
         handle_event_failure(event, e)
@@ -431,13 +442,16 @@ module OutboxRelay
           severity: "critical"
         )
 
-        Sentry.capture_exception(e, extra: {
+        OutboxRelay::Instrumentation::Models.error(
+          e,
+          model: "OutboxConsumer",
+          operation: "offset_update",
           event_id: event.event_id,
           sequence: event.sequence,
           consumer_group: consumer_group,
           phase: "offset_update",
           severity: "critical"
-        }) if defined?(Sentry)
+        )
 
         # Don't call handle_event_failure - message WAS processed successfully
         # This is a tracking failure, not a business logic failure
@@ -533,13 +547,15 @@ module OutboxRelay
         error_class: e.class.name
       )
 
-      Sentry.capture_exception(e, extra: {
+      OutboxRelay::Instrumentation::Models.error(
+        e,
+        model: "OutboxConsumer",
+        operation: "dlq_save_validation",
         event_id: event.event_id,
         consumer_group: consumer_group,
         validation_errors: dlq_entry.errors.full_messages,
-        dlq_attributes: dlq_entry.attributes,
         severity: "critical"
-      }) if defined?(Sentry)
+      )
 
       raise OutboxRelay::Error, "Failed to save DLQ entry (validation): #{dlq_entry.errors.full_messages.join(', ')}"
     rescue ActiveRecord::RecordNotUnique => e
@@ -571,13 +587,15 @@ module OutboxRelay
         backtrace: e.backtrace&.first(10)&.join("\n")
       )
 
-      Sentry.capture_exception(e, extra: {
+      OutboxRelay::Instrumentation::Models.error(
+        e,
+        model: "OutboxConsumer",
+        operation: "dlq_save",
         event_id: event.event_id,
         consumer_group: consumer_group,
-        dlq_attributes: dlq_entry.attributes,
         phase: "dlq_save",
         severity: "critical"
-      }) if defined?(Sentry)
+      )
 
       raise OutboxRelay::Error, "Failed to save DLQ entry: #{e.message}"
     end
@@ -637,8 +655,8 @@ module OutboxRelay
 
   # Handle event processing failure with proper error reporting and state management
   def handle_event_failure(event, error)
-    # Report to Sentry immediately for monitoring
-    report_processing_error_to_sentry(event, error)
+    # Report error to monitoring backend via ActiveSupport::Notifications
+    report_processing_error(event, error)
 
     # Attempt to update event state for retry/DLQ
     update_failed_event_state(event, error)
@@ -647,24 +665,25 @@ module OutboxRelay
     log_critical_state_error(event, error, state_error)
   end
 
-  def report_processing_error_to_sentry(event, error)
-    return unless defined?(Sentry)
-
+  def report_processing_error(event, error)
     # Get current DLQ entry for retry count
     dlq_entry = OutboxRelay::DeadLetterEvent.find_by(
       outbox_relay_outbox_event_id: event.id,
       consumer_group: consumer_group
     )
 
-    Sentry.capture_exception(error, extra: {
+    OutboxRelay::Instrumentation::Models.error(
+      error,
+      model: "OutboxConsumer",
+      operation: "event_processing",
       event_id: event.event_id,
       consumer_group: consumer_group,
       topic: topic,
       event_name: event.event_name,
       sequence: event.sequence,
       retry_count: dlq_entry&.total_retries || 0,
-      partition_key: partition_key,
-    })
+      partition_key: partition_key
+    )
   end
 
   def update_failed_event_state(event, error)
@@ -687,13 +706,15 @@ module OutboxRelay
     )
 
     # Alert monitoring - this is a critical system failure
-    if defined?(Sentry)
-      Sentry.capture_exception(state_error, extra: {
-        original_error: original_error.message,
-        event_id: event.event_id,
-        consumer_group: consumer_group,
-      })
-    end
+    OutboxRelay::Instrumentation::Models.error(
+      state_error,
+      model: "OutboxConsumer",
+      operation: "update_failed_event_state",
+      original_error: original_error.message,
+      event_id: event.event_id,
+      consumer_group: consumer_group,
+      severity: "critical"
+    )
   end
 
   def recoverable_error?(error)

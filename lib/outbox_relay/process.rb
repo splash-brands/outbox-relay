@@ -94,11 +94,10 @@ module OutboxRelay
 
       # Alert on sustained lock contention
       if @consecutive_lock_failures >= 5
-        Sentry.capture_message(
-          "Sustained heartbeat lock contention detected",
-          level: :warning,
-          extra: { process_id: id, consecutive_failures: @consecutive_lock_failures }
-        ) if defined?(Sentry)
+        OutboxRelay::Instrumentation::Process.run_error(
+          StandardError.new("Sustained heartbeat lock contention detected"),
+          name: "process_#{id}"
+        )
       end
 
       false

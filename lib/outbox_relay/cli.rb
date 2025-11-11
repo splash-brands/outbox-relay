@@ -164,10 +164,7 @@ module OutboxRelay
         backtrace: error.backtrace&.first(5)&.join("\n")
       )
 
-      Sentry.capture_exception(error, extra: {
-        cli_step: step,
-        suggestion: suggestion
-      }) if defined?(Sentry)
+      OutboxRelay::Instrumentation::CLI.start_error(error)
 
       puts "\n" + "=" * 80
       puts "❌ Setup Failed: #{step}"
