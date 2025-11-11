@@ -1,34 +1,6 @@
 # frozen_string_literal: true
 
 namespace :outbox_relay do
-  desc "Start OutboxRelay supervisor with workers"
-  task start: :environment do
-    # On macOS, we MUST set environment variables BEFORE the Ruby process starts
-    # If they're not set, re-exec with the proper environment
-    if RUBY_PLATFORM.include?("darwin")
-      needs_reexec = ENV["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] != "YES" ||
-                     ENV["PGGSSENCMODE"] != "disable"
-
-      if needs_reexec && ENV["OUTBOX_RELAY_REEXEC"] != "1"
-        puts "🍎 macOS detected - re-executing with fork-safety environment..."
-        ENV["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
-        ENV["PGGSSENCMODE"] = "disable"
-        ENV["OUTBOX_RELAY_REEXEC"] = "1"
-        Kernel.exec(ENV, "bundle", "exec", "rake", "outbox_relay:start", *ARGV[1..])
-      end
-
-      puts "🍎 macOS fork-safety environment confirmed:"
-      puts "   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=#{ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY']}"
-      puts "   PGGSSENCMODE=#{ENV['PGGSSENCMODE']}"
-      puts ""
-    end
-
-    require "outbox_relay"
-
-    # Start the supervisor
-    OutboxRelay::CLI.start(ARGV[1..])
-  end
-
   desc "Show OutboxRelay configuration"
   task config: :environment do
     require "outbox_relay"
@@ -92,7 +64,7 @@ namespace :outbox_relay do
     if ps_output.empty?
       puts "No OutboxRelay processes running"
       puts ""
-      puts "To start: bundle exec rake outbox_relay:start"
+      puts "To start: ./bin/outbox_relay"
     else
       lines = ps_output.lines
 
@@ -134,7 +106,7 @@ namespace :outbox_relay do
       if total_processes == 0
         puts "No OutboxRelay processes running"
         puts ""
-        puts "To start: bundle exec rake outbox_relay:start"
+        puts "To start: ./bin/outbox_relay"
         next
       end
 

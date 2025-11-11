@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    outbox_relay (0.2.0)
+    outbox_relay (0.4.0)
       activerecord (>= 7.0, < 9.0)
       activesupport (>= 7.0, < 9.0)
       concurrent-ruby (~> 1.3)

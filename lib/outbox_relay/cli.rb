@@ -1,23 +1,54 @@
 # frozen_string_literal: true
 
-require "optparse"
+require "thor"
 
 module OutboxRelay
-  class CLI
+  class CLI < Thor
     class << self
-      def start(argv = ARGV)
-        new(argv).run
+      def exit_on_failure?
+        true
       end
     end
 
-    attr_reader :options
+    desc "start", "Start OutboxRelay server with workers"
+    long_desc <<~DESC
+      Starts the OutboxRelay supervisor and worker processes to process outbox events.
 
-    def initialize(argv)
-      @argv = argv
-      @options = parse_options(argv)
-    end
+      The server will poll configured consumer groups and process events according
+      to your configuration in config/outbox_consumers.yml.
+    DESC
 
-    def run
+    class_option :polling_interval,
+      type: :numeric,
+      aliases: "-p",
+      default: Configuration::DEFAULT_POLLING_INTERVAL,
+      desc: "Polling interval in seconds"
+
+    class_option :batch_size,
+      type: :numeric,
+      aliases: "-b",
+      default: Configuration::DEFAULT_BATCH_SIZE,
+      desc: "Batch size for processing"
+
+    class_option :max_loops,
+      type: :numeric,
+      aliases: "-m",
+      default: Configuration::DEFAULT_MAX_LOOPS,
+      desc: "Maximum loops before restart"
+
+    class_option :environment,
+      type: :string,
+      aliases: "-e",
+      desc: "Rails environment (default: from RAILS_ENV)"
+
+    class_option :log_level,
+      type: :string,
+      aliases: "-l",
+      desc: "Log level (debug, info, warn, error)"
+
+    default_task :start
+
+    def start
       setup_environment
       validate_options!
 
@@ -27,11 +58,11 @@ module OutboxRelay
       OutboxRelay.logger.info(
         event_name: "outbox_relay_starting",
         version: OutboxRelay::VERSION,
-        options: options
+        options: symbolized_options
       )
 
       # Start the supervisor
-      OutboxRelay::Supervisor.start(**options)
+      OutboxRelay::Supervisor.start(**symbolized_options)
     rescue => e
       OutboxRelay.logger.error(
         event_name: "outbox_relay_failed_to_start",
@@ -43,51 +74,8 @@ module OutboxRelay
 
     private
 
-    def parse_options(argv)
-      options = {
-        polling_interval: Configuration::DEFAULT_POLLING_INTERVAL,
-        batch_size: Configuration::DEFAULT_BATCH_SIZE,
-        max_loops: Configuration::DEFAULT_MAX_LOOPS
-      }
-
-      parser = OptionParser.new do |opts|
-        opts.banner = "Usage: outbox_relay [options]"
-
-        opts.on("-p", "--polling-interval SECONDS", Float, "Polling interval in seconds (default: 1.0)") do |interval|
-          options[:polling_interval] = interval
-        end
-
-        opts.on("-b", "--batch-size SIZE", Integer, "Batch size for processing (default: 100)") do |size|
-          options[:batch_size] = size
-        end
-
-        opts.on("-m", "--max-loops COUNT", Integer, "Maximum loops before restart (default: 1000)") do |count|
-          options[:max_loops] = count
-        end
-
-        opts.on("-e", "--environment ENV", "Rails environment (default: from RAILS_ENV)") do |env|
-          options[:environment] = env
-        end
-
-        opts.on("-l", "--log-level LEVEL", "Log level (debug, info, warn, error)") do |level|
-          options[:log_level] = level
-        end
-
-        opts.on("-h", "--help", "Show this help message") do
-          puts opts
-          exit
-        end
-
-        opts.on("-v", "--version", "Show version") do
-          puts "OutboxRelay #{OutboxRelay::VERSION}"
-          exit
-        end
-      end
-
-      parser.parse!(argv)
-      options
-    rescue OptionParser::InvalidOption => e
-      abort "Invalid option: #{e.message}\n\n#{parser}"
+    def symbolized_options
+      @symbolized_options ||= options.transform_keys(&:to_sym).compact
     end
 
     def setup_environment
@@ -184,9 +172,17 @@ module OutboxRelay
     def validate_options!
       errors = []
 
-      errors << "Polling interval must be positive" if options[:polling_interval] <= 0
-      errors << "Batch size must be positive" if options[:batch_size] <= 0
-      errors << "Max loops must be positive" if options[:max_loops] <= 0
+      if options[:polling_interval]&.<= 0
+        errors << "Polling interval must be positive (got: #{options[:polling_interval]})"
+      end
+
+      if options[:batch_size]&.<= 0
+        errors << "Batch size must be positive (got: #{options[:batch_size]})"
+      end
+
+      if options[:max_loops]&.<= 0
+        errors << "Max loops must be positive (got: #{options[:max_loops]})"
+      end
 
       if errors.any?
         abort "Configuration errors:\n#{errors.join("\n")}"
@@ -218,11 +214,16 @@ module OutboxRelay
       puts "Missing environment variables:"
       missing_vars.each { |var| puts "  - #{var}" }
       puts ""
-      puts "To fix this, run OutboxRelay using the rake task:"
-      puts "  bundle exec rake outbox_relay:start"
+      puts "Recommended solution:"
+      puts "  1. Use the generated executable: ./bin/outbox_relay"
+      puts "     (Generated via: rails generate outbox_relay:install)"
       puts ""
-      puts "Or set the variables manually before starting:"
-      puts "  OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES PGGSSENCMODE=disable bundle exec rake outbox_relay:start"
+      puts "Alternative (if not using the generator):"
+      puts "  Set these environment variables before starting:"
+      puts "  export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES"
+      puts "  export PGGSSENCMODE=disable"
+      puts ""
+      puts "Note: If you ARE using bin/outbox_relay and seeing this, please report as a bug."
       puts ""
       puts "=" * 80
       puts ""

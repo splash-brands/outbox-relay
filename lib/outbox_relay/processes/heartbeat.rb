@@ -21,18 +21,16 @@ module OutboxRelay
       # After 3 failures (30 seconds), assume database is unreachable
       DEFAULT_MAX_HEARTBEAT_FAILURES = 3
 
-      def initialize(*)
-        super
-        @heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL
-        @max_heartbeat_failures = DEFAULT_MAX_HEARTBEAT_FAILURES
-        @heartbeat_failures = Concurrent::AtomicFixnum.new(0)
-        @heartbeat_task = nil
-      end
-
       # Start automatic heartbeat after boot
       # Called automatically by runnable lifecycle
       def start_heartbeat
         return unless registered?  # Only start if registration succeeded
+
+        # Lazy initialize heartbeat state if not already set
+        # This handles cases where initialize chain wasn't called
+        @heartbeat_interval ||= DEFAULT_HEARTBEAT_INTERVAL
+        @max_heartbeat_failures ||= DEFAULT_MAX_HEARTBEAT_FAILURES
+        @heartbeat_failures ||= Concurrent::AtomicFixnum.new(0)
 
         @heartbeat_task = Concurrent::TimerTask.new(
           execution_interval: @heartbeat_interval,

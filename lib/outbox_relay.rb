@@ -59,11 +59,10 @@ module OutboxRelay
   # The Objective-C runtime checks OBJC_DISABLE_INITIALIZE_FORK_SAFETY during
   # the fork() system call, before any Ruby code can modify the environment.
   #
-  # Use the rake task which sets them automatically:
-  #   bundle exec rake outbox_relay:start
+  # Use the generated bin/outbox_relay executable which sets them automatically:
+  #   ./bin/outbox_relay
   #
-  # Or set them manually:
-  #   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES PGGSSENCMODE=disable bundle exec rake outbox_relay:start
+  # The executable handles this automatically via bin/outbox_relay template.
   def setup_macos_fork_safety!
     return unless macos?
 

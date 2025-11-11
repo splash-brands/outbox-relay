@@ -27,8 +27,14 @@ Next steps:
      end
    end
 
-4. Start the supervisor:
-   bundle exec rake outbox_relay:start
+4. Start OutboxRelay:
+   ./bin/outbox_relay
+
+   Or with options:
+   ./bin/outbox_relay --polling-interval 0.5 --batch-size 200
+
+   For help:
+   ./bin/outbox_relay help
 
 5. Monitor status:
    bundle exec rake outbox_relay:status
