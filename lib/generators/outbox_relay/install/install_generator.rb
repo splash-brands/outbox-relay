@@ -20,6 +20,11 @@ module OutboxRelay
         template "outbox_consumers.yml", "config/outbox_consumers.yml"
       end
 
+      def create_executable
+        template "bin/outbox_relay", "bin/outbox_relay"
+        chmod "bin/outbox_relay", 0755 & ~File.umask, verbose: false
+      end
+
       def create_migrations
         # Core tables: outbox_events, consumer_offsets, dead_letter_events
         # Uses immutable event log architecture (no state machine, no lock_version)

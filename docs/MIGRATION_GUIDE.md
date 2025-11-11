@@ -299,7 +299,7 @@ DELETE FROM outbox_events WHERE created_at < NOW() - INTERVAL '7 days';
 
 ```bash
 # Start OutboxRelay workers with new code
-bundle exec rake outbox_relay:start
+./bin/outbox_relay
 
 # Or via systemd/docker/kubernetes
 systemctl restart outbox_relay
@@ -371,7 +371,7 @@ psql -d your_database < backup_before_migration_YYYYMMDD_HHMMSS.sql
 
 **Step 5: Restart old workers**
 ```bash
-bundle exec rake outbox_relay:start
+./bin/outbox_relay
 ```
 
 ### If Issues Occur After > 1 Hour

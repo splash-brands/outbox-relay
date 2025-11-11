@@ -434,7 +434,7 @@ OutboxEvent
 
 ```bash
 # Start workers
-rake outbox_relay:start
+./bin/outbox_relay
 
 # Check status
 rake outbox_relay:status

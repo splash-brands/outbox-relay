@@ -102,14 +102,15 @@ Then run:
 
 ```bash
 bundle install
-rails generate outbox_relay:install
-rails db:migrate
+bin/rails generate outbox_relay:install
+bin/rails db:migrate
 ```
 
 This will:
 - Create PostgreSQL tables (`outbox_relay_outbox_events`, `outbox_relay_consumer_offsets`, `outbox_relay_dead_letter_events`, `outbox_relay_processes`)
 - Generate initializer at `config/initializers/outbox_relay.rb`
 - Generate YAML configuration at `config/outbox_consumers.yml`
+- Create executable at `bin/outbox_relay` for starting the server
 
 ## 🚀 Quick Start
 
@@ -214,14 +215,14 @@ OutboxRelay::OutboxEvent.create!(
 ### 4. Start Workers
 
 ```bash
-# Development
-bundle exec rake outbox_relay:start
+# Start with default settings
+./bin/outbox_relay
 
-# Production (add to Procfile)
-outbox_relay: bundle exec rake outbox_relay:start
+# Or with custom options
+./bin/outbox_relay --polling-interval 0.5 --batch-size 200
 
-# Or via CLI
-bundle exec outbox_relay start
+# View help
+./bin/outbox_relay help
 ```
 
 ### 5. Monitor
@@ -273,11 +274,18 @@ end
 ### CLI Options
 
 ```bash
-bundle exec rake outbox_relay:start \
+# View all available options
+./bin/outbox_relay help start
+
+# Start with custom options
+./bin/outbox_relay \
   --polling-interval 0.5 \
   --batch-size 50 \
   --max-loops 500 \
   --log-level debug
+
+# Or using short flags
+./bin/outbox_relay -p 0.5 -b 50 -m 500 -l debug
 ```
 
 ### YAML Configuration
@@ -565,7 +573,7 @@ Before deploying OutboxRelay to production:
 ```yaml
 # Procfile (for Heroku, Render, etc.)
 web: bundle exec rails server
-outbox_relay: bundle exec outbox_relay start
+outbox_relay: ./bin/outbox_relay
 worker: bundle exec sidekiq
 ```
 
@@ -573,7 +581,7 @@ worker: bundle exec sidekiq
 
 ```dockerfile
 # Start workers in production
-CMD ["bundle", "exec", "outbox_relay", "start"]
+CMD ["./bin/outbox_relay"]
 ```
 
 ### Systemd
@@ -587,7 +595,7 @@ After=postgresql.service
 Type=simple
 User=deploy
 WorkingDirectory=/var/www/app
-ExecStart=/usr/local/bin/bundle exec outbox_relay start
+ExecStart=/var/www/app/bin/outbox_relay
 Restart=always
 RestartSec=5
 

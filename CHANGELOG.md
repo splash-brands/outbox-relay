@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-01-11
+
+### Added
+
+- **Solid Queue-style CLI** - Generator now creates `bin/outbox_relay` executable in Rails apps (following Solid Queue pattern)
+- **Thor-based CLI** - Migrated from OptionParser to Thor for better command structure and help output
+- **Automatic fork-safety** - Generated `bin/outbox_relay` automatically handles macOS fork-safety environment variables
+
+### Changed
+
+- **BREAKING**: Removed `rake outbox_relay:start` task - use `./bin/outbox_relay` instead
+- **Installation process** - `rails generate outbox_relay:install` now creates `bin/outbox_relay` executable
+- **All documentation updated** - README, STATUS, CHANGELOG, and docs now reference `./bin/outbox_relay`
+- **CLI warning messages** - Updated macOS fork-safety warnings to reference generated executable
+
+### Migration Guide
+
+If upgrading from 0.3.x:
+
+1. Run generator to create new executable: `bin/rails generate outbox_relay:install`
+2. Update Procfile/systemd/docker: Change `bundle exec rake outbox_relay:start` to `./bin/outbox_relay`
+3. Start using new command: `./bin/outbox_relay` (with optional flags like `--polling-interval 0.5`)
+
+Note: Utility rake tasks (status, lag, cleanup, etc.) remain unchanged.
+
+## [0.3.0] - 2025-01-11
+
+### Changed
+
+- **ActiveSupport::Notifications instrumentation** - Replaced Sentry direct calls with Rails instrumentation events
+- All errors and critical events now emit via `ActiveSupport::Notifications` for flexible backend integration
+- Applications can subscribe to `outbox_relay.*` events and route to any monitoring backend (Sentry, DataDog, New Relic)
+
 ## [0.2.0] - 2025-01-10
 
 ### Added
@@ -119,13 +152,8 @@ OUTBOX_CONSUMERS = {
 
 **macOS fork safety:**
 ```bash
-# Use rake task (automatically sets environment):
-bundle exec rake outbox_relay:start
-
-# Or set manually:
-OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
-PGGSSENCMODE=disable \
-bundle exec rake outbox_relay:start
+# The generated bin/outbox_relay executable automatically handles this:
+./bin/outbox_relay
 ```
 
 ## Contributors
