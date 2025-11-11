@@ -16,6 +16,10 @@ module OutboxRelay
       attr_reader :name
 
       def initialize(*)
+        # CRITICAL: Call super first to initialize included modules (Heartbeat, etc.)
+        # Without this, module initialize methods never run, leaving @heartbeat_interval nil
+        super
+
         @name = generate_name
         # Use simple boolean for signal-safety (no mutex)
         # Ruby VM guarantees atomicity of boolean read/write
