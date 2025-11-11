@@ -42,12 +42,12 @@ module OutboxRelay
           backtrace: e.backtrace&.first(10)&.join("\n")
         )
 
-        Sentry.capture_exception(e, extra: {
+        OutboxRelay::Instrumentation::Process.registration_failed(
+          e,
           name: name,
           kind: kind,
-          pid: pid,
-          severity: "critical"
-        }) if defined?(Sentry)
+          pid: pid
+        )
 
         # Re-raise - a process that can't register shouldn't run
         raise OutboxRelay::Error, "Failed to register process: #{e.message}"
@@ -94,13 +94,12 @@ module OutboxRelay
           backtrace: e.backtrace&.first(5)&.join("\n")
         )
 
-        Sentry.capture_exception(e, extra: {
+        OutboxRelay::Instrumentation::Process.deregistration_failed(
+          e,
           process_id: process_id,
           db_id: @db_process&.id,
-          name: name,
-          phase: "shutdown",
-          severity: "high"
-        }) if defined?(Sentry)
+          name: name
+        )
 
         # Don't re-raise during shutdown - this is best-effort cleanup
         # Log for manual cleanup if needed
@@ -147,12 +146,13 @@ module OutboxRelay
           max_failures: @max_heartbeat_failures
         )
 
-        Sentry.capture_exception(e, extra: {
+        OutboxRelay::Instrumentation::Process.heartbeat_failed(
+          e,
           process_id: process_id,
           db_id: @db_process&.id,
           consecutive_failures: failures,
-          severity: failures >= @max_heartbeat_failures ? "critical" : "warning"
-        }) if defined?(Sentry)
+          max_failures: @max_heartbeat_failures
+        )
 
         # After max consecutive failures, assume database is broken and shut down
         if failures >= @max_heartbeat_failures

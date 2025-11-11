@@ -63,10 +63,10 @@ module OutboxRelay
           backtrace: e.backtrace&.first(5)&.join("\n")
         )
 
-        Sentry.capture_exception(e, extra: {
-          process_id: process_id,
-          severity: "high"
-        }) if defined?(Sentry)
+        OutboxRelay::Instrumentation::Heartbeat.start_error(
+          e,
+          process_id: process_id
+        )
 
         # Don't fail the process if heartbeat can't start
         # Process can still run, just won't have liveness detection
@@ -122,11 +122,10 @@ module OutboxRelay
           backtrace: exception.backtrace&.first(5)&.join("\n")
         )
 
-        Sentry.capture_exception(exception, extra: {
-          process_id: process_id,
-          severity: "high",
-          context: "heartbeat_timer_task"
-        }) if defined?(Sentry)
+        OutboxRelay::Instrumentation::Heartbeat.task_error(
+          exception,
+          process_id: process_id
+        )
       end
 
       private

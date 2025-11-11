@@ -52,10 +52,11 @@ namespace :outbox_relay do
         backtrace: e.backtrace&.first(5)&.join("\n")
       )
 
-      Sentry.capture_exception(e, extra: {
-        task: "outbox_relay:status",
+      OutboxRelay::Instrumentation::Tasks.task_error(
+        e,
+        task_name: "outbox_relay:status",
         severity: "high"
-      }) if defined?(Sentry)
+      )
 
       exit 1
     end
@@ -205,11 +206,12 @@ namespace :outbox_relay do
           backtrace: e.backtrace&.first(5)&.join("\n")
         )
 
-        Sentry.capture_exception(e, extra: {
-          task: "outbox_relay:stop",
+        OutboxRelay::Instrumentation::Tasks.task_error(
+          e,
+          task_name: "outbox_relay:stop",
           process_name: process[:name],
           pid: process[:pid]
-        }) if defined?(Sentry)
+        )
 
         failed_signals << { pid: process[:pid], name: process[:name], error: e.message }
       end
@@ -275,12 +277,13 @@ namespace :outbox_relay do
             backtrace: e.backtrace&.first(5)&.join("\n")
           )
 
-          Sentry.capture_exception(e, extra: {
-            task: "outbox_relay:lag",
+          OutboxRelay::Instrumentation::Tasks.task_error(
+            e,
+            task_name: "outbox_relay:lag",
             consumer_class: worker_config.consumer_class,
             topic: worker_config.topic,
             partition_key: partition_key
-          }) if defined?(Sentry)
+          )
         end
       end
     end
@@ -321,11 +324,12 @@ namespace :outbox_relay do
         backtrace: e.backtrace&.first(10)&.join("\n")
       )
 
-      Sentry.capture_exception(e, extra: {
-        task: "outbox_relay:cleanup",
+      OutboxRelay::Instrumentation::Tasks.task_error(
+        e,
+        task_name: "outbox_relay:cleanup",
         phase: "offset_fetch",
         severity: "critical"
-      }) if defined?(Sentry)
+      )
 
       exit 1
     end
@@ -387,12 +391,13 @@ namespace :outbox_relay do
           backtrace: e.backtrace&.first(10)&.join("\n")
         )
 
-        Sentry.capture_exception(e, extra: {
-          task: "outbox_relay:cleanup",
+        OutboxRelay::Instrumentation::Tasks.task_error(
+          e,
+          task_name: "outbox_relay:cleanup",
           phase: "event_deletion",
           topic: topic,
           min_sequence: min_sequence
-        }) if defined?(Sentry)
+        )
       end
     end
 
@@ -414,11 +419,12 @@ namespace :outbox_relay do
         backtrace: e.backtrace&.first(10)&.join("\n")
       )
 
-      Sentry.capture_exception(e, extra: {
-        task: "outbox_relay:cleanup",
+      OutboxRelay::Instrumentation::Tasks.task_error(
+        e,
+        task_name: "outbox_relay:cleanup",
         phase: "dlq_deletion",
         severity: "high"
-      }) if defined?(Sentry)
+      )
 
       resolved_dlq_deleted = 0  # Continue with summary
       total_errors += 1
@@ -497,11 +503,12 @@ namespace :outbox_relay do
         backtrace: e.backtrace&.first(10)&.join("\n")
       )
 
-      Sentry.capture_exception(e, extra: {
-        task: "outbox_relay:prune_processes",
+      OutboxRelay::Instrumentation::Tasks.task_error(
+        e,
+        task_name: "outbox_relay:prune_processes",
         timeout: timeout,
         severity: "high"
-      }) if defined?(Sentry)
+      )
 
       exit 1
     end
@@ -611,10 +618,11 @@ namespace :outbox_relay do
         backtrace: e.backtrace&.first(10)&.join("\n")
       )
 
-      Sentry.capture_exception(e, extra: {
-        task: "outbox_relay:process_status",
+      OutboxRelay::Instrumentation::Tasks.task_error(
+        e,
+        task_name: "outbox_relay:process_status",
         severity: "high"
-      }) if defined?(Sentry)
+      )
 
       exit 1
     end
@@ -707,10 +715,11 @@ namespace :outbox_relay do
         backtrace: e.backtrace&.first(10)&.join("\n")
       )
 
-      Sentry.capture_exception(e, extra: {
-        task: "outbox_relay:check_locks",
+      OutboxRelay::Instrumentation::Tasks.task_error(
+        e,
+        task_name: "outbox_relay:check_locks",
         severity: "medium"
-      }) if defined?(Sentry)
+      )
 
       exit 1
     end

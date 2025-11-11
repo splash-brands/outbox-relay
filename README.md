@@ -19,7 +19,7 @@ OutboxRelay is a high-performance, long-running process system that continuously
 - 📊 **Partition support** - Parallel processing across partitions
 - 💀 **Dead letter queue** - Per-consumer-group failure tracking
 - 🎯 **Event filtering** - Process only specific event types
-- 📈 **Monitoring** - Built-in lag tracking and status reporting
+- 📈 **Monitoring** - ActiveSupport::Notifications for any backend (Sentry, DataDog, New Relic)
 - 🔧 **Zero dependencies** - Pure PostgreSQL, no external queue systems
 
 ## 🛡️ Production Readiness for ECS/Container Deployments
@@ -436,6 +436,159 @@ OutboxRelay.logger.error(
   error: error.message,
   backtrace: error.backtrace.first(5)
 )
+```
+
+### ActiveSupport::Notifications Instrumentation
+
+OutboxRelay emits all errors and critical events via `ActiveSupport::Notifications`, allowing your application to choose any monitoring backend (Sentry, DataDog, New Relic, etc.).
+
+**Subscribe to all OutboxRelay events:**
+
+```ruby
+# config/initializers/outbox_relay_instrumentation.rb
+
+ActiveSupport::Notifications.subscribe(/^outbox_relay\./) do |name, start, finish, id, payload|
+  # Route to your monitoring backend
+  if payload[:exception]
+    Sentry.capture_exception(
+      payload[:exception],
+      extra: payload.except(:exception),
+      level: severity_to_sentry_level(payload[:severity])
+    )
+  elsif payload[:message]
+    Sentry.capture_message(
+      payload[:message],
+      extra: payload.except(:message),
+      level: severity_to_sentry_level(payload[:severity])
+    )
+  end
+end
+
+def severity_to_sentry_level(severity)
+  case severity
+  when "critical" then :fatal
+  when "high" then :error
+  when "warning" then :warning
+  else :info
+  end
+end
+```
+
+**Subscribe to specific event categories:**
+
+```ruby
+# Worker errors only
+ActiveSupport::Notifications.subscribe("outbox_relay.worker.poll_error") do |name, start, finish, id, payload|
+  Sentry.capture_exception(
+    payload[:exception],
+    extra: {
+      consumer_class: payload[:consumer_class],
+      partition_key: payload[:partition_key],
+      loop_count: payload[:loop_count]
+    }
+  )
+end
+
+# Heartbeat failures only (with escalation)
+ActiveSupport::Notifications.subscribe("outbox_relay.heartbeat.failure") do |name, start, finish, id, payload|
+  # payload[:severity] escalates from "warning" to "critical" based on consecutive_failures
+  Sentry.capture_exception(
+    payload[:exception],
+    extra: {
+      process_id: payload[:process_id],
+      consecutive_failures: payload[:consecutive_failures],
+      max_failures: payload[:max_failures]
+    },
+    level: payload[:severity] == "critical" ? :fatal : :warning
+  )
+end
+
+# Supervisor events only
+ActiveSupport::Notifications.subscribe(/^outbox_relay\.supervisor\./) do |name, start, finish, id, payload|
+  # Route supervisor-specific events
+end
+```
+
+**Available Event Categories:**
+
+```ruby
+# Worker Events
+outbox_relay.worker.poll_error                    # Critical: Worker processing failure
+outbox_relay.worker.delay_calculation_error       # High: Lag query failed
+
+# Heartbeat Events
+outbox_relay.heartbeat.failure                    # Warning→Critical: Dynamic escalation
+outbox_relay.heartbeat.task_error                 # High: Timer task failure
+outbox_relay.heartbeat.start_error                # High: Heartbeat startup failed
+
+# Process Lifecycle Events
+outbox_relay.process.registration_failed          # Critical: Process can't register
+outbox_relay.process.deregistration_failed        # High: Shutdown cleanup issue
+outbox_relay.process.heartbeat_failed             # Warning→Critical: DB connectivity
+outbox_relay.process.run_error                    # Error: Lock contention
+
+# Supervisor Events
+outbox_relay.supervisor.boot_incomplete           # Error: Failed worker starts
+outbox_relay.supervisor.fork_error                # Critical: Fork system error
+outbox_relay.supervisor.restart_abandoned         # Error: Excessive restarts
+
+# Poller Events
+outbox_relay.poller.poll_error                    # Warning: Polling error
+outbox_relay.poller.instrumentation_error         # High: Framework error
+
+# Model Events
+outbox_relay.models.error                         # High: Generic model errors
+
+# Task Events
+outbox_relay.tasks.error                          # High: Rake task errors
+
+# Callback Events
+outbox_relay.callbacks.boot_failed                # Warning: Boot callback failed
+outbox_relay.callbacks.shutdown_block_failed      # Warning: Shutdown block failed
+outbox_relay.callbacks.shutdown_failed            # Warning: Shutdown callback failed
+
+# Configuration Events
+outbox_relay.configuration.partition_count_query_failed  # Critical: Config query failed
+```
+
+**Event Payload Structure:**
+
+All events include:
+- `exception` or `message`: The error/message
+- `severity`: "critical", "high", "warning", or "error"
+- `phase`: Operational phase (e.g., "fork", "poll", "shutdown")
+- Additional context fields specific to each event type
+
+**DataDog Example:**
+
+```ruby
+ActiveSupport::Notifications.subscribe(/^outbox_relay\./) do |name, start, finish, id, payload|
+  if payload[:exception]
+    Datadog::Tracing.active_trace&.set_error(payload[:exception])
+
+    Datadog.statsd.increment(
+      'outbox_relay.error',
+      tags: [
+        "event:#{name}",
+        "severity:#{payload[:severity]}",
+        "phase:#{payload[:phase]}"
+      ]
+    )
+  end
+end
+```
+
+**New Relic Example:**
+
+```ruby
+ActiveSupport::Notifications.subscribe(/^outbox_relay\./) do |name, start, finish, id, payload|
+  if payload[:exception]
+    NewRelic::Agent.notice_error(
+      payload[:exception],
+      custom_params: payload.except(:exception)
+    )
+  end
+end
 ```
 
 ## 💀 Dead Letter Queue
