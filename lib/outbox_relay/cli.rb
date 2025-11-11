@@ -175,9 +175,17 @@ module OutboxRelay
     def validate_options!
       errors = []
 
-      errors << "Polling interval must be positive" if options[:polling_interval] <= 0
-      errors << "Batch size must be positive" if options[:batch_size] <= 0
-      errors << "Max loops must be positive" if options[:max_loops] <= 0
+      if options[:polling_interval]&.<= 0
+        errors << "Polling interval must be positive (got: #{options[:polling_interval]})"
+      end
+
+      if options[:batch_size]&.<= 0
+        errors << "Batch size must be positive (got: #{options[:batch_size]})"
+      end
+
+      if options[:max_loops]&.<= 0
+        errors << "Max loops must be positive (got: #{options[:max_loops]})"
+      end
 
       if errors.any?
         abort "Configuration errors:\n#{errors.join("\n")}"
@@ -209,10 +217,16 @@ module OutboxRelay
       puts "Missing environment variables:"
       missing_vars.each { |var| puts "  - #{var}" }
       puts ""
-      puts "This should not happen if you're using the generated bin/outbox_relay."
-      puts "The executable should automatically set these variables."
+      puts "Recommended solution:"
+      puts "  1. Use the generated executable: ./bin/outbox_relay"
+      puts "     (Generated via: rails generate outbox_relay:install)"
       puts ""
-      puts "If you're seeing this, please report it as a bug."
+      puts "Alternative (if not using the generator):"
+      puts "  Set these environment variables before starting:"
+      puts "  export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES"
+      puts "  export PGGSSENCMODE=disable"
+      puts ""
+      puts "Note: If you ARE using bin/outbox_relay and seeing this, please report as a bug."
       puts ""
       puts "=" * 80
       puts ""

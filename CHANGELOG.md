@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] - 2025-01-11
+## [0.4.0] - 2025-11-11
 
 ### Added
 
@@ -32,7 +32,7 @@ If upgrading from 0.3.x:
 
 Note: Utility rake tasks (status, lag, cleanup, etc.) remain unchanged.
 
-## [0.3.0] - 2025-01-11
+## [0.3.0] - 2025-11-11
 
 ### Changed
 
