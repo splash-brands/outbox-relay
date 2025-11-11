@@ -53,11 +53,11 @@ module OutboxRelay
                 backtrace: e.backtrace&.first(10)&.join("\n")
               )
 
-              Sentry.capture_exception(e, extra: {
+              OutboxRelay::Instrumentation::Poller.poll_error(
+                e,
                 process_id: process_id,
-                name: name,
-                phase: "poll"
-              }) if defined?(Sentry)
+                name: name
+              )
 
               # On polling error, wait full interval before retry
               return polling_interval
@@ -74,12 +74,11 @@ module OutboxRelay
             backtrace: e.backtrace&.first(10)&.join("\n")
           )
 
-          Sentry.capture_exception(e, extra: {
+          OutboxRelay::Instrumentation::Poller.instrumentation_error(
+            e,
             process_id: process_id,
-            name: name,
-            phase: "instrumentation",
-            severity: "high"
-          }) if defined?(Sentry)
+            name: name
+          )
 
           # On instrumentation error, still try to poll
           begin

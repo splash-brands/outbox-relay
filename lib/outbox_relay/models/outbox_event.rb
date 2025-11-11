@@ -86,11 +86,14 @@ module OutboxRelay
         backtrace: e.backtrace&.first(10)&.join("\n")
       )
 
-      Sentry.capture_exception(e, extra: {
+      OutboxRelay::Instrumentation::Models.error(
+        e,
+        model: "OutboxEvent",
+        operation: "next_sequence",
         topic: topic,
         event_name: event_name,
         severity: "critical"
-      }) if defined?(Sentry)
+      )
 
       # Re-raise - record cannot be saved without sequence
       raise

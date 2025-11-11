@@ -139,13 +139,14 @@ module OutboxRelay
       # - Check consumer implementation for bugs
       # - Monitor consumer lag (rake outbox_relay:lag)
       # - Consider manual restart if issue persists
-      Sentry.capture_exception(e, extra: {
+      OutboxRelay::Instrumentation::Worker.poll_error(
+        e,
         process_id: process_id,
         consumer_class: consumer_class_name,
         partition_key: partition_key,
         loop_count: @loop_count,
-        total_processed: @total_processed,
-      }) if defined?(Sentry)
+        total_processed: @total_processed
+      )
 
       # On error, wait full polling interval (avoid tight error loop)
       polling_interval
@@ -234,13 +235,13 @@ module OutboxRelay
         backtrace: e.backtrace&.first(5)&.join("\n"),
       )
 
-      Sentry.capture_exception(e, extra: {
+      OutboxRelay::Instrumentation::Worker.delay_calculation_error(
+        e,
         process_id: process_id,
         consumer_class: consumer_class_name,
         partition_key: partition_key,
-        processed_count: processed_count,
-        severity: "high"  # Lag query failures are serious
-      }) if defined?(Sentry)
+        processed_count: processed_count
+      )
 
       # Conservative fallback: Use normal polling interval regardless of processed_count
       # This prevents aggressive polling during database issues which could worsen DB load

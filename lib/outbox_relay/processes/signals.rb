@@ -228,11 +228,10 @@ module OutboxRelay
               backtrace: e.backtrace&.first(5)&.join("\n")
             )
 
-            Sentry.capture_exception(e, extra: {
-              signal: signal,
-              target_pid: pid,
-              severity: "high"
-            }) if defined?(Sentry)
+            OutboxRelay::Instrumentation::Signals.signal_handler_error(
+              e,
+              signal_name: "#{signal}_to_#{pid}"
+            )
 
             failed_pids << pid
           end

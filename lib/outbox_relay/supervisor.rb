@@ -101,16 +101,12 @@ module OutboxRelay
           }
         )
 
-        Sentry.capture_message(
-          "Supervisor started with #{@failed_worker_starts.size} failed workers",
-          level: :error,
-          extra: {
-            total_expected: total_expected,
-            running_workers: forks.size,
-            failed_workers: @failed_worker_starts.size,
-            failed_details: @failed_worker_starts
-          }
-        ) if defined?(Sentry)
+        OutboxRelay::Instrumentation::Supervisor.boot_incomplete(
+          total_expected: total_expected,
+          running_workers: forks.size,
+          failed_workers: @failed_worker_starts.size,
+          failed_details: @failed_worker_starts
+        )
       end
     end
 
@@ -249,12 +245,11 @@ module OutboxRelay
           backtrace: e.backtrace&.first(10)&.join("\n")
         )
 
-        Sentry.capture_exception(e, extra: {
+        OutboxRelay::Instrumentation::Supervisor.fork_error(
+          e,
           worker_name: worker.name,
-          consumer_class: worker_config.consumer_class,
-          severity: "critical",
-          phase: "fork"
-        }) if defined?(Sentry)
+          consumer_class: worker_config.consumer_class
+        )
 
         # Track failed worker start for visibility
         @failed_worker_starts << {
@@ -358,15 +353,12 @@ module OutboxRelay
                   action: "Manual intervention required"
                 )
 
-                Sentry.capture_message(
-                  "Worker restart abandoned after #{attempts} attempts",
-                  level: :error,
-                  extra: {
-                    worker_name: fork_info[:worker]&.name,
-                    worker_key: worker_key,
-                    exit_status: status.exitstatus
-                  }
-                ) if defined?(Sentry)
+                OutboxRelay::Instrumentation::Supervisor.restart_abandoned(
+                  worker_name: fork_info[:worker]&.name,
+                  worker_key: worker_key,
+                  exit_status: status.exitstatus,
+                  restart_attempts: attempts
+                )
 
                 # Don't restart - stop trying
                 return

@@ -41,7 +41,7 @@ module OutboxRelay
             error: e.message,
             backtrace: e.backtrace&.first(10)&.join("\n")
           )
-          Sentry.capture_exception(e, extra: { callback: callback, phase: "boot" }) if defined?(Sentry)
+          OutboxRelay::Instrumentation::Callbacks.boot_failed(e, callback: callback)
 
           # Re-raise critical errors that prevent worker from functioning
           # Most boot callbacks (like logging) are non-critical, so we continue
@@ -70,7 +70,7 @@ module OutboxRelay
               error: e.message,
               backtrace: e.backtrace&.first(10)&.join("\n")
             )
-            Sentry.capture_exception(e, extra: { phase: "shutdown_block" }) if defined?(Sentry)
+            OutboxRelay::Instrumentation::Callbacks.shutdown_block_failed(e)
             # Continue with registered callbacks
           end
         end
@@ -85,7 +85,7 @@ module OutboxRelay
             error: e.message,
             backtrace: e.backtrace&.first(10)&.join("\n")
           )
-          Sentry.capture_exception(e, extra: { callback: callback, phase: "shutdown" }) if defined?(Sentry)
+          OutboxRelay::Instrumentation::Callbacks.shutdown_failed(e, callback: callback)
 
           # Continue with other callbacks during shutdown - best effort cleanup
         end

@@ -227,10 +227,10 @@ module OutboxRelay
           backtrace: e.backtrace&.first(10)&.join("\n")
         )
 
-        Sentry.capture_exception(e, extra: {
-          topic: topic,
-          severity: "critical"
-        }) if defined?(Sentry)
+        OutboxRelay::Instrumentation::Configuration.partition_count_query_failed(
+          e,
+          topic: topic
+        )
 
         raise OutboxRelay::ConfigurationError, "Failed to determine partition count for topic '#{topic}': #{e.message}"
       end

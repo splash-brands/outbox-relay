@@ -90,11 +90,12 @@ module OutboxRelay
               retries_exhausted: true
             )
 
-            Sentry.capture_exception(e, extra: {
+            OutboxRelay::Instrumentation::Runnable.reconnect_error(
+              e,
               process_id: process_id,
-              retries: retry_count,
-              severity: "critical"
-            }) if defined?(Sentry)
+              attempt: retry_count,
+              max_attempts: max_retries
+            )
 
             raise ConnectionError, "Failed to reconnect after #{max_retries} attempts: #{e.message}"
           end
@@ -168,11 +169,11 @@ module OutboxRelay
               backtrace: e.backtrace&.first(5)&.join("\n")
             )
 
-            Sentry.capture_exception(e, extra: {
-              signal: signal,
-              process_id: process_id,
-              severity: "critical"
-            }) if defined?(Sentry)
+            OutboxRelay::Instrumentation::Runnable.fork_initialization_error(
+              e,
+              consumer_class: "signal_handler",
+              partition_key: signal
+            )
 
             # This is critical - without signal handlers, process can't be stopped gracefully
             raise OutboxRelay::Error, "Failed to register #{signal} handler: #{e.message}"
