@@ -29,8 +29,21 @@ module OutboxRelay
     # Metadata JSON storage
     # For SQLite compatibility (text column), serialize as JSON
     # PostgreSQL/MySQL handle jsonb/json natively
-    if connection.adapter_name == 'SQLite'
-      serialize :metadata, coder: JSON
+    # Setup happens once on first connection access to avoid class load-time connection
+    class << self
+      def connection
+        setup_json_serialization_once! unless @json_serialization_configured
+        super
+      end
+
+      private
+
+      def setup_json_serialization_once!
+        @json_serialization_configured = true
+        return unless super.adapter_name == 'SQLite'
+
+        serialize :metadata, coder: JSON
+      end
     end
 
     store_accessor :metadata, :consumer_class, :topic, :partition_key
