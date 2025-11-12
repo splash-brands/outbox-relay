@@ -119,7 +119,12 @@ module OutboxRelay
         # Defensive initialization - ensure counter exists even if initialize didn't run
         @heartbeat_failures ||= Concurrent::AtomicFixnum.new(0)
 
-        success = @db_process.heartbeat
+        # Get current metadata from the process
+        # This allows processes to update their state during heartbeat
+        # For example, supervisor updates workers_count as forks change
+        current_metadata = metadata
+
+        success = @db_process.heartbeat(metadata: current_metadata)
 
         if success
           @heartbeat_failures.value = 0  # Reset on success

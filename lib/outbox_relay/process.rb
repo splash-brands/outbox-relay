@@ -54,17 +54,31 @@ module OutboxRelay
     # Uses optimistic locking with restore_attributes to handle concurrent updates.
     # If record was deleted (deregistered), this will raise RecordNotFound.
     #
+    # Optionally updates metadata if provided. This allows processes to update
+    # their state (e.g., supervisor updating workers_count) during heartbeat.
+    #
+    # @param metadata [Hash, nil] Optional metadata to merge with existing metadata
     # @return [Boolean] true if heartbeat successful
-    def heartbeat
-      # Reload attributes in case they were modified elsewhere
-      restore_attributes
-
+    def heartbeat(metadata: nil)
       # Use NOWAIT to prevent indefinite blocking
       # If we can't acquire lock immediately, skip this heartbeat
       # This prevents timer thread accumulation during database contention
       ActiveRecord::Base.transaction do
+        # Reload from database to get latest state
+        # If record was deleted, this will raise RecordNotFound
+        reload
+
         lock!("FOR UPDATE NOWAIT")
-        touch(:last_heartbeat_at)
+
+        if metadata
+          # Merge new metadata with existing metadata
+          # PostgreSQL jsonb column handles merge automatically
+          self.metadata = self.metadata.merge(metadata)
+        end
+
+        # Update heartbeat timestamp and save any metadata changes
+        self.last_heartbeat_at = Time.current
+        save!
       end
 
       # Reset lock failure counter on success

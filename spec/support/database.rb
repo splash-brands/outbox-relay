@@ -64,6 +64,22 @@ ActiveRecord::Schema.define do
     t.index :resolution_status
     t.index :created_at
   end
+
+  create_table :outbox_relay_processes, force: true do |t|
+    t.string :kind, null: false
+    t.string :name, null: false
+    t.integer :pid, null: false
+    t.string :hostname, null: false
+    t.integer :supervisor_id
+    t.datetime :last_heartbeat_at, null: false
+    t.text :metadata
+    t.timestamps
+
+    t.index :kind
+    t.index :pid
+    t.index :supervisor_id
+    t.index :last_heartbeat_at
+  end
 end
 
 # Configure model table names and SQLite-specific behavior
@@ -104,11 +120,20 @@ module OutboxRelay
   end
 end
 
+# Configure Process model for SQLite tests
+# Note: Process already exists and inherits from ActiveRecord::Base
+# We just need to add JSON serialization for SQLite
+OutboxRelay::Process.class_eval do
+  # Serialize metadata as JSON for SQLite (PostgreSQL uses jsonb natively)
+  serialize :metadata, coder: JSON
+end
+
 # Clean database before each test
 RSpec.configure do |config|
   config.before(:each) do
     OutboxRelay::OutboxEvent.delete_all
     OutboxRelay::ConsumerOffset.delete_all
     OutboxRelay::DeadLetterEvent.delete_all
+    OutboxRelay::Process.delete_all
   end
 end
