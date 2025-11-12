@@ -5,26 +5,8 @@ module OutboxRelay
   # Resolution statuses
   RESOLUTION_STATUSES = ["retrying", "unresolved", "resolved", "reprocessed", "ignored"].freeze
 
-  # JSON serialization for SQLite compatibility (text column)
-  # PostgreSQL/MySQL handle jsonb/json natively
-  # Setup happens once on first connection access to avoid class load-time connection
-  class << self
-    def connection
-      setup_json_serialization_once! unless @json_serialization_configured
-      super
-    end
-
-    private
-
-    def setup_json_serialization_once!
-      @json_serialization_configured = true
-      return unless super.adapter_name == 'SQLite'
-
-      serialize :error_context, coder: JSON
-      serialize :original_payload, coder: JSON
-      serialize :original_headers, coder: JSON
-    end
-  end
+  # PostgreSQL handles jsonb natively - no need for serialize
+  # error_context, original_payload, and original_headers are jsonb columns
 
   # Validations
   validates :consumer_group, presence: true

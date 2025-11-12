@@ -18,25 +18,8 @@ module OutboxRelay
   # Make critical fields immutable after creation to prevent accidental modification
   attr_readonly :sequence, :topic, :event_id, :event_name, :partition_key
 
-  # JSON serialization for SQLite compatibility (text column)
-  # PostgreSQL/MySQL handle jsonb/json natively
-  # Setup happens once on first connection access to avoid class load-time connection
-  class << self
-    def connection
-      setup_json_serialization_once! unless @json_serialization_configured
-      super
-    end
-
-    private
-
-    def setup_json_serialization_once!
-      @json_serialization_configured = true
-      return unless super.adapter_name == 'SQLite'
-
-      serialize :payload, coder: JSON
-      serialize :headers, coder: JSON
-    end
-  end
+  # PostgreSQL handles jsonb natively - no need for serialize
+  # payload and headers are jsonb columns in the database
 
   # Callbacks
   before_validation :set_sequence, on: :create
