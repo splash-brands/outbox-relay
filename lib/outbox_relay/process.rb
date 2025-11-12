@@ -27,6 +27,12 @@ module OutboxRelay
     validates :last_heartbeat_at, presence: true
 
     # Metadata JSON storage
+    # For SQLite compatibility (text column), serialize as JSON
+    # PostgreSQL/MySQL handle jsonb/json natively
+    if connection.adapter_name == 'SQLite'
+      serialize :metadata, coder: JSON
+    end
+
     store_accessor :metadata, :consumer_class, :topic, :partition_key
 
     # Register a new process in the database

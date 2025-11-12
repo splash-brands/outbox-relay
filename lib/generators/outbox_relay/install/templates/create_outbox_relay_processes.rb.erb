@@ -17,7 +17,15 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
 
       # Process metadata (JSON)
       # Stores consumer_class, topic, partition_key, etc.
-      t.text :metadata
+      # Use appropriate JSON type based on database adapter
+      case connection.adapter_name
+      when 'PostgreSQL'
+        t.jsonb :metadata, default: {}, null: false
+      when 'Mysql2', 'Trilogy'
+        t.json :metadata, null: false
+      else # SQLite and others
+        t.text :metadata, null: false
+      end
 
       t.timestamps
 
