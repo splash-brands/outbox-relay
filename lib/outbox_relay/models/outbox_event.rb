@@ -18,6 +18,13 @@ module OutboxRelay
   # Make critical fields immutable after creation to prevent accidental modification
   attr_readonly :sequence, :topic, :event_id, :event_name, :partition_key
 
+  # JSON serialization for SQLite compatibility (text column)
+  # PostgreSQL/MySQL handle jsonb/json natively
+  if connection.adapter_name == 'SQLite'
+    serialize :payload, coder: JSON
+    serialize :headers, coder: JSON
+  end
+
   # Callbacks
   before_validation :set_sequence, on: :create
   before_validation :set_default_partition_key, on: :create

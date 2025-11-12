@@ -15,8 +15,18 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
       t.uuid(:event_id, null: false, default: -> { "gen_random_uuid()" })
 
       # Event data (immutable)
-      t.jsonb(:payload, null: false, default: {})
-      t.jsonb(:headers, default: {})
+      # Use appropriate JSON type based on database adapter
+      case connection.adapter_name
+      when 'PostgreSQL'
+        t.jsonb(:payload, null: false, default: {})
+        t.jsonb(:headers, default: {})
+      when 'Mysql2', 'Trilogy'
+        t.json(:payload, null: false)
+        t.json(:headers)
+      else # SQLite and others
+        t.text(:payload, null: false)
+        t.text(:headers)
+      end
 
       # Ordering & partitioning
       t.bigint(:sequence, null: false)
@@ -98,13 +108,33 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
       t.integer(:total_retries, null: false, default: 0)
       t.text(:error_message)
       t.text(:error_backtrace)
-      t.jsonb(:error_context)
+
+      # Use appropriate JSON type based on database adapter
+      case connection.adapter_name
+      when 'PostgreSQL'
+        t.jsonb(:error_context)
+      when 'Mysql2', 'Trilogy'
+        t.json(:error_context)
+      else # SQLite and others
+        t.text(:error_context)
+      end
 
       # Original event snapshot (for debugging)
       t.string(:original_topic)
       t.string(:original_event_name)
-      t.jsonb(:original_payload)
-      t.jsonb(:original_headers)
+
+      # Use appropriate JSON type based on database adapter
+      case connection.adapter_name
+      when 'PostgreSQL'
+        t.jsonb(:original_payload)
+        t.jsonb(:original_headers)
+      when 'Mysql2', 'Trilogy'
+        t.json(:original_payload)
+        t.json(:original_headers)
+      else # SQLite and others
+        t.text(:original_payload)
+        t.text(:original_headers)
+      end
 
       # Resolution tracking
       # States: retrying, unresolved, resolved, reprocessed, ignored

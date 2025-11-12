@@ -5,6 +5,14 @@ module OutboxRelay
   # Resolution statuses
   RESOLUTION_STATUSES = ["retrying", "unresolved", "resolved", "reprocessed", "ignored"].freeze
 
+  # JSON serialization for SQLite compatibility (text column)
+  # PostgreSQL/MySQL handle jsonb/json natively
+  if connection.adapter_name == 'SQLite'
+    serialize :error_context, coder: JSON
+    serialize :original_payload, coder: JSON
+    serialize :original_headers, coder: JSON
+  end
+
   # Validations
   validates :consumer_group, presence: true
   validates :total_retries, presence: true, numericality: { only_integer: true, greater_than: 0 }
