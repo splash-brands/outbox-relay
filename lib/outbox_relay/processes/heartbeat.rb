@@ -40,7 +40,14 @@ module OutboxRelay
           # Timer callback - wrap in executor to manage database connections properly
           # Primary error handling in Registrable#heartbeat
           # Task-level errors handled by handle_heartbeat_task_error observer
-          wrap_in_app_executor { heartbeat }
+          #
+          # Note: wrap_in_app_executor is only available in Worker (via AppExecutor module)
+          # Supervisor doesn't need it since it doesn't interact with application code
+          if respond_to?(:wrap_in_app_executor, true)
+            wrap_in_app_executor { heartbeat }
+          else
+            heartbeat
+          end
         end
 
         # Add error handler for task itself
