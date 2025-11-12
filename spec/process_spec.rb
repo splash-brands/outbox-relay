@@ -87,6 +87,22 @@ RSpec.describe OutboxRelay::Process do
 
       expect(process.heartbeat).to be false
     end
+
+    it "handles nil metadata gracefully" do
+      # Manually set metadata to nil to simulate edge case
+      process.update_column(:metadata, nil)
+      process.reload
+
+      expect(process.metadata).to be_nil
+
+      # Should not crash even if metadata is nil
+      expect {
+        process.heartbeat(metadata: { test: "value" })
+      }.not_to raise_error
+
+      process.reload
+      expect(process.metadata["test"]).to eq("value")
+    end
   end
 
   describe "#deregister" do

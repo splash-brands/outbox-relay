@@ -73,7 +73,9 @@ module OutboxRelay
         if metadata
           # Merge new metadata with existing metadata
           # PostgreSQL jsonb column handles merge automatically
-          self.metadata = self.metadata.merge(metadata)
+          # Ensure metadata is a Hash before merging (handles nil and edge cases)
+          current_metadata = self.metadata.is_a?(Hash) ? self.metadata : {}
+          self.metadata = current_metadata.merge(metadata)
         end
 
         # Update heartbeat timestamp and save any metadata changes
