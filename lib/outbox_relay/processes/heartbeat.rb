@@ -34,7 +34,6 @@ module OutboxRelay
 
         @heartbeat_task = Concurrent::TimerTask.new(
           execution_interval: @heartbeat_interval,
-          timeout_interval: @heartbeat_interval - 1,  # Give 1 second buffer
           run_now: false  # Don't run immediately, first heartbeat after interval
         ) do
           # Timer callback - wrap in executor to manage database connections properly
