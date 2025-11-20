@@ -69,6 +69,8 @@ OutboxRelay::Worker (per partition)
   └── Graceful shutdown handling
 ```
 
+> **Multi-Instance Deployments**: OutboxRelay supports multiple supervisors running simultaneously (e.g., in ECS, Kubernetes). Workers coordinate via PostgreSQL `FOR UPDATE SKIP LOCKED` to prevent duplicate processing. See [Multi-Instance Deployment](#-multi-instance-deployment) for details.
+
 ### Key Design Patterns
 
 1. **Immutable Event Log** - Events are facts that exist, not lifecycle entities (like Kafka)
@@ -320,6 +322,9 @@ consumer_groups:
         class: "Processor"
         partitions: [0, 1, 2, 3]  # Process only partitions 0-3
 ```
+
+**Horizontal Scaling:**
+> 💡 **For multi-instance deployments (ECS, Kubernetes)**: Set partition count to match or exceed your desired number of instances. For example, with 5 ECS tasks, use `partitions: 5` or higher. See [Multi-Instance Deployment](#-multi-instance-deployment) for detailed guidance.
 
 When publishing events, partition is calculated automatically using CRC32:
 
@@ -798,6 +803,351 @@ Set up these cron jobs for production:
 # Monitor advisory locks daily
 0 6 * * * cd /app && bundle exec rake outbox_relay:check_locks >> /var/log/outbox_relay_locks.log
 ```
+
+## 🌐 Multi-Instance Deployment
+
+OutboxRelay is designed for **horizontal scaling** with multiple supervisor instances running simultaneously. This is the recommended pattern for container-based deployments (ECS, Kubernetes, Docker Swarm).
+
+### Architecture
+
+**Multiple supervisors are expected and intentional** in production deployments:
+
+```
+ECS/Kubernetes Deployment (3 replicas)
+├─ Container 1: Supervisor-1 + Workers [partitions 0,1]
+├─ Container 2: Supervisor-2 + Workers [partitions 0,1]
+└─ Container 3: Supervisor-3 + Workers [partitions 0,1]
+
+Total: 3 supervisors + 6 workers
+```
+
+Each container runs:
+- **One supervisor process** - Manages forked workers in its container
+- **N worker processes** - One per partition configured for that consumer group
+
+### How Workers Coordinate
+
+Workers across different containers **do not duplicate work** thanks to database-level coordination:
+
+1. **`FOR UPDATE SKIP LOCKED`** - PostgreSQL row-level locks
+   - Worker-1 in Container-A locks event #100
+   - Worker-2 in Container-B tries to lock same event → skips immediately (no wait)
+   - Workers naturally distribute work without blocking each other
+
+2. **Advisory Locks** - Per consumer group deduplication
+   - Even if two workers fetch the same event, only one acquires the advisory lock
+   - The other worker silently skips and moves to next event
+   - Different consumer groups can process the same event independently
+
+3. **Offset Tracking** - Per-partition progress tracking
+   - Each partition tracks its own progress per consumer group
+   - Workers won't re-fetch already processed events
+
+**Result**: Multiple supervisors cooperate seamlessly without configuration changes.
+
+### Configuration for Multi-Instance Deployments
+
+#### Optimal Partition Count
+
+**Rule of thumb**: Set partition count to **match or exceed** your maximum number of instances.
+
+**Examples:**
+
+**2 ECS Tasks (containers)**
+```yaml
+topics:
+  order_updates:
+    partitions: 2  # Perfect - one partition per container
+
+consumer_groups:
+  order_processor:
+    topics:
+      - name: order_updates
+        class: "OrderUpdatesConsumer"
+        partitions: all
+```
+
+Result: Each container processes 1 partition efficiently, no wasted resources.
+
+**10 ECS Tasks (high throughput)**
+```yaml
+topics:
+  order_updates:
+    partitions: 10  # One partition per container
+
+  notifications:
+    partitions: 20  # Two partitions per container for higher throughput
+
+consumer_groups:
+  order_processor:
+    topics:
+      - name: order_updates
+        class: "OrderUpdatesConsumer"
+        partitions: all  # All 10 workers process all partitions
+```
+
+Result: 10 containers × 1 worker = 10 workers for `order_updates`. Workers use `SKIP LOCKED` to distribute events.
+
+**Autoscaling Scenario**
+```yaml
+topics:
+  high_volume_events:
+    partitions: 20  # Support up to 20 instances
+
+consumer_groups:
+  processor:
+    topics:
+      - name: high_volume_events
+        class: "EventProcessor"
+        partitions: all
+```
+
+- **Low traffic**: 2 containers → 4 workers (2 per container) share 20 partitions
+- **High traffic**: 20 containers → 40 workers efficiently process all partitions
+- **Scaling is seamless** - no configuration changes needed
+
+#### What Happens with Mismatched Counts?
+
+**Scenario: 2 partitions, 10 containers**
+```yaml
+topics:
+  low_volume:
+    partitions: 2  # ⚠️ Only 2 partitions
+
+# With 10 ECS tasks:
+# - 10 supervisors spawned ✓
+# - 20 workers spawned (2 per container) ✓
+# - But only 2 partitions to process ⚠️
+```
+
+**What happens:**
+- All 20 workers compete for the same 2 partitions
+- `SKIP LOCKED` ensures no duplication ✓
+- **But**: 18 workers often idle, wasting resources ⚠️
+
+**Solution**: Increase partitions to match container count, or reduce container count.
+
+### Deployment Examples
+
+#### ECS (Elastic Container Service)
+
+**Task Definition** with 3 desired tasks:
+
+```json
+{
+  "family": "outbox-relay",
+  "containerDefinitions": [{
+    "name": "outbox-relay",
+    "image": "your-app:latest",
+    "command": ["bundle", "exec", "outbox_relay", "start"],
+    "memory": 512,
+    "cpu": 256,
+    "essential": true
+  }]
+}
+```
+
+**Service Configuration**:
+```json
+{
+  "serviceName": "outbox-relay-service",
+  "desiredCount": 3,
+  "launchType": "FARGATE",
+  "healthCheckGracePeriodSeconds": 60
+}
+```
+
+**Result**: 3 containers, each with supervisor + workers. Workers coordinate via database.
+
+#### Kubernetes
+
+**Deployment** with 5 replicas:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: outbox-relay
+spec:
+  replicas: 5  # 5 independent supervisor instances
+  selector:
+    matchLabels:
+      app: outbox-relay
+  template:
+    metadata:
+      labels:
+        app: outbox-relay
+    spec:
+      containers:
+      - name: outbox-relay
+        image: your-app:latest
+        command: ["bundle", "exec", "outbox_relay", "start"]
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+```
+
+**Configuration** (`config/outbox_consumers.yml`):
+```yaml
+topics:
+  events:
+    partitions: 10  # Support up to 10 replicas efficiently
+
+consumer_groups:
+  processor:
+    topics:
+      - name: events
+        class: "EventProcessor"
+        partitions: all
+```
+
+**Result**: 5 pods × 2 workers = 10 workers efficiently processing 10 partitions.
+
+#### Docker Compose (Development/Testing)
+
+```yaml
+version: '3.8'
+services:
+  outbox-relay-1:
+    build: .
+    command: bundle exec outbox_relay start
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://postgres@postgres/myapp_development
+
+  outbox-relay-2:
+    build: .
+    command: bundle exec outbox_relay start
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://postgres@postgres/myapp_development
+
+  postgres:
+    image: postgres:15
+    ports:
+      - "5432:5432"
+```
+
+**Result**: 2 supervisors running locally, coordinating via PostgreSQL.
+
+### Monitoring Multi-Instance Deployments
+
+#### Check All Running Processes
+
+```bash
+# Shows all supervisors and workers across all containers
+bundle exec rake outbox_relay:status
+
+# Example output:
+# Process Registry (last 5 minutes)
+# ================================================================================
+# SUPERVISORS (3 running)
+# --------------------------------------------------------------------------------
+#   supervisor-abc123  | PID: 1  | Host: ecs-task-1 | Workers: 2 | Uptime: 2h
+#   supervisor-def456  | PID: 1  | Host: ecs-task-2 | Workers: 2 | Uptime: 2h
+#   supervisor-ghi789  | PID: 1  | Host: ecs-task-3 | Workers: 2 | Uptime: 1h
+#
+# WORKERS (6 running)
+# --------------------------------------------------------------------------------
+#   worker-orders-p0 | PID: 15 | Supervisor: abc123 | Loops: 523
+#   worker-orders-p1 | PID: 16 | Supervisor: abc123 | Loops: 498
+#   ... (6 total)
+```
+
+#### Monitor Event Distribution
+
+```ruby
+# Check which workers are actively processing
+OutboxRelay::Process
+  .where(kind: "worker")
+  .where("last_heartbeat_at > ?", 1.minute.ago)
+  .group_by(&:hostname)
+  .transform_values(&:count)
+
+# => {"ecs-task-1" => 2, "ecs-task-2" => 2, "ecs-task-3" => 2}
+```
+
+#### Health Check for Multi-Instance
+
+```ruby
+# app/controllers/health_controller.rb
+def outbox_relay
+  # Check if ANY supervisor is running (not requiring specific count)
+  recent_supervisors = OutboxRelay::Process
+    .where(kind: "supervisor")
+    .where("last_heartbeat_at > ?", 2.minutes.ago)
+    .count
+
+  recent_workers = OutboxRelay::Process
+    .where(kind: "worker")
+    .where("last_heartbeat_at > ?", 2.minutes.ago)
+    .count
+
+  healthy = recent_supervisors > 0 && recent_workers > 0
+
+  render json: {
+    healthy: healthy,
+    supervisors: recent_supervisors,
+    workers: recent_workers,
+    message: healthy ? "OutboxRelay operating normally" : "No active workers"
+  }, status: healthy ? 200 : 503
+end
+```
+
+### Best Practices
+
+✅ **DO:**
+- Set partition count to match or exceed maximum number of instances
+- Use ECS/Kubernetes autoscaling - OutboxRelay handles it automatically
+- Monitor process registry health (`rake outbox_relay:process_status`)
+- Schedule dead process cleanup: `*/5 * * * * rake outbox_relay:prune_processes`
+
+❌ **DON'T:**
+- Try to enforce single supervisor (breaks horizontal scaling)
+- Use file-based pidfiles for singleton (doesn't work across containers)
+- Worry about seeing multiple supervisors in logs (this is correct!)
+- Set partitions lower than your instance count (wastes resources)
+
+### FAQ
+
+**Q: I see 10 supervisors in my process registry. Is this a bug?**
+A: No! With 10 ECS tasks, you should see 10 supervisors. Each container runs one supervisor.
+
+**Q: Won't this cause duplicate event processing?**
+A: No. Workers coordinate via `FOR UPDATE SKIP LOCKED` and advisory locks at the database level.
+
+**Q: Should I limit to one supervisor?**
+A: No. That defeats horizontal scaling. OutboxRelay is designed for multiple supervisors.
+
+**Q: How do I scale up?**
+A: Just increase ECS desired count or Kubernetes replicas. No configuration changes needed (if partitions ≥ instances).
+
+**Q: What if one container dies?**
+A: Other containers continue processing. The dead supervisor's workers are cleaned up by `rake outbox_relay:prune_processes`.
+
+**Q: Can different containers process different partitions?**
+A: By default, all containers process all partitions (coordinated by SKIP LOCKED). For dedicated partition assignment, use partition configuration:
+
+```yaml
+consumer_groups:
+  processor_group_a:
+    topics:
+      - name: events
+        partitions: [0, 1, 2]  # Container group A
+
+  processor_group_b:
+    topics:
+      - name: events
+        partitions: [3, 4, 5]  # Container group B
+```
+
+Then deploy with environment variables to load different consumer groups per container.
 
 ## 🔧 Troubleshooting
 
