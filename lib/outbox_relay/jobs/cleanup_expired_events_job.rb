@@ -16,11 +16,9 @@ module OutboxRelay
     #
     # Enable cleanup in your OutboxRelay initializer:
     #
-    #   OutboxRelay.configure do |config|
-    #     config.cleanup_enabled = true           # Enable/disable cleanup (default: false)
-    #     config.cleanup_interval = 900           # Run every 15 minutes (default: 900)
-    #     config.cleanup_batch_size = 10_000      # Delete up to 10k events per run (default: 10_000)
-    #   end
+    #   OutboxRelay.configuration.cleanup_enabled = true        # Enable/disable cleanup (default: false)
+    #   OutboxRelay.configuration.cleanup_interval = 900        # Run every 15 minutes (default: 900)
+    #   OutboxRelay.configuration.cleanup_batch_size = 10_000   # Delete up to 10k events per run (default: 10_000)
     #
     # ## Sidekiq Integration
     #
