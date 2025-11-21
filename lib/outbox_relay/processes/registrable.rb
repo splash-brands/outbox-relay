@@ -12,17 +12,16 @@ module OutboxRelay
       #
       # Registry tracks: process ID, name, kind, hostname, PID, metadata, heartbeats
       def register
-        # Prepare metadata for database storage
-        # Include supervisor_id if this is a supervised worker
-        registration_metadata = metadata.merge(
-          supervisor_id: supervisor_id_for_registration
-        ).compact
+        # Get supervisor_id from the supervisor DB process object if available
+        # This is set by supervisor.supervised_by() before fork
+        # Avoids PID-based lookup which fails in multi-container deployments
+        supervisor_id = try(:supervisor_db_process)&.id
 
         @db_process = OutboxRelay::Process.register(
           kind: kind,
           name: name,
-          supervisor_id: registration_metadata.delete(:supervisor_id),
-          **registration_metadata
+          supervisor_id: supervisor_id,
+          **metadata.compact
         )
 
         OutboxRelay.logger.info(
@@ -51,17 +50,6 @@ module OutboxRelay
 
         # Re-raise - a process that can't register shouldn't run
         raise OutboxRelay::Error, "Failed to register process: #{e.message}"
-      end
-
-      # Get supervisor database ID for worker registration
-      # Workers need to link to their supervisor's database record
-      def supervisor_id_for_registration
-        return nil unless supervised?
-
-        # For workers, find supervisor's database record by PID
-        # @supervisor_pid was captured after fork in boot
-        supervisor_record = OutboxRelay::Process.find_by(pid: @supervisor_pid)
-        supervisor_record&.id
       end
 
       def deregister

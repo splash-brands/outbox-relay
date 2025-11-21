@@ -62,6 +62,14 @@ module OutboxRelay
     before_shutdown :log_worker_stop
 
     attr_reader :consumer_class_name, :consumer_group, :topic, :partition_key, :batch_size, :max_loops
+    attr_reader :supervisor_db_process
+
+    # Set the supervisor's database process record
+    # Called by supervisor before fork to pass its DB record to the worker
+    # This avoids PID-based lookup which fails in multi-container deployments
+    def supervised_by(supervisor_process)
+      @supervisor_db_process = supervisor_process
+    end
 
     def initialize(consumer_class:, consumer_group:, topic:, partition_key:, polling_interval: 1.0, batch_size: 100, max_loops: 1000)
       @consumer_class_name = consumer_class
