@@ -41,16 +41,16 @@ module OutboxRelay
     end
 
     initializer "outbox_relay.logger" do
-      ActiveSupport.on_load(:outbox_relay) do
-        self.logger = ::Rails.logger if logger == OutboxRelay::DEFAULT_LOGGER
-      end
-
       # Attach LogSubscriber for automatic structured logging
       OutboxRelay::LogSubscriber.attach_to :outbox_relay
 
       config.after_initialize do |app|
         OutboxRelay.logger = config.outbox_relay.logger || Rails.logger
         OutboxRelay.custom_logger = Rails.application.config.custom_logger if Rails.application.config.respond_to?(:custom_logger)
+      end
+
+      ActiveSupport.on_load(:outbox_relay) do
+        OutboxRelay.logger = ::Rails.logger if OutboxRelay.logger == OutboxRelay::DEFAULT_LOGGER
       end
     end
 
