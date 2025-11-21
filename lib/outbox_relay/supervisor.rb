@@ -203,6 +203,11 @@ module OutboxRelay
       worker = Worker.new(**worker_params)
       worker.mode = :fork
 
+      # Pass supervisor's DB record to worker before fork
+      # This allows worker to register with correct supervisor_id
+      # Avoids PID-based lookup which fails in multi-container deployments
+      worker.supervised_by(@db_process)
+
       begin
         pid = fork do
           # In child process (forked worker)
