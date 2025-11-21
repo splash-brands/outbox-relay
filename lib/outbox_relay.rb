@@ -101,6 +101,9 @@ require "outbox_relay/configuration"
 require "outbox_relay/cli"
 require "outbox_relay/outbox_publisher"
 
+# Load jobs (optional features)
+require "outbox_relay/jobs/cleanup_expired_events_job"
+
 # Load process management (modules first, then classes in dependency order)
 require "outbox_relay/processes/callbacks"
 require "outbox_relay/processes/interruptible"
