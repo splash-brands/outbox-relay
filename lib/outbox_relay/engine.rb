@@ -8,15 +8,49 @@ module OutboxRelay
 
     config.outbox_relay = ActiveSupport::OrderedOptions.new
 
-    initializer "outbox_relay.configs" do
-      config.after_initialize do |app|
-        OutboxRelay.logger = app.config.outbox_relay.logger || Rails.logger
-        OutboxRelay.custom_logger = Rails.application.config.custom_logger if Rails.application.config.respond_to?(:custom_logger)
+    # Configure app executor and error handling before Rails prepares
+    # This ensures OutboxRelay can report errors during initialization
+    initializer "outbox_relay.app_executor", before: :run_prepare_callbacks do |app|
+      config.outbox_relay.app_executor ||= app.executor
 
-        # Configure Rails executor wrapper for proper context management
-        # This ensures database connections, code reloading, and other Rails
-        # features work correctly in forked worker processes
-        OutboxRelay.app_executor = app.executor
+      # Default error handler using Rails.error (Rails 7+)
+      # Falls back to Rails.logger for Rails 6
+      config.outbox_relay.on_thread_error ||= ->(exception) {
+        if defined?(Rails.error)
+          Rails.error.report(exception, handled: false, source: "outbox_relay")
+        else
+          Rails.logger.error("[OutboxRelay] Thread error: #{exception.message}")
+          Rails.logger.error(exception.backtrace.join("\n"))
+        end
+      }
+
+      OutboxRelay.app_executor = config.outbox_relay.app_executor
+      OutboxRelay.on_thread_error = config.outbox_relay.on_thread_error
+    end
+
+    # Apply configuration from config.outbox_relay to OutboxRelay module
+    initializer "outbox_relay.config" do
+      config.outbox_relay.each do |name, value|
+        # Skip internal Rails options (app_executor, on_thread_error)
+        next if [:app_executor, :on_thread_error].include?(name)
+
+        if OutboxRelay.respond_to?("#{name}=")
+          OutboxRelay.public_send("#{name}=", value)
+        end
+      end
+    end
+
+    initializer "outbox_relay.logger" do
+      ActiveSupport.on_load(:outbox_relay) do
+        self.logger = ::Rails.logger if logger == OutboxRelay::DEFAULT_LOGGER
+      end
+
+      # Attach LogSubscriber for automatic structured logging
+      OutboxRelay::LogSubscriber.attach_to :outbox_relay
+
+      config.after_initialize do |app|
+        OutboxRelay.logger = config.outbox_relay.logger || Rails.logger
+        OutboxRelay.custom_logger = Rails.application.config.custom_logger if Rails.application.config.respond_to?(:custom_logger)
       end
     end
 

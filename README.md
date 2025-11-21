@@ -21,6 +21,8 @@ OutboxRelay is a high-performance, long-running process system that continuously
 - 🎯 **Event filtering** - Process only specific event types
 - 📈 **Monitoring** - ActiveSupport::Notifications for any backend (Sentry, DataDog, New Relic)
 - 🔧 **Zero dependencies** - Pure PostgreSQL, no external queue systems
+- 🎨 **Rails-native** - Deep Rails integration (Engine, LogSubscriber, Error Reporting)
+- 🐛 **Auto error tracking** - Automatic Sentry/Bugsnag integration (Rails 7+)
 
 ## 🛡️ Production Readiness for ECS/Container Deployments
 
@@ -245,33 +247,56 @@ bundle exec rake outbox_relay:stop
 
 ## ⚙️ Configuration
 
-### Initializer Options
+### Rails-Style Configuration (Recommended)
 
-In `config/initializers/outbox_relay.rb`:
+OutboxRelay integrates deeply with Rails through the Engine pattern. Configure via `config.outbox_relay` in `config/application.rb` or environment-specific files:
 
 ```ruby
-OutboxRelay.configure do |config|
-  # Polling interval (seconds) - default delay when no backlog
-  config.polling_interval = 1.0
+# config/application.rb or config/environments/production.rb
+module YourApp
+  class Application < Rails::Application
+    # OutboxRelay configuration
+    config.outbox_relay.polling_interval = 1.0    # Polling interval (seconds)
+    config.outbox_relay.batch_size = 100          # Events per batch
+    config.outbox_relay.max_loops = 1000          # Worker restart after N loops
+    config.outbox_relay.shutdown_timeout = 30     # Graceful shutdown timeout
+    config.outbox_relay.silence_polling = true    # Reduce query logs
 
-  # Batch size - events processed per poll
-  config.batch_size = 100
+    # Optional: Custom logger
+    config.outbox_relay.logger = Logger.new("log/outbox_relay.log")
 
-  # Max loops before worker restart (prevents memory leaks)
-  config.max_loops = 1000
-
-  # Graceful shutdown timeout (seconds)
-  config.shutdown_timeout = 30
-
-  # Silence ActiveRecord query logs for polling
-  config.silence_polling = true
-end
-
-# Configure custom logger
-if Rails.application.config.respond_to?(:custom_logger)
-  OutboxRelay.custom_logger = Rails.application.config.custom_logger
+    # Optional: Custom error handler (overrides default Rails.error)
+    # By default, uses Rails.error for automatic Sentry/Bugsnag integration
+    config.outbox_relay.on_thread_error = ->(exception) {
+      Sentry.capture_exception(exception,
+        level: :error,
+        tags: { source: "outbox_relay" }
+      )
+    }
+  end
 end
 ```
+
+**Benefits:**
+- ✅ Rails-native configuration pattern
+- ✅ Per-environment settings (`production.rb`, `staging.rb`)
+- ✅ Automatic Rails error reporting (Rails 7+)
+- ✅ Consistent with other Rails gems
+
+### Backward-Compatible Configuration
+
+The original style still works for non-Rails apps or existing setups:
+
+```ruby
+# config/initializers/outbox_relay.rb
+OutboxRelay.polling_interval = 1.0
+OutboxRelay.batch_size = 100
+OutboxRelay.max_loops = 1000
+OutboxRelay.shutdown_timeout = 30
+OutboxRelay.silence_polling = true
+```
+
+**Note:** `config.outbox_relay` settings take precedence if both styles are used.
 
 ### CLI Options
 
@@ -413,9 +438,37 @@ consumer.last_consumed_sequence # => 12345
 consumer.last_consumed_at # => 2024-11-03 10:30:00 UTC
 ```
 
-### Logging
+### Automatic Structured Logging (New!)
 
-OutboxRelay provides structured logging via custom_logger:
+OutboxRelay now includes **LogSubscriber** for automatic, unified logging of all operations:
+
+```bash
+# Example output with automatic structured logging
+[OutboxRelay] Started worker-abc123 (kind: worker, topic: orders, partition: 0)
+[OutboxRelay] Batch processed (duration: 123.4ms, events: 10, topic: orders)
+[OutboxRelay] Worker stopped (uptime: 3600s, loops: 1000)
+```
+
+**Log Levels:**
+- `INFO`: Process lifecycle, registration, fork events
+- `WARN`: Errors, failures, unexpected conditions
+- `DEBUG`: Polling, batches, heartbeats (requires `config.log_level = :debug`)
+
+**Features:**
+- ✅ Automatic duration tracking for all operations
+- ✅ Colorized output (Rails-style)
+- ✅ Consistent structured format
+- ✅ No manual logging needed
+
+**Enable Debug Logging:**
+```ruby
+# config/environments/development.rb
+config.log_level = :debug  # See polling and batch details
+```
+
+### Manual Logging (Advanced)
+
+For custom logging beyond automatic LogSubscriber:
 
 ```ruby
 # Worker lifecycle events
@@ -426,21 +479,51 @@ OutboxRelay.logger.info(
   partition_key: 0
 )
 
-# Batch processing
+# Custom metrics
 OutboxRelay.logger.debug(
-  event_name: "batch_processed",
-  processed: 10,
-  lag: 5,
-  duration_ms: 42.5
+  event_name: "custom_metric",
+  metric_name: "batch_latency",
+  value: 42.5
 )
+```
 
-# Errors
-OutboxRelay.logger.error(
-  event_name: "consumer_error",
-  consumer_class: "OrderUpdatesConsumer",
-  error: error.message,
-  backtrace: error.backtrace.first(5)
-)
+### Automatic Error Reporting (New!)
+
+**Rails 7+ Integration**: OutboxRelay automatically reports all thread errors to your configured error tracker (Sentry, Bugsnag, Rollbar, etc.) via `Rails.error`:
+
+```ruby
+# Happens automatically - no configuration needed!
+# All OutboxRelay thread errors are reported to:
+# - Sentry
+# - Bugsnag
+# - Rollbar
+# - Any Rails.error subscriber
+
+# Errors include:
+#   - handled: false (for alerting)
+#   - source: "outbox_relay" (for filtering)
+#   - Full context (worker name, partition, etc.)
+```
+
+**Rails 6 Compatibility**: Automatically falls back to `Rails.logger.error`.
+
+**Custom Error Handler** (optional):
+```ruby
+# config/application.rb
+config.outbox_relay.on_thread_error = ->(exception) {
+  # Custom handling with additional context
+  Sentry.capture_exception(exception,
+    level: :error,
+    tags: {
+      source: "outbox_relay",
+      environment: Rails.env,
+      worker_type: Thread.current[:worker_name]
+    },
+    extra: {
+      partition: Thread.current[:partition_key]
+    }
+  )
+}
 ```
 
 ### ActiveSupport::Notifications Instrumentation
