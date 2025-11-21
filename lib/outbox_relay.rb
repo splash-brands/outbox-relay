@@ -116,5 +116,11 @@ require "outbox_relay/processes/poller"    # Poller < Base
 require "outbox_relay/worker"
 require "outbox_relay/supervisor"
 
+# Load LogSubscriber for structured logging
+require "outbox_relay/log_subscriber"
+
 # Load Rails integration if Rails is present
 require "outbox_relay/engine" if defined?(Rails::Engine)
+
+# Run load hooks for extensions
+ActiveSupport.run_load_hooks(:outbox_relay, self)
