@@ -9,7 +9,7 @@ module OutboxRelay
   validates :consumer_group, presence: true
   validates :topic, presence: true
   validates :last_consumed_sequence, presence: true, numericality: { only_integer: true, greater_than_or_equal_to: 0 }
-  validate :sequence_must_not_decrease, on: :update, if: :last_consumed_sequence_changed?
+  # Note: sequence_must_not_decrease validation removed - handled by conditional update in update_offset!
 
   # Scopes
   scope :for_group, ->(group) { where(consumer_group: group) }
@@ -29,13 +29,68 @@ module OutboxRelay
 
   # Instance methods
   def update_offset!(sequence:, event_id:)
+    # Kafka-style conditional offset update to handle out-of-order completion
+    # in concurrent worker environments.
+    #
+    # ## Problem: Race Condition in Concurrent Processing
+    #
+    # When multiple workers process events in parallel:
+    #   Worker A: fetches event seq=100
+    #   Worker B: fetches event seq=101
+    #   Worker B: completes first → offset=101 ✓
+    #   Worker A: completes later → tries offset=100 → CONFLICT!
+    #
+    # ## Solution: Conditional Update (Kafka Pattern)
+    #
+    # Only update offset if new sequence is GREATER than current:
+    #   UPDATE consumer_offsets
+    #   SET last_consumed_sequence = 100
+    #   WHERE id = X AND last_consumed_sequence < 100
+    #
+    # This prevents:
+    #   1. ValidationError when workers complete out-of-order
+    #   2. False-positive DLQ entries for successfully processed events
+    #   3. Offset going backwards (data integrity)
+    #
+    # ## Safety Guarantees (At-Least-Once Delivery)
+    #
+    # If Worker A crashes BEFORE commit:
+    #   - Transaction rolls back
+    #   - Advisory lock released
+    #   - Offset NOT updated
+    #   - Event seq=100 will be re-processed ✓
+    #
+    # If Worker A commits AFTER Worker B:
+    #   - Offset stays at 101 (conditional update skips)
+    #   - Event seq=100 was successfully processed
+    #   - No data loss ✓
+    #
+    # ## Return Value
+    #
+    # Returns:
+    #   - true if offset was updated (sequence > current)
+    #   - false if offset was stale (sequence <= current)
+    #   - Raises on other errors (DB connectivity, constraint violations)
+    #
     with_lock do
+      reload # Ensure we have latest offset value
+
+      # Check if this is a stale offset (event processed out-of-order)
+      if sequence <= last_consumed_sequence
+        # This is expected in concurrent processing - not an error!
+        # Worker completed processing but another worker already advanced offset
+        return false
+      end
+
+      # Offset is fresh - update it
       update!(
         last_consumed_sequence: sequence,
         last_consumed_event_id: event_id,
         last_consumed_at: Time.current,
         heartbeat_at: Time.current,
       )
+
+      true
     end
   end
 
@@ -61,26 +116,6 @@ module OutboxRelay
 
   def active?
     heartbeat_at.present? && heartbeat_at > ACTIVE_TIMEOUT.ago
-  end
-
-  private
-
-  def sequence_must_not_decrease
-    # Prevents sequence from going backwards, but ALLOWS same sequence to be
-    # written multiple times (e.g., after worker restart with in-progress event).
-    #
-    # Database uniqueness constraint on (consumer_group, topic) prevents actual
-    # duplicate offset records. This validation only catches application bugs
-    # where sequence counter decrements.
-    return unless last_consumed_sequence_changed?
-    return unless last_consumed_sequence_was.present?
-
-    if last_consumed_sequence < last_consumed_sequence_was
-      errors.add(
-        :last_consumed_sequence,
-        "cannot decrease (was #{last_consumed_sequence_was}, got #{last_consumed_sequence})",
-      )
-    end
   end
   end
 end
