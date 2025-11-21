@@ -17,20 +17,16 @@ module OutboxRelay
     # Enable cleanup in your OutboxRelay initializer:
     #
     #   OutboxRelay.configuration.cleanup_enabled = true        # Enable/disable cleanup (default: false)
-    #   OutboxRelay.configuration.cleanup_interval = 900        # Run every 15 minutes (default: 900)
     #   OutboxRelay.configuration.cleanup_batch_size = 10_000   # Delete up to 10k events per run (default: 10_000)
     #
     # ## Sidekiq Integration
     #
-    # If using Sidekiq, register the job in your Sidekiq configuration:
+    # If using Sidekiq Enterprise periodic jobs, register the job with cron syntax:
     #
     #   Sidekiq.configure_server do |config|
     #     config.periodic do |mgr|
     #       if OutboxRelay.configuration.cleanup_enabled
-    #         mgr.register(
-    #           OutboxRelay.configuration.cleanup_interval,
-    #           "OutboxRelay::Jobs::CleanupExpiredEventsJob"
-    #         )
+    #         mgr.register("*/15 * * * *", "OutboxRelay::Jobs::CleanupExpiredEventsJob")  # Every 15 minutes
     #       end
     #     end
     #   end
