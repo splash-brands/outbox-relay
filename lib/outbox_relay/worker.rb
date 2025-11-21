@@ -170,8 +170,6 @@ module OutboxRelay
         payload[:processed_count] = count
         payload[:lag] = consumer.lag
 
-        log_batch_processed(count, consumer.lag) if count > 0
-
         count
       end
     ensure
@@ -335,11 +333,14 @@ module OutboxRelay
     # Lifecycle callbacks
 
     def log_worker_start
-      # Print detailed startup banner with metadata
+      # Log structured startup event
       print_startup_banner
+    end
 
-      # Log structured event for monitoring
-      custom_logger.warn(
+    def print_startup_banner
+      # Log structured data instead of ASCII banner
+      # LogSubscriber already handles the visual presentation with start_process event
+      log_data = {
         event_name: "worker_started",
         process_id: process_id,
         name: name,
@@ -348,54 +349,24 @@ module OutboxRelay
         topic: topic,
         partition_key: partition_key,
         polling_interval: polling_interval,
-        batch_size: batch_size,
-      )
-    end
+        batch_size: batch_size
+      }
 
-    def print_startup_banner
-      banner_lines = []
-      banner_lines << "=" * 80
-      banner_lines << "OutboxRelay Worker Starting"
-      banner_lines << "=" * 80
-      banner_lines << ""
-
-      # Consumer Group Info
-      banner_lines << "Consumer Group: #{consumer_group}"
+      # Add optional descriptions if available
       if OutboxRelay.configuration.consumer_group_configs[consumer_group]
         description = OutboxRelay.configuration.consumer_group_configs[consumer_group]["description"]
-        banner_lines << "Description: #{description}" if description.present?
+        log_data[:consumer_group_description] = description if description.present?
       end
 
-      banner_lines << ""
-
-      # Topic Info
-      banner_lines << "Processing Topic: #{topic}"
-      banner_lines << "  Partition: #{partition_key}"
       if OutboxRelay.configuration.topic_descriptions[topic]
-        topic_desc = OutboxRelay.configuration.topic_descriptions[topic]
-        banner_lines << "  Description: #{topic_desc}" if topic_desc.present?
+        log_data[:topic_description] = OutboxRelay.configuration.topic_descriptions[topic]
       end
-      banner_lines << "  Consumer Class: #{consumer_class_name}"
 
-      banner_lines << ""
-
-      # Configuration
-      banner_lines << "Configuration:"
-      banner_lines << "  Batch Size: #{batch_size} events/batch"
-      banner_lines << "  Polling Interval: #{polling_interval}s (when idle)"
-      banner_lines << "  Max Loops: #{max_loops} (before restart)"
-
-      banner_lines << ""
-      banner_lines << "Process ID: #{process_id}"
-      banner_lines << "=" * 80
-
-      # Log each line separately to ensure proper formatting
-      # Use warn level so banner is visible in production (info level is filtered out)
-      banner_lines.each { |line| custom_logger.warn(line) }
+      custom_logger.info(log_data)
     end
 
     def log_worker_stop
-      custom_logger.warn(
+      custom_logger.info(
         event_name: "worker_stopped",
         process_id: process_id,
         name: name,
@@ -407,17 +378,5 @@ module OutboxRelay
       )
     end
 
-    def log_batch_processed(count, lag)
-      custom_logger.debug(
-        event_name: "batch_processed",
-        process_id: process_id,
-        consumer_class: consumer_class_name,
-        topic: topic,
-        partition_key: partition_key,
-        processed: count,
-        lag: lag,
-        total_processed: @total_processed,
-      )
-    end
   end
 end

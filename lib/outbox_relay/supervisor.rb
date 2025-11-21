@@ -41,7 +41,7 @@ module OutboxRelay
 
     def stop
       super
-      custom_logger.warn(
+      custom_logger.info(
         event_name: "supervisor_stopping",
         process_id: process_id,
         supervisor_pid: ::Process.pid,
@@ -519,7 +519,7 @@ module OutboxRelay
     # Lifecycle callbacks
 
     def log_supervisor_start
-      custom_logger.warn(
+      custom_logger.info(
         event_name: "supervisor_started",
         process_id: process_id,
         supervisor_pid: ::Process.pid,
@@ -531,7 +531,7 @@ module OutboxRelay
     end
 
     def log_supervisor_stop
-      custom_logger.warn(
+      custom_logger.info(
         event_name: "supervisor_stopped",
         process_id: process_id,
         supervisor_pid: ::Process.pid,

@@ -55,7 +55,7 @@ module OutboxRelay
           # Lazy connection establishment can bypass gssencmode on macOS
           ActiveRecord::Base.connection.execute("SELECT 1")
 
-          custom_logger.info(
+          custom_logger.debug(
             event_name: "activerecord_reconnected_after_fork",
             process_id: process_id,
             name: name,

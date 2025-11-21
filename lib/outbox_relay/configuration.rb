@@ -184,13 +184,7 @@ module OutboxRelay
 
         # Priority 2: Configuration partitions (from YAML)
         if OutboxRelay.configuration.partitions[topic]
-          partition_count = OutboxRelay.configuration.partitions[topic]
-          OutboxRelay.logger.debug(
-            event_name: "using_yaml_partition_count",
-            topic: topic,
-            partition_count: partition_count
-          )
-          return partition_count
+          return OutboxRelay.configuration.partitions[topic]
         end
 
         # Priority 3: Query database for actual partitions (fallback)

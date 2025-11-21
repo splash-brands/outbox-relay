@@ -184,14 +184,14 @@ module OutboxRelay
       def handle_signal(signal)
         case signal
         when "TERM", "INT"
-          custom_logger.warn(
+          custom_logger.info(
             event_name: "terminating_gracefully",
             signal: signal,
             process_id: process_id
           )
           terminate_gracefully
         when "QUIT"
-          custom_logger.warn(
+          custom_logger.info(
             event_name: "terminating_immediately",
             signal: signal,
             process_id: process_id
