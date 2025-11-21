@@ -421,7 +421,19 @@ module OutboxRelay
 
       # Update offset atomically (lock auto-released on COMMIT)
       begin
-        update_offset(event)
+        offset_updated = update_offset(event)
+
+        # Log stale offset updates for visibility (Kafka-style out-of-order completion)
+        unless offset_updated
+          @logger.debug(
+            event_name: "stale_offset_skipped",
+            event_id: event.event_id,
+            sequence: event.sequence,
+            current_offset: current_offset.last_consumed_sequence,
+            consumer_group: consumer_group,
+            message: "Event processed successfully but offset not updated (out-of-order completion)"
+          )
+        end
       rescue => e
         # Offset update failures are CRITICAL - they indicate infrastructure issues
         # and can cause event reprocessing or offset corruption

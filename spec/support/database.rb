@@ -34,13 +34,16 @@ ActiveRecord::Schema.define do
   create_table :outbox_relay_consumer_offsets, force: true do |t|
     t.string :consumer_group, null: false
     t.string :topic, null: false
-    t.integer :partition_key, null: false, default: 0
     t.integer :last_consumed_sequence, null: false, default: 0
+    t.string :last_consumed_event_id
+    t.string :consumer_instance_id
     t.datetime :last_consumed_at
     t.datetime :heartbeat_at
     t.timestamps
 
-    t.index [:consumer_group, :topic, :partition_key], unique: true, name: "index_consumer_offsets_unique"
+    # Unique constraint: one offset per (consumer_group, topic)
+    # Note: partition is encoded in consumer_group name (e.g., "notifications_p0")
+    t.index [:consumer_group, :topic], unique: true, name: "index_consumer_offsets_unique"
     t.index :heartbeat_at
   end
 
