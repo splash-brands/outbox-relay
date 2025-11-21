@@ -231,14 +231,14 @@ module OutboxRelay
           started_at: Time.current,
         }
 
-        custom_logger.info(
-          event_name: "worker_forked",
+        safe_instrument(
+          :worker_forked,
           supervisor_pid: ::Process.pid,
           worker_pid: pid,
           worker_name: worker.name,
           consumer_class: worker_config.consumer_class,
           topic: worker_config.topic,
-          partition_key: partition_key,
+          partition_key: partition_key
         )
 
       rescue => e

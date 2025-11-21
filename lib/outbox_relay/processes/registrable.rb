@@ -24,8 +24,8 @@ module OutboxRelay
           **metadata.compact
         )
 
-        OutboxRelay.logger.info(
-          event_name: "process_registered",
+        OutboxRelay.instrument(
+          :process_registered,
           process_id: process_id,
           name: name,
           kind: kind,
@@ -64,8 +64,8 @@ module OutboxRelay
 
         @db_process.deregister
 
-        OutboxRelay.logger.info(
-          event_name: "process_deregistered",
+        OutboxRelay.instrument(
+          :process_deregistered,
           process_id: process_id,
           name: name,
           kind: kind,

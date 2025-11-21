@@ -73,25 +73,18 @@ module OutboxRelay
 
     # Worker polling events (debug level - noisy)
 
-    def polling(event)
+    def poll(event)
       debug do
         "Polling (duration: #{event.duration.round(1)}ms)"
       end
     end
 
-    def batch_fetched(event)
+    def process_batch(event)
       debug do
         payload = event.payload
-        "Batch fetched (duration: #{event.duration.round(1)}ms, events: #{payload[:count]}, " \
-        "topic: #{payload[:topic]}, partition: #{payload[:partition_key]})"
-      end
-    end
-
-    def batch_processed(event)
-      debug do
-        payload = event.payload
-        "Batch processed (duration: #{event.duration.round(1)}ms, events: #{payload[:count]}, " \
-        "topic: #{payload[:topic]}, partition: #{payload[:partition_key]})"
+        process = payload[:process]
+        "Batch processed (duration: #{event.duration.round(1)}ms, processed: #{payload[:processed_count]}, " \
+        "lag: #{payload[:lag]})"
       end
     end
 

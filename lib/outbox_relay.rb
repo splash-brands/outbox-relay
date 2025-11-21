@@ -38,7 +38,7 @@ module OutboxRelay
   end
 
   def instrument(channel, **options, &block)
-    ActiveSupport::Notifications.instrument("outbox_relay.#{channel}", **options, &block)
+    ActiveSupport::Notifications.instrument("#{channel}.outbox_relay", **options, &block)
   end
 
   def configure
