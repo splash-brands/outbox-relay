@@ -20,15 +20,14 @@ module OutboxRelay
   #   OutboxRelay::LogSubscriber.attach_to :outbox_relay
   #
   # Log levels:
-  # - INFO: Process lifecycle (start, stop, registration)
+  # - INFO: Process lifecycle (start, stop, registration), batch processing (when events processed)
   # - WARN: Errors, failures, unexpected conditions
-  # - DEBUG: Polling, batches, heartbeats (noisy, off by default)
+  # - DEBUG: Polling operations (noisy, off by default)
   #
   # ## Example Output
   #
   #   [OutboxRelay] Started worker-abc123 (kind: worker, topic: orders, partition: 0)
-  #   [OutboxRelay] Polling completed (duration: 45.2ms, events: 10)
-  #   [OutboxRelay] Batch processed (duration: 123.4ms, events: 10, topic: orders)
+  #   [OutboxRelay] Batch processed worker: "worker-abc123", consumer_group: "notifications", topic: "user_events", partition: 0, processed: 10, lag: 5, duration_ms: 123.4, throughput_per_sec: 81.0
   #   [OutboxRelay] Worker stopped (uptime: 3600s, loops: 1000)
   #
   class LogSubscriber < ActiveSupport::LogSubscriber
@@ -80,11 +79,32 @@ module OutboxRelay
     end
 
     def process_batch(event)
-      debug do
-        payload = event.payload
-        process = payload[:process]
-        "Batch processed (duration: #{event.duration.round(1)}ms, processed: #{payload[:processed_count]}, " \
-        "lag: #{payload[:lag]})"
+      payload = event.payload
+      process = payload[:process]
+      consumer = payload[:consumer]
+      processed_count = payload[:processed_count] || 0
+
+      # Only log when events were actually processed (reduce noise when idle)
+      return unless processed_count > 0
+
+      # INFO level for batch processing (important operational data)
+      # Includes all context needed for debugging and monitoring
+      info do
+        duration = event.duration.round(1)
+        throughput = processed_count / (event.duration / 1000.0)
+
+        attributes = {
+          worker: process&.name,
+          consumer_group: consumer&.consumer_group,
+          topic: consumer&.topic,
+          partition: consumer&.partition_key,
+          processed: processed_count,
+          lag: payload[:lag],
+          duration_ms: duration,
+          throughput_per_sec: throughput.round(1)
+        }
+
+        "Batch processed #{formatted_attributes(**attributes)}"
       end
     end
 
@@ -196,6 +216,10 @@ module OutboxRelay
     def debug(&block)
       return unless logger.debug?
       logger.debug(color(yield, :cyan, true))
+    end
+
+    def formatted_attributes(**attributes)
+      attributes.map { |attr, value| "#{attr}: #{value.inspect}" }.join(", ")
     end
 
     def color(message, color_name, bold = false)
