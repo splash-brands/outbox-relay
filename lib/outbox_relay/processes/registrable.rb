@@ -33,7 +33,7 @@ module OutboxRelay
           db_id: @db_process.id
         )
       rescue => e
-        OutboxRelay.logger.error(
+        custom_logger.error(
           event_name: "process_registration_failed",
           name: name,
           error: e.message,
@@ -54,7 +54,7 @@ module OutboxRelay
 
       def deregister
         unless @db_process
-          OutboxRelay.logger.warn(
+          custom_logger.warn(
             event_name: "deregister_skipped_no_process",
             name: name,
             reason: "Process was never successfully registered"
@@ -72,7 +72,7 @@ module OutboxRelay
           db_id: @db_process.id
         )
       rescue => e
-        OutboxRelay.logger.error(
+        custom_logger.error(
           event_name: "process_deregistration_failed",
           name: name,
           process_id: process_id,
@@ -120,23 +120,45 @@ module OutboxRelay
           # Process was deregistered or record deleted
           failures = @heartbeat_failures.increment
 
-          OutboxRelay.logger.warn(
+          # Severity escalation: INFO → WARN → ERROR
+          # First failure is expected during graceful shutdown/deployment
+          # Multiple failures indicate a real problem
+          severity = case failures
+                     when 1 then :info
+                     when 2 then :warn
+                     else :error
+                     end
+
+          custom_logger.public_send(
+            severity,
             event_name: "heartbeat_process_not_found",
             process_id: process_id,
             db_id: @db_process.id,
-            consecutive_failures: failures
+            consecutive_failures: failures,
+            severity: severity
           )
         end
       rescue => e
         failures = @heartbeat_failures.increment
 
-        OutboxRelay.logger.error(
+        # Severity escalation for database errors
+        # First failure could be transient (network blip, connection pool exhausted)
+        # Multiple failures indicate persistent database issues
+        severity = case failures
+                   when 1 then :warn
+                   when 2 then :error
+                   else :error
+                   end
+
+        custom_logger.public_send(
+          severity,
           event_name: "process_heartbeat_failed",
           process_id: process_id,
           db_id: @db_process&.id,
           error: e.message,
           consecutive_failures: failures,
-          max_failures: @max_heartbeat_failures
+          max_failures: @max_heartbeat_failures,
+          severity: severity
         )
 
         OutboxRelay::Instrumentation::Process.heartbeat_failed(
@@ -149,7 +171,7 @@ module OutboxRelay
 
         # After max consecutive failures, assume database is broken and shut down
         if failures >= @max_heartbeat_failures
-          OutboxRelay.logger.error(
+          custom_logger.error(
             event_name: "heartbeat_failures_exceeded",
             process_id: process_id,
             db_id: @db_process&.id,

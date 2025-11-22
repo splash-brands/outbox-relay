@@ -16,7 +16,6 @@ module OutboxRelay
   DEFAULT_LOGGER = ActiveSupport::Logger.new($stdout)
 
   mattr_accessor :logger, default: DEFAULT_LOGGER
-  mattr_accessor :custom_logger # For application-specific logging
 
   # Configuration
   mattr_accessor :polling_interval, default: 1.0 # seconds

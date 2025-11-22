@@ -46,7 +46,6 @@ module OutboxRelay
 
       config.after_initialize do |app|
         OutboxRelay.logger = config.outbox_relay.logger || Rails.logger
-        OutboxRelay.custom_logger = Rails.application.config.custom_logger if Rails.application.config.respond_to?(:custom_logger)
       end
 
       ActiveSupport.on_load(:outbox_relay) do

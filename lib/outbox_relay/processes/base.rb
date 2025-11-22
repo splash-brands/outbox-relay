@@ -100,7 +100,7 @@ module OutboxRelay
       end
 
       def custom_logger
-        @custom_logger ||= OutboxRelay.custom_logger || OutboxRelay.logger
+        OutboxRelay.logger
       end
     end
   end
