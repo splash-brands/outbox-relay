@@ -17,7 +17,3 @@ OutboxRelay.configure do |config|
   config.silence_polling = true
 end
 
-# Configure custom logger if available
-if Rails.application.config.respond_to?(:custom_logger)
-  OutboxRelay.custom_logger = Rails.application.config.custom_logger
-end

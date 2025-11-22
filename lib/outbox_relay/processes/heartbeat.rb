@@ -54,14 +54,14 @@ module OutboxRelay
 
         @heartbeat_task.execute
 
-        OutboxRelay.logger.info(
+        custom_logger.info(
           event_name: "heartbeat_started",
           process_id: process_id,
           interval: @heartbeat_interval,
           max_failures: @max_heartbeat_failures
         )
       rescue => e
-        OutboxRelay.logger.error(
+        custom_logger.error(
           event_name: "heartbeat_start_failed",
           process_id: process_id,
           error: e.message,
@@ -91,7 +91,7 @@ module OutboxRelay
         unless @heartbeat_task.wait_for_termination(5)
           # Force kill if it doesn't stop gracefully
           @heartbeat_task.kill
-          OutboxRelay.logger.warn(
+          custom_logger.warn(
             event_name: "heartbeat_force_killed",
             process_id: process_id,
             reason: "Task didn't stop within 5 seconds"
@@ -100,12 +100,12 @@ module OutboxRelay
 
         @heartbeat_task = nil
 
-        OutboxRelay.logger.info(
+        custom_logger.info(
           event_name: "heartbeat_stopped",
           process_id: process_id
         )
       rescue => e
-        OutboxRelay.logger.error(
+        custom_logger.error(
           event_name: "heartbeat_stop_failed",
           process_id: process_id,
           error: e.message,
@@ -120,7 +120,7 @@ module OutboxRelay
       def handle_heartbeat_task_error(time, result, exception)
         return unless exception
 
-        OutboxRelay.logger.error(
+        custom_logger.error(
           event_name: "heartbeat_task_error",
           process_id: process_id,
           error: exception.message,

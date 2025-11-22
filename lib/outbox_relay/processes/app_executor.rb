@@ -121,7 +121,7 @@ module OutboxRelay
       #
       def handle_thread_error(error)
         # Log error details
-        logger = OutboxRelay.custom_logger || Rails.logger
+        logger = OutboxRelay.logger
         logger.error(
           event_name: "outbox_relay_thread_error",
           error: error.message,
@@ -139,7 +139,7 @@ module OutboxRelay
       rescue => callback_error
         # Error handler itself failed - log but don't raise
         # This prevents error handling from causing additional failures
-        logger = OutboxRelay.custom_logger || Rails.logger
+        logger = OutboxRelay.logger
         logger.error(
           event_name: "thread_error_handler_failed",
           original_error: error.message,

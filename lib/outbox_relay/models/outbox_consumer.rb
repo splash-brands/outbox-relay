@@ -35,7 +35,7 @@ module OutboxRelay
       @partition_key = partition_key
       @event_filter = Array.wrap(event_filter).compact
       @dead_letter_config = dead_letter_config
-      @logger = OutboxRelay.custom_logger || OutboxRelay.logger
+      @logger = OutboxRelay.logger
       @consumer_instance_id = build_consumer_instance_id
     end
 
