@@ -41,7 +41,7 @@ module OutboxRelay
 
     def stop
       super
-      custom_logger.info(
+      OutboxRelay.logger.info(
         event_name: "supervisor_stopping",
         process_id: process_id,
         supervisor_pid: ::Process.pid,
@@ -66,7 +66,7 @@ module OutboxRelay
     def safe_instrument(event_name, **metadata, &block)
       OutboxRelay.instrument(event_name, **metadata, &block)
     rescue => e
-      custom_logger.warn(
+      OutboxRelay.logger.warn(
         event_name: "instrumentation_failed",
         failed_event: event_name,
         error: e.message,
@@ -87,7 +87,7 @@ module OutboxRelay
 
       # Report startup status including any failures
       if @failed_worker_starts.any?
-        custom_logger.error(
+        OutboxRelay.logger.error(
           event_name: "supervisor_boot_incomplete",
           total_expected: total_expected,
           running_workers: forks.size,
@@ -242,7 +242,7 @@ module OutboxRelay
         )
 
       rescue => e
-        custom_logger.error(
+        OutboxRelay.logger.error(
           event_name: "fork_system_error",
           worker_name: worker.name,
           error: e.message,
@@ -265,7 +265,7 @@ module OutboxRelay
         }
 
         # Don't crash supervisor - log and continue with other workers
-        custom_logger.error(
+        OutboxRelay.logger.error(
           event_name: "worker_fork_abandoned",
           worker_name: worker.name,
           message: "Failed to fork worker - continuing with other workers"
@@ -312,7 +312,7 @@ module OutboxRelay
         worker_config = backoff_info[:worker_config]
         partition_key = backoff_info[:partition_key]
 
-        custom_logger.info(
+        OutboxRelay.logger.info(
           event_name: "worker_restarting_after_backoff",
           worker_key: worker_key,
           partition_key: partition_key,
@@ -350,7 +350,7 @@ module OutboxRelay
 
               # Check if we've exceeded max attempts
               if attempts > 10
-                custom_logger.error(
+                OutboxRelay.logger.error(
                   event_name: "worker_restart_abandoned",
                   worker_name: fork_info[:worker]&.name,
                   restart_attempts: attempts,
@@ -378,7 +378,7 @@ module OutboxRelay
                 partition_key: fork_info[:partition_key]
               }
 
-              custom_logger.warn(
+              OutboxRelay.logger.warn(
                 event_name: "worker_restart_delayed",
                 worker_name: fork_info[:worker]&.name,
                 restart_attempts: attempts,
@@ -398,7 +398,7 @@ module OutboxRelay
 
     def log_fork_terminated(pid, fork_info, status)
       if status.success?
-        custom_logger.info(
+        OutboxRelay.logger.info(
           event_name: "worker_terminated_successfully",
           supervisor_pid: ::Process.pid,
           worker_pid: pid,
@@ -406,7 +406,7 @@ module OutboxRelay
           uptime: Time.current - fork_info[:started_at],
         )
       else
-        custom_logger.error(
+        OutboxRelay.logger.error(
           event_name: "worker_terminated_with_error",
           supervisor_pid: ::Process.pid,
           worker_pid: pid,
@@ -432,7 +432,7 @@ module OutboxRelay
         failed = signal_processes(forks.keys, :TERM)
 
         if failed.any?
-          custom_logger.error(
+          OutboxRelay.logger.error(
             event_name: "graceful_shutdown_signal_failures",
             failed_pids: failed,
             message: "Some workers did not receive TERM signal"
@@ -467,7 +467,7 @@ module OutboxRelay
         failed = signal_processes(forks.keys, :KILL)
 
         if failed.any?
-          custom_logger.error(
+          OutboxRelay.logger.error(
             event_name: "kill_signal_failures",
             failed_pids: failed,
             message: "Some workers did not receive KILL signal - may be zombie processes"
@@ -519,7 +519,7 @@ module OutboxRelay
     # Lifecycle callbacks
 
     def log_supervisor_start
-      custom_logger.info(
+      OutboxRelay.logger.info(
         event_name: "supervisor_started",
         process_id: process_id,
         supervisor_pid: ::Process.pid,
@@ -531,7 +531,7 @@ module OutboxRelay
     end
 
     def log_supervisor_stop
-      custom_logger.info(
+      OutboxRelay.logger.info(
         event_name: "supervisor_stopped",
         process_id: process_id,
         supervisor_pid: ::Process.pid,

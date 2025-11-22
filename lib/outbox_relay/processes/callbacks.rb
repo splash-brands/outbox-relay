@@ -35,7 +35,7 @@ module OutboxRelay
         _boot_callbacks.each do |callback|
           send(callback)
         rescue => e
-          custom_logger.error(
+          OutboxRelay.logger.error(
             event_name: "boot_callback_failed",
             callback: callback,
             error: e.message,
@@ -65,7 +65,7 @@ module OutboxRelay
           begin
             yield
           rescue => e
-            custom_logger.error(
+            OutboxRelay.logger.error(
               event_name: "shutdown_block_failed",
               error: e.message,
               backtrace: e.backtrace&.first(10)&.join("\n")
@@ -79,7 +79,7 @@ module OutboxRelay
         _shutdown_callbacks.each do |callback|
           send(callback)
         rescue => e
-          custom_logger.error(
+          OutboxRelay.logger.error(
             event_name: "shutdown_callback_failed",
             callback: callback,
             error: e.message,

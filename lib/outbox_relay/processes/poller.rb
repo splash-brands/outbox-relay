@@ -44,7 +44,7 @@ module OutboxRelay
               with_polling_volume { poll }
             rescue => e
               # Polling errors - these are expected and handled
-              custom_logger.error(
+              OutboxRelay.logger.error(
                 event_name: "polling_error",
                 process_id: process_id,
                 name: name,
@@ -65,7 +65,7 @@ module OutboxRelay
           end
         rescue => e
           # Instrumentation errors - these should be rare and indicate system issues
-          custom_logger.error(
+          OutboxRelay.logger.error(
             event_name: "instrumentation_error",
             process_id: process_id,
             name: name,
@@ -84,7 +84,7 @@ module OutboxRelay
           begin
             with_polling_volume { poll }
           rescue => poll_error
-            custom_logger.error(
+            OutboxRelay.logger.error(
               event_name: "polling_error_after_instrumentation_failure",
               process_id: process_id,
               name: name,
@@ -106,7 +106,7 @@ module OutboxRelay
             ActiveRecord::Base.logger.silence { yield }
           rescue => e
             # Logger silencing failed - log and continue without silencing
-            custom_logger.warn(
+            OutboxRelay.logger.warn(
               event_name: "logger_silencing_failed",
               process_id: process_id,
               error: e.message,

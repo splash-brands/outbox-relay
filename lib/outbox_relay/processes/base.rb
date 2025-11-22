@@ -99,9 +99,6 @@ module OutboxRelay
         [kind, SecureRandom.hex(6)].join("-")
       end
 
-      def custom_logger
-        OutboxRelay.logger
-      end
     end
   end
 end

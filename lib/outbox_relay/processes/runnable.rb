@@ -55,7 +55,7 @@ module OutboxRelay
           # Lazy connection establishment can bypass gssencmode on macOS
           ActiveRecord::Base.connection.execute("SELECT 1")
 
-          custom_logger.debug(
+          OutboxRelay.logger.debug(
             event_name: "activerecord_reconnected_after_fork",
             process_id: process_id,
             name: name,
@@ -69,7 +69,7 @@ module OutboxRelay
           if retry_count < max_retries
             backoff_seconds = retry_count ** 2  # 1s, 4s, 9s
 
-            custom_logger.warn(
+            OutboxRelay.logger.warn(
               event_name: "activerecord_reconnection_retry",
               process_id: process_id,
               error: e.message,
@@ -81,7 +81,7 @@ module OutboxRelay
             sleep(backoff_seconds)
             retry
           else
-            custom_logger.error(
+            OutboxRelay.logger.error(
               event_name: "activerecord_reconnection_failed",
               process_id: process_id,
               error: e.message,
@@ -155,13 +155,13 @@ module OutboxRelay
               stop
             end
 
-            custom_logger.debug(
+            OutboxRelay.logger.debug(
               event_name: "signal_handler_registered",
               signal: signal,
               process_id: process_id
             )
           rescue => e
-            custom_logger.error(
+            OutboxRelay.logger.error(
               event_name: "signal_handler_registration_failed",
               signal: signal,
               error: e.message,
@@ -182,7 +182,7 @@ module OutboxRelay
       end
 
       def handle_thread_error(exception)
-        custom_logger.error(
+        OutboxRelay.logger.error(
           event_name: "thread_error",
           process_id: process_id,
           name: name,

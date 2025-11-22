@@ -81,7 +81,7 @@ module OutboxRelay
 
         # Log occasionally (every 100 occurrences) to avoid log spam
         if @spurious_wakeups % 100 == 0
-          custom_logger.debug(
+          OutboxRelay.logger.debug(
             event_name: "interruptible_sleep_spurious_wakeups",
             count: @spurious_wakeups,
             error_class: e.class.name
@@ -155,7 +155,7 @@ module OutboxRelay
         begin
           @self_pipe[:reader].close unless @self_pipe[:reader].closed?
         rescue => e
-          custom_logger.warn(
+          OutboxRelay.logger.warn(
             event_name: "self_pipe_reader_close_failed",
             error: e.message,
             error_class: e.class.name
@@ -165,7 +165,7 @@ module OutboxRelay
         begin
           @self_pipe[:writer].close unless @self_pipe[:writer].closed?
         rescue => e
-          custom_logger.warn(
+          OutboxRelay.logger.warn(
             event_name: "self_pipe_writer_close_failed",
             error: e.message,
             error_class: e.class.name

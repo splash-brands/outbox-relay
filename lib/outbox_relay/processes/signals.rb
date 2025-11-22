@@ -158,7 +158,7 @@ module OutboxRelay
 
         # Log queue state before processing (safe here - not in signal handler)
         if queue_size > 0
-          custom_logger.debug(
+          OutboxRelay.logger.debug(
             event_name: "processing_signal_queue",
             queue_size: queue_size,
             signals: @signal_queue.dup, # dup to avoid modification during logging
@@ -169,7 +169,7 @@ module OutboxRelay
 
         # Alert if signals were dropped
         if dropped_count > 0
-          custom_logger.error(
+          OutboxRelay.logger.error(
             event_name: "signals_dropped_queue_full",
             dropped_count: dropped_count,
             reason: "Signal queue reached maximum size (10)"
@@ -184,14 +184,14 @@ module OutboxRelay
       def handle_signal(signal)
         case signal
         when "TERM", "INT"
-          custom_logger.info(
+          OutboxRelay.logger.info(
             event_name: "terminating_gracefully",
             signal: signal,
             process_id: process_id
           )
           terminate_gracefully
         when "QUIT"
-          custom_logger.info(
+          OutboxRelay.logger.info(
             event_name: "terminating_immediately",
             signal: signal,
             process_id: process_id
@@ -206,20 +206,20 @@ module OutboxRelay
         pids.each do |pid|
           begin
             ::Process.kill(signal, pid)
-            custom_logger.debug(
+            OutboxRelay.logger.debug(
               event_name: "signal_sent",
               signal: signal,
               target_pid: pid
             )
           rescue Errno::ESRCH
             # Process already dead - this is fine
-            custom_logger.debug(
+            OutboxRelay.logger.debug(
               event_name: "signal_failed_process_not_found",
               signal: signal,
               target_pid: pid
             )
           rescue => e
-            custom_logger.error(
+            OutboxRelay.logger.error(
               event_name: "signal_failed",
               signal: signal,
               target_pid: pid,

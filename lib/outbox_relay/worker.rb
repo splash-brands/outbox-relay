@@ -126,7 +126,7 @@ module OutboxRelay
       # Handle thread-level errors using AppExecutor pattern
       handle_thread_error(e)
 
-      custom_logger.error(
+      OutboxRelay.logger.error(
         event_name: "worker_poll_error",
         process_id: process_id,
         consumer_class: consumer_class_name,
@@ -232,7 +232,7 @@ module OutboxRelay
         polling_interval
       end
     rescue => e
-      custom_logger.error(
+      OutboxRelay.logger.error(
         event_name: "worker_delay_calculation_error",
         process_id: process_id,
         processed_count: processed_count,
@@ -253,7 +253,7 @@ module OutboxRelay
       # This prevents aggressive polling during database issues which could worsen DB load
       # Trade-off: May increase latency if lag queries fail during normal operation,
       # but prevents exacerbating database problems during outages
-      custom_logger.warn(
+      OutboxRelay.logger.warn(
         event_name: "using_conservative_delay_on_lag_failure",
         process_id: process_id,
         processed_count: processed_count,
@@ -267,7 +267,7 @@ module OutboxRelay
     def instantiate_consumer
       consumer_class_name.constantize.new(partition_key: partition_key)
     rescue => e
-      custom_logger.error(
+      OutboxRelay.logger.error(
         event_name: "consumer_instantiation_failed",
         consumer_class: consumer_class_name,
         partition_key: partition_key,
@@ -295,7 +295,7 @@ module OutboxRelay
       # Log different messages based on shutdown reason
       # Now safe to log since heartbeat has been stopped by super
       if supervised? && supervisor_went_away?
-        custom_logger.warn(
+        OutboxRelay.logger.warn(
           event_name: "worker_orphaned_shutting_down",
           process_id: process_id,
           name: name,
@@ -305,7 +305,7 @@ module OutboxRelay
           loop_count: @loop_count,
         )
       else
-        custom_logger.info(
+        OutboxRelay.logger.info(
           event_name: "worker_shutting_down",
           process_id: process_id,
           name: name,
@@ -362,11 +362,11 @@ module OutboxRelay
         log_data[:topic_description] = OutboxRelay.configuration.topic_descriptions[topic]
       end
 
-      custom_logger.info(log_data)
+      OutboxRelay.logger.info(log_data)
     end
 
     def log_worker_stop
-      custom_logger.info(
+      OutboxRelay.logger.info(
         event_name: "worker_stopped",
         process_id: process_id,
         name: name,

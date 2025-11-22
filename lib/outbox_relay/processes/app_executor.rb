@@ -51,7 +51,7 @@ module OutboxRelay
     # (OutboxRelay internal issues), NOT application errors (event handler bugs).
     #
     # Framework errors are:
-    #   - Logged via custom_logger.error
+    #   - Logged via OutboxRelay.logger.error
     #   - Reported via on_thread_error callback
     #   - Instrumented for monitoring
     #
@@ -108,7 +108,7 @@ module OutboxRelay
       # NOT for errors within user event handlers.
       #
       # Errors are:
-      #   1. Logged to custom_logger (or Rails.logger fallback)
+      #   1. Logged to OutboxRelay.logger
       #   2. Instrumented via ActiveSupport::Notifications
       #   3. Reported to on_thread_error callback (if configured)
       #
