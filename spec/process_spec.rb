@@ -103,6 +103,78 @@ RSpec.describe OutboxRelay::Process do
       process.reload
       expect(process.metadata["test"]).to eq("value")
     end
+
+    context "lock contention handling" do
+      it "does not log for 1-2 consecutive lock failures (normal contention)" do
+        # Force lock failures by stubbing lock! method
+        allow(process).to receive(:lock!).and_raise(ActiveRecord::LockWaitTimeout, "NOWAIT lock failed")
+
+        # First failure - should NOT log (consecutive_failures = 1)
+        expect(OutboxRelay.logger).not_to receive(:debug)
+        expect(OutboxRelay.logger).not_to receive(:warn)
+        expect(process.heartbeat).to be false # Returns false when lock fails
+
+        # Second failure - should NOT log (consecutive_failures = 2)
+        expect(OutboxRelay.logger).not_to receive(:debug)
+        expect(OutboxRelay.logger).not_to receive(:warn)
+        expect(process.heartbeat).to be false
+      end
+
+      it "logs at DEBUG level for 3rd consecutive lock failure" do
+        # Force 3 consecutive failures
+        allow(process).to receive(:lock!).and_raise(ActiveRecord::LockWaitTimeout)
+
+        # First two failures - no logs
+        process.heartbeat
+        process.heartbeat
+
+        # Third failure - should log at DEBUG level
+        expect(OutboxRelay.logger).to receive(:debug).with(hash_including(
+          event_name: "heartbeat_lock_skipped",
+          consecutive_failures: 3
+        ))
+
+        process.heartbeat
+      end
+
+      it "logs at WARN level for 4+ consecutive lock failures" do
+        # Force 4 consecutive failures
+        allow(process).to receive(:lock!).and_raise(ActiveRecord::LockWaitTimeout)
+
+        # First 3 failures (first 2 silent, 3rd at DEBUG)
+        process.heartbeat
+        process.heartbeat
+        allow(OutboxRelay.logger).to receive(:debug) # Allow 3rd one
+        process.heartbeat
+
+        # Fourth failure - should log at WARN level
+        expect(OutboxRelay.logger).to receive(:warn).with(hash_including(
+          event_name: "heartbeat_lock_skipped",
+          consecutive_failures: 4
+        ))
+
+        process.heartbeat
+      end
+
+      it "resets consecutive failures counter on successful heartbeat" do
+        # Force 2 failures
+        allow(process).to receive(:lock!).and_raise(ActiveRecord::LockWaitTimeout)
+        process.heartbeat
+        process.heartbeat
+
+        # Now allow success
+        allow(process).to receive(:lock!).and_call_original
+
+        # Successful heartbeat should reset counter
+        expect(process.heartbeat).to be true
+
+        # Next failure should be treated as first failure (no log)
+        allow(process).to receive(:lock!).and_raise(ActiveRecord::LockWaitTimeout)
+        expect(OutboxRelay.logger).not_to receive(:debug)
+        expect(OutboxRelay.logger).not_to receive(:warn)
+        process.heartbeat
+      end
+    end
   end
 
   describe "#deregister" do

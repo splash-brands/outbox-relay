@@ -98,16 +98,20 @@ module OutboxRelay
       @consecutive_lock_failures ||= 0
       @consecutive_lock_failures += 1
 
-      # Log at appropriate level based on frequency
-      log_level = @consecutive_lock_failures > 3 ? :warn : :debug
+      # Only log when it becomes a potential issue (3+ failures)
+      # 1-2 failures are normal (overlapping heartbeats, transient contention)
+      if @consecutive_lock_failures >= 3
+        # Log at appropriate level based on severity
+        log_level = @consecutive_lock_failures >= 4 ? :warn : :debug
 
-      OutboxRelay.logger.send(log_level,
-        event_name: "heartbeat_lock_skipped",
-        process_id: id,
-        consecutive_failures: @consecutive_lock_failures,
-        error: e.message,
-        error_class: e.class.name
-      )
+        OutboxRelay.logger.send(log_level,
+          event_name: "heartbeat_lock_skipped",
+          process_id: id,
+          consecutive_failures: @consecutive_lock_failures,
+          error: e.message,
+          error_class: e.class.name
+        )
+      end
 
       # Alert on sustained lock contention
       if @consecutive_lock_failures >= 5
