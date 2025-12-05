@@ -376,12 +376,8 @@ module OutboxRelay
 
       # Try to acquire lock - returns false if another worker already holds it
       unless acquire_advisory_lock(lock_key)
-        @logger.debug(
-          event_name: "event_already_being_processed",
-          event_id: event.event_id,
-          sequence: event.sequence,
-          consumer_group: consumer_group,
-        )
+        # Lock held by another worker - skip silently (this is normal/expected)
+        # Advisory locks exist specifically to prevent duplicate processing
         return false # Skip this event, another worker is processing it
       end
 
