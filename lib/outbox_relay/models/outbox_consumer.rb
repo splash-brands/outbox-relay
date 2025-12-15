@@ -522,91 +522,60 @@ module OutboxRelay
   end
 
   def move_to_dead_letter_queue(event, error)
-    # Find or create DLQ entry for this consumer group
-    dlq_entry = OutboxRelay::DeadLetterEvent.find_or_initialize_by(
-      outbox_relay_outbox_event_id: event.id,
-      consumer_group: consumer_group
-    )
+    # CRITICAL: Use requires_new to create independent transaction
+    # This ensures DLQ entry is persisted even when the outer transaction rolls back
+    #
+    # Flow:
+    #   1. Outer transaction: process_event starts
+    #   2. consume_message fails with error
+    #   3. handle_event_failure -> move_to_dead_letter_queue
+    #   4. NEW independent transaction: DLQ entry saved and COMMITTED
+    #   5. Outer transaction: raise causes ROLLBACK
+    #   6. DLQ entry survives because it was committed in step 4
+    #
+    # Without requires_new, the DLQ save would be rolled back with the outer transaction
+    dlq_entry = nil
 
-    # Increment retry count
-    dlq_entry.assign_attributes(
-      consumer_class: self.class.name,
-      total_retries: (dlq_entry.total_retries || 0) + 1,
-      error_message: error.message,
-      error_backtrace: error.backtrace&.first(20)&.join("\n"),
-      error_context: build_error_context(event, error),
-      original_topic: event.topic,
-      original_event_name: event.event_name,
-      original_payload: event.payload,
-      original_headers: event.headers,
-      resolution_status: should_dead_letter?(event) ? "unresolved" : "retrying"
-    )
-
-    begin
-      dlq_entry.save!
-    rescue ActiveRecord::RecordInvalid => e
-      # Validation failure - likely data integrity issue
-      @logger.error(
-        event_name: "dlq_save_validation_failed",
-        event_id: event.event_id,
-        consumer_group: consumer_group,
-        validation_errors: dlq_entry.errors.full_messages.join(", "),
-        error: e.message,
-        error_class: e.class.name
+    ActiveRecord::Base.transaction(requires_new: true) do
+      # Find or create DLQ entry for this consumer group
+      dlq_entry = OutboxRelay::DeadLetterEvent.find_or_initialize_by(
+        outbox_relay_outbox_event_id: event.id,
+        consumer_group: consumer_group
       )
 
-      OutboxRelay::Instrumentation::Models.error(
-        e,
-        model: "OutboxConsumer",
-        operation: "dlq_save_validation",
-        event_id: event.event_id,
-        consumer_group: consumer_group,
-        validation_errors: dlq_entry.errors.full_messages,
-        severity: "critical"
-      )
-
-      raise OutboxRelay::Error, "Failed to save DLQ entry (validation): #{dlq_entry.errors.full_messages.join(', ')}"
-    rescue ActiveRecord::RecordNotUnique => e
-      # Duplicate entry - race condition between workers
-      @logger.warn(
-        event_name: "dlq_save_duplicate_race_condition",
-        event_id: event.event_id,
-        consumer_group: consumer_group,
-        error: e.message
-      )
-      # Try to reload and update existing entry
-      dlq_entry.reload
+      # Increment retry count
       dlq_entry.assign_attributes(
+        consumer_class: self.class.name,
         total_retries: (dlq_entry.total_retries || 0) + 1,
         error_message: error.message,
         error_backtrace: error.backtrace&.first(20)&.join("\n"),
         error_context: build_error_context(event, error),
+        original_topic: event.topic,
+        original_event_name: event.event_name,
+        original_payload: event.payload,
+        original_headers: event.headers,
         resolution_status: should_dead_letter?(event) ? "unresolved" : "retrying"
       )
-      dlq_entry.save!
-    rescue => e
-      # Database or other system error
-      @logger.error(
-        event_name: "dlq_save_failed",
-        event_id: event.event_id,
-        consumer_group: consumer_group,
-        error: e.message,
-        error_class: e.class.name,
-        backtrace: e.backtrace&.first(10)&.join("\n")
-      )
 
-      OutboxRelay::Instrumentation::Models.error(
-        e,
-        model: "OutboxConsumer",
-        operation: "dlq_save",
-        event_id: event.event_id,
-        consumer_group: consumer_group,
-        phase: "dlq_save",
-        severity: "critical"
-      )
-
-      raise OutboxRelay::Error, "Failed to save DLQ entry: #{e.message}"
+      begin
+        dlq_entry.save!
+      rescue ActiveRecord::RecordNotUnique
+        # Race condition - another worker created DLQ entry first
+        # Reload and update the existing entry
+        dlq_entry = OutboxRelay::DeadLetterEvent.find_by!(
+          outbox_relay_outbox_event_id: event.id,
+          consumer_group: consumer_group
+        )
+        dlq_entry.update!(
+          total_retries: dlq_entry.total_retries + 1,
+          error_message: error.message,
+          error_backtrace: error.backtrace&.first(20)&.join("\n"),
+          error_context: build_error_context(event, error),
+          resolution_status: should_dead_letter?(event) ? "unresolved" : "retrying"
+        )
+      end
     end
+    # End of requires_new transaction - DLQ entry is now committed independently
 
     @logger.error(
       event_name: "event_moved_to_dead_letter_queue",
