@@ -57,8 +57,10 @@ module OutboxRelay
   #
   class Worker < Processes::Poller
     include Processes::AppExecutor
+    include Processes::PartitionClaiming
 
     after_boot :log_worker_start
+    before_shutdown :release_partition_claim
     before_shutdown :log_worker_stop
 
     attr_reader :consumer_class_name, :consumer_group, :topic, :partition_key, :batch_size, :max_loops

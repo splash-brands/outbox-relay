@@ -32,6 +32,11 @@ module OutboxRelay
               @supervisor_pid = ::Process.ppid
 
               reconnect_after_fork
+
+              # Claim partition before registration (Workers only)
+              # If claim fails, worker exits gracefully and doesn't register
+              claim_partition if respond_to?(:claim_partition)
+
               register
               start_heartbeat  # Start automatic heartbeat after registration
               register_signal_handlers
