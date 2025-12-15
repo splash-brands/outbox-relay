@@ -39,12 +39,16 @@ ActiveRecord::Schema.define do
     t.string :consumer_instance_id
     t.datetime :last_consumed_at
     t.datetime :heartbeat_at
+    # Partition claiming columns
+    t.string :claimed_by
+    t.datetime :claimed_until
     t.timestamps
 
     # Unique constraint: one offset per (consumer_group, topic)
     # Note: partition is encoded in consumer_group name (e.g., "notifications_p0")
     t.index [:consumer_group, :topic], unique: true, name: "index_consumer_offsets_unique"
     t.index :heartbeat_at
+    t.index [:claimed_by, :claimed_until], name: "index_consumer_offset_claim"
   end
 
   create_table :outbox_relay_dead_letter_events, force: true do |t|

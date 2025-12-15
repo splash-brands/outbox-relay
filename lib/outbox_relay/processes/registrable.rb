@@ -116,6 +116,10 @@ module OutboxRelay
 
         if success
           @heartbeat_failures.value = 0  # Reset on success
+
+          # Renew partition claim during heartbeat (Workers only)
+          # This extends the claim TTL to prevent expiration
+          renew_partition_claim if respond_to?(:renew_partition_claim)
         else
           # Process was deregistered or record deleted
           failures = @heartbeat_failures.increment
