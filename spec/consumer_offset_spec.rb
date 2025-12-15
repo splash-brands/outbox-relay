@@ -62,6 +62,38 @@ RSpec.describe OutboxRelay::ConsumerOffset do
       end
     end
 
+    context "with invalid auto_offset_reset value" do
+      it "raises ArgumentError for unknown symbol" do
+        expect {
+          described_class.find_or_initialize_for(
+            consumer_group: consumer_group,
+            topic: topic,
+            auto_offset_reset: :unknown
+          )
+        }.to raise_error(ArgumentError, /auto_offset_reset must be :latest or :earliest, got: :unknown/)
+      end
+
+      it "raises ArgumentError for string instead of symbol" do
+        expect {
+          described_class.find_or_initialize_for(
+            consumer_group: consumer_group,
+            topic: topic,
+            auto_offset_reset: "latest"
+          )
+        }.to raise_error(ArgumentError, /auto_offset_reset must be :latest or :earliest, got: "latest"/)
+      end
+
+      it "raises ArgumentError for nil" do
+        expect {
+          described_class.find_or_initialize_for(
+            consumer_group: consumer_group,
+            topic: topic,
+            auto_offset_reset: nil
+          )
+        }.to raise_error(ArgumentError, /auto_offset_reset must be :latest or :earliest, got: nil/)
+      end
+    end
+
     context "when offset already exists" do
       it "finds existing offset regardless of auto_offset_reset" do
         existing = described_class.create!(

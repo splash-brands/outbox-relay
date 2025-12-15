@@ -44,7 +44,11 @@ module OutboxRelay
     # @param auto_offset_reset [Symbol] Where to start for NEW consumer groups:
     #   - :latest (default) - Start from latest event (safe for production deploys)
     #   - :earliest - Start from beginning (reprocess all historical events)
+    VALID_AUTO_OFFSET_RESET_VALUES = [:latest, :earliest].freeze
+
     def initialize(consumer_group:, topic:, partition_key:, event_filter: nil, dead_letter_config: {}, auto_offset_reset: :latest)
+      validate_auto_offset_reset!(auto_offset_reset)
+
       @consumer_group = consumer_group
       @topic = topic
       @partition_key = partition_key
@@ -54,6 +58,17 @@ module OutboxRelay
       @logger = OutboxRelay.logger
       @consumer_instance_id = build_consumer_instance_id
     end
+
+    private
+
+    def validate_auto_offset_reset!(value)
+      return if VALID_AUTO_OFFSET_RESET_VALUES.include?(value)
+
+      raise ArgumentError,
+        "auto_offset_reset must be :latest or :earliest, got: #{value.inspect}"
+    end
+
+    public
 
   # Main consumption loop
   def consume_batch(batch_size: 50)

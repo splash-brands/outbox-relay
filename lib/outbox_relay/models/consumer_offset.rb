@@ -5,6 +5,7 @@ module OutboxRelay
   # Constants
   ACTIVE_TIMEOUT = 5.minutes
   CLAIM_TTL = 30.seconds
+  VALID_AUTO_OFFSET_RESET_VALUES = [:latest, :earliest].freeze
 
   # Validations
   validates :consumer_group, presence: true
@@ -49,6 +50,11 @@ module OutboxRelay
   #   # => Starts from sequence 0, processes all historical events
   #
   def self.find_or_initialize_for(consumer_group:, topic:, auto_offset_reset: :latest)
+    unless VALID_AUTO_OFFSET_RESET_VALUES.include?(auto_offset_reset)
+      raise ArgumentError,
+        "auto_offset_reset must be :latest or :earliest, got: #{auto_offset_reset.inspect}"
+    end
+
     find_or_initialize_by(
       consumer_group: consumer_group,
       topic: topic,
