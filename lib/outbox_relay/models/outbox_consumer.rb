@@ -6,35 +6,51 @@ module OutboxRelay
   #
   # Usage:
   #   class MyConsumer < OutboxRelay::OutboxConsumer
-#     def initialize(partition_key:)
-#       super(
-#         consumer_group: "my_group",
-#         topic: "my_topic",
-#         partition_key: partition_key,  # REQUIRED: Partition number (0-based) to process
-#         event_filter: ["created", "updated"],  # Optional: filter by event_name
-#         dead_letter_config: { max_retries: 2 },  # Optional: DLQ configuration
-#       )
-#     end
-#
-#     def consume_message(event)
-#       # Process event
-#     end
-#   end
-#
-# Partition Key:
-# - Required parameter that determines which partition this consumer processes
-# - Each partition is processed independently for parallelism
-# - Partition number should be 0 to (partition_count - 1)
-# - Orchestrator spawns one consumer instance per partition
+  #     def initialize(partition_key:)
+  #       super(
+  #         consumer_group: "my_group",
+  #         topic: "my_topic",
+  #         partition_key: partition_key,  # REQUIRED: Partition number (0-based) to process
+  #         event_filter: ["created", "updated"],  # Optional: filter by event_name
+  #         dead_letter_config: { max_retries: 2 },  # Optional: DLQ configuration
+  #         auto_offset_reset: :latest,  # Optional: :latest (default) or :earliest
+  #       )
+  #     end
+  #
+  #     def consume_message(event)
+  #       # Process event
+  #     end
+  #   end
+  #
+  # Partition Key:
+  # - Required parameter that determines which partition this consumer processes
+  # - Each partition is processed independently for parallelism
+  # - Partition number should be 0 to (partition_count - 1)
+  # - Orchestrator spawns one consumer instance per partition
+  #
+  # Auto Offset Reset (for NEW consumer groups only):
+  # - :latest (default) - Start from current position, skip historical events
+  #   Safe for production deploys - new consumers won't reprocess old data
+  # - :earliest - Start from sequence 0, process ALL historical events
+  #   Use for backfill consumers or when you need to reprocess everything
   class OutboxConsumer
-    attr_reader :consumer_group, :topic, :event_filter, :dead_letter_config, :partition_key
+    attr_reader :consumer_group, :topic, :event_filter, :dead_letter_config, :partition_key, :auto_offset_reset
 
-    def initialize(consumer_group:, topic:, partition_key:, event_filter: nil, dead_letter_config: {})
+    # @param consumer_group [String] Unique name for this consumer group
+    # @param topic [String] Topic to consume events from
+    # @param partition_key [Integer] Partition number to process (0-based)
+    # @param event_filter [Array<String>, nil] Optional list of event names to process
+    # @param dead_letter_config [Hash] DLQ configuration (e.g., { max_retries: 3 })
+    # @param auto_offset_reset [Symbol] Where to start for NEW consumer groups:
+    #   - :latest (default) - Start from latest event (safe for production deploys)
+    #   - :earliest - Start from beginning (reprocess all historical events)
+    def initialize(consumer_group:, topic:, partition_key:, event_filter: nil, dead_letter_config: {}, auto_offset_reset: :latest)
       @consumer_group = consumer_group
       @topic = topic
       @partition_key = partition_key
       @event_filter = Array.wrap(event_filter).compact
       @dead_letter_config = dead_letter_config
+      @auto_offset_reset = auto_offset_reset
       @logger = OutboxRelay.logger
       @consumer_instance_id = build_consumer_instance_id
     end
@@ -481,6 +497,7 @@ module OutboxRelay
     @current_offset ||= OutboxRelay::ConsumerOffset.find_or_initialize_for(
       consumer_group: consumer_group_with_partition,
       topic: topic,
+      auto_offset_reset: auto_offset_reset,
     ).tap do |offset|
       offset.consumer_instance_id = @consumer_instance_id
       # Set heartbeat on new records to indicate this consumer is active

@@ -165,7 +165,8 @@ class OrderUpdatesConsumer < OutboxRelay::OutboxConsumer
       topic: "order_updates",
       partition_key: partition_key,
       event_filter: ["created", "updated"], # optional
-      dead_letter_config: { max_retries: 2 } # optional
+      dead_letter_config: { max_retries: 2 }, # optional
+      auto_offset_reset: :latest # optional, default: :latest
     )
   end
 
@@ -188,6 +189,58 @@ class OrderUpdatesConsumer < OutboxRelay::OutboxConsumer
   end
 end
 ```
+
+#### Consumer Options
+
+| Option | Required | Default | Description |
+|--------|----------|---------|-------------|
+| `consumer_group` | Yes | - | Unique identifier for the consumer group |
+| `topic` | Yes | - | Topic to consume from |
+| `partition_key` | Yes | - | Partition to process |
+| `event_filter` | No | `nil` | Array of event names to process (others are skipped) |
+| `dead_letter_config` | No | `{}` | DLQ configuration with `max_retries` |
+| `auto_offset_reset` | No | `:latest` | Where new consumers start (see below) |
+
+#### `auto_offset_reset` Option
+
+Controls where **new** consumer groups start consuming. Does NOT affect existing consumer groups with saved offsets.
+
+| Value | Behavior | Use Case |
+|-------|----------|----------|
+| `:latest` (default) | Start from current max sequence | **Production deploys** - skip historical events |
+| `:earliest` | Start from sequence 0 | **Backfill** - process all historical events |
+
+**Example: Safe Production Deploy**
+```ruby
+# New consumer deployed to production - skips all historical events
+class NewFeatureConsumer < OutboxRelay::OutboxConsumer
+  def initialize(partition_key:)
+    super(
+      consumer_group: "new_feature",
+      topic: "order_lifecycle",
+      partition_key: partition_key,
+      # auto_offset_reset: :latest is the default
+    )
+  end
+end
+```
+
+**Example: Backfill Historical Data**
+```ruby
+# Reprocess all historical events (use with caution!)
+class BackfillConsumer < OutboxRelay::OutboxConsumer
+  def initialize(partition_key:)
+    super(
+      consumer_group: "backfill_2024",
+      topic: "order_lifecycle",
+      partition_key: partition_key,
+      auto_offset_reset: :earliest  # Process ALL events from beginning
+    )
+  end
+end
+```
+
+> **Note:** This follows Kafka's `auto.offset.reset` semantics. Once a consumer group has a saved offset, this setting is ignored.
 
 ### 3. Publish Events
 

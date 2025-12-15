@@ -7,33 +7,89 @@ RSpec.describe OutboxRelay::ConsumerOffset do
   let(:topic) { "test-topic" }
 
   describe ".find_or_initialize_for" do
-    it "creates a new offset with default sequence 0" do
-      offset = described_class.find_or_initialize_for(
-        consumer_group: consumer_group,
-        topic: topic
-      )
+    context "with auto_offset_reset: :latest (default)" do
+      it "creates new offset starting from latest sequence" do
+        # Create some existing events in the topic
+        OutboxRelay::OutboxEvent.create!(
+          topic: topic,
+          event_name: "test.event",
+          payload: {},
+          sequence: 500,
+          partition_key: 0
+        )
 
-      expect(offset).to be_new_record
-      expect(offset.consumer_group).to eq(consumer_group)
-      expect(offset.topic).to eq(topic)
-      expect(offset.last_consumed_sequence).to eq(0)
+        offset = described_class.find_or_initialize_for(
+          consumer_group: consumer_group,
+          topic: topic
+        )
+
+        expect(offset).to be_new_record
+        expect(offset.consumer_group).to eq(consumer_group)
+        expect(offset.topic).to eq(topic)
+        expect(offset.last_consumed_sequence).to eq(500) # Starts from latest
+      end
+
+      it "creates new offset with 0 when topic has no events" do
+        offset = described_class.find_or_initialize_for(
+          consumer_group: consumer_group,
+          topic: "empty-topic"
+        )
+
+        expect(offset).to be_new_record
+        expect(offset.last_consumed_sequence).to eq(0)
+      end
     end
 
-    it "finds existing offset" do
-      existing = described_class.create!(
-        consumer_group: consumer_group,
-        topic: topic,
-        last_consumed_sequence: 100
-      )
+    context "with auto_offset_reset: :earliest" do
+      it "creates new offset starting from sequence 0" do
+        # Create some existing events in the topic
+        OutboxRelay::OutboxEvent.create!(
+          topic: topic,
+          event_name: "test.event",
+          payload: {},
+          sequence: 500,
+          partition_key: 0
+        )
 
-      offset = described_class.find_or_initialize_for(
-        consumer_group: consumer_group,
-        topic: topic
-      )
+        offset = described_class.find_or_initialize_for(
+          consumer_group: consumer_group,
+          topic: topic,
+          auto_offset_reset: :earliest
+        )
 
-      expect(offset).to be_persisted
-      expect(offset.id).to eq(existing.id)
-      expect(offset.last_consumed_sequence).to eq(100)
+        expect(offset).to be_new_record
+        expect(offset.last_consumed_sequence).to eq(0) # Starts from beginning
+      end
+    end
+
+    context "when offset already exists" do
+      it "finds existing offset regardless of auto_offset_reset" do
+        existing = described_class.create!(
+          consumer_group: consumer_group,
+          topic: topic,
+          last_consumed_sequence: 100
+        )
+
+        # Create events after existing offset
+        OutboxRelay::OutboxEvent.create!(
+          topic: topic,
+          event_name: "test.event",
+          payload: {},
+          sequence: 500,
+          partition_key: 0
+        )
+
+        # auto_offset_reset should NOT affect existing offsets
+        offset = described_class.find_or_initialize_for(
+          consumer_group: consumer_group,
+          topic: topic,
+          auto_offset_reset: :latest
+        )
+
+        expect(offset).to be_persisted
+        expect(offset.id).to eq(existing.id)
+        expect(offset.last_consumed_sequence).to eq(100) # Unchanged
+      end
     end
   end
 
