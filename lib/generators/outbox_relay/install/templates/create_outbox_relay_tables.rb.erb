@@ -62,12 +62,6 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
       t.string(:consumer_instance_id)
       t.timestamp(:heartbeat_at)
 
-      # Partition claiming (distributed lock)
-      # claimed_by: consumer_instance_id that holds exclusive claim
-      # claimed_until: TTL expiration timestamp for the claim
-      t.string(:claimed_by)
-      t.timestamp(:claimed_until)
-
       t.timestamps(null: false)
     end
 
@@ -84,13 +78,6 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
       :outbox_relay_consumer_offsets,
       [:consumer_instance_id, :heartbeat_at],
       name: "idx_consumer_heartbeat"
-    )
-
-    # Index for partition claiming queries
-    add_index(
-      :outbox_relay_consumer_offsets,
-      [:claimed_by, :claimed_until],
-      name: "idx_consumer_offset_claim"
     )
 
     # ============================================================================

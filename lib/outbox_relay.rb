@@ -112,7 +112,6 @@ require "outbox_relay/processes/heartbeat"
 require "outbox_relay/processes/runnable"
 require "outbox_relay/processes/signals"
 require "outbox_relay/processes/app_executor"  # Rails executor wrapper
-require "outbox_relay/processes/partition_claiming"  # Distributed partition locking
 require "outbox_relay/processes/base"      # Base uses above modules
 require "outbox_relay/processes/poller"    # Poller < Base
 
