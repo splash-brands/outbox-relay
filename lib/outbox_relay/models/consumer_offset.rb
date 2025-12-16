@@ -4,7 +4,6 @@ module OutboxRelay
   class ConsumerOffset < ApplicationRecord
   # Constants
   ACTIVE_TIMEOUT = 5.minutes
-  CLAIM_TTL = 30.seconds
   VALID_AUTO_OFFSET_RESET_VALUES = [:latest, :earliest].freeze
 
   # Validations
