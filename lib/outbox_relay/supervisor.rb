@@ -4,6 +4,11 @@ module OutboxRelay
   class Supervisor < Processes::Base
     include Processes::Signals
 
+    CLAIM_UNAVAILABLE_EXIT_STATUS =
+      Processes::PartitionClaiming::CLAIM_UNAVAILABLE_EXIT_STATUS
+    CLAIM_UNAVAILABLE_RETRY_DELAY =
+      Processes::PartitionClaiming::CLAIM_UNAVAILABLE_RETRY_DELAY
+
     after_boot :log_supervisor_start
     before_shutdown :log_supervisor_stop
 
@@ -343,6 +348,13 @@ module OutboxRelay
               @restart_attempts.delete(worker_key)
               @restart_backoff_until.delete(worker_key)
               start_worker(worker_config, fork_info[:partition_key])
+            elsif claim_unavailable_exit_status?(status)
+              delay_restart_for_partition_claim(
+                worker_key: worker_key,
+                worker_config: worker_config,
+                partition_key: fork_info[:partition_key],
+                worker_name: fork_info[:worker]&.name
+              )
             else
               # Exponential backoff for failed workers
               @restart_attempts[worker_key] += 1
@@ -396,6 +408,33 @@ module OutboxRelay
       end
     end
 
+    def delay_restart_for_partition_claim(worker_key:, worker_config:, partition_key:, worker_name:)
+      @restart_attempts.delete(worker_key)
+
+      restart_at = Time.current + CLAIM_UNAVAILABLE_RETRY_DELAY
+      @restart_backoff_until[worker_key] = {
+        restart_at: restart_at,
+        worker_config: worker_config,
+        partition_key: partition_key
+      }
+
+      OutboxRelay.logger.info(
+        event_name: "worker_restart_delayed_claim_unavailable",
+        worker_key: worker_key,
+        worker_name: worker_name,
+        partition_key: partition_key,
+        topic: worker_config.topic,
+        restart_in_seconds: CLAIM_UNAVAILABLE_RETRY_DELAY.to_i,
+        restart_at: restart_at.iso8601
+      )
+    end
+
+    def claim_unavailable_exit_status?(status)
+      status.exitstatus == CLAIM_UNAVAILABLE_EXIT_STATUS
+    rescue NoMethodError
+      false
+    end
+
     def log_fork_terminated(pid, fork_info, status)
       if status.success?
         OutboxRelay.logger.info(
@@ -403,6 +442,16 @@ module OutboxRelay
           supervisor_pid: ::Process.pid,
           worker_pid: pid,
           worker_name: fork_info[:worker]&.name,
+          uptime: Time.current - fork_info[:started_at],
+        )
+      elsif claim_unavailable_exit_status?(status)
+        OutboxRelay.logger.info(
+          event_name: "worker_terminated_claim_unavailable",
+          supervisor_pid: ::Process.pid,
+          worker_pid: pid,
+          worker_name: fork_info[:worker]&.name,
+          exit_status: status.exitstatus,
+          partition_key: fork_info[:partition_key],
           uptime: Time.current - fork_info[:started_at],
         )
       else
