@@ -17,6 +17,7 @@ OutboxRelay is a high-performance, long-running process system that continuously
 - 👥 **Multi-consumer support** - Multiple consumer groups process same events independently
 - 🔄 **Fork-based workers** - Process isolation for fault tolerance
 - 📊 **Partition support** - Parallel processing across partitions
+- 🎯 **Partition claiming** - Database-backed distributed locks prevent duplicate workers (v0.8.0+)
 - 💀 **Dead letter queue** - Per-consumer-group failure tracking
 - 🎯 **Event filtering** - Process only specific event types
 - 📈 **Monitoring** - ActiveSupport::Notifications for any backend (Sentry, DataDog, New Relic)
@@ -38,6 +39,7 @@ OutboxRelay implements **all critical production patterns** for reliable contain
 - ✅ **Supervisor monitoring** - Workers detect supervisor death and self-terminate
 - ✅ **Restart backoff** - Exponential backoff prevents restart storms
 - ✅ **Failed worker tracking** - Visibility into fork failures and startup issues
+- ✅ **Partition claiming** - Only one worker per partition across all instances (v0.8.0+)
 
 **Container-Friendly Features:**
 - Fork-based architecture with proper database reconnection
@@ -1284,6 +1286,175 @@ consumer_groups:
 ```
 
 Then deploy with environment variables to load different consumer groups per container.
+
+## 🎯 Partition Claiming (v0.8.0+)
+
+OutboxRelay v0.8.0 introduces **Partition Claiming** - a database-backed distributed locking mechanism that ensures only one worker processes each partition at any given time. This eliminates duplicate processing and reduces resource waste in multi-instance deployments.
+
+### The Problem
+
+With `SKIP LOCKED`, multiple workers can spawn for the same partition across different ECS/Kubernetes instances:
+
+```
+Without Partition Claiming:
+┌─────────────────┐      ┌─────────────────┐
+│   ECS Task 1    │      │   ECS Task 2    │
+│                 │      │                 │
+│ Worker p0 ✓     │      │ Worker p0 ✓     │  ← Both spawn!
+│ Worker p1 ✓     │      │ Worker p1 ✓     │  ← Both spawn!
+│ Worker p2 ✓     │      │ Worker p2 ✓     │  ← Both spawn!
+│ Worker p3 ✓     │      │ Worker p3 ✓     │  ← Both spawn!
+└─────────────────┘      └─────────────────┘
+Total: 8 workers for 4 partitions (50% waste)
+```
+
+While `SKIP LOCKED` prevents duplicate event processing, the redundant workers still:
+- Consume CPU cycles polling the database
+- Hold database connections
+- Create lock contention
+- Add unnecessary infrastructure cost
+
+### The Solution
+
+Partition Claiming ensures exactly one worker per partition:
+
+```
+With Partition Claiming:
+┌─────────────────┐      ┌─────────────────┐
+│   ECS Task 1    │      │   ECS Task 2    │
+│                 │      │                 │
+│ Worker p0 ✅    │      │ Worker p0 exit  │  ← Graceful exit
+│ Worker p1 ✅    │      │ Worker p1 exit  │  ← Graceful exit
+│ Worker p2 exit  │      │ Worker p2 ✅    │  ← Claims partition
+│ Worker p3 exit  │      │ Worker p3 ✅    │  ← Claims partition
+└─────────────────┘      └─────────────────┘
+Total: 4 workers for 4 partitions (100% efficiency)
+```
+
+### How It Works
+
+1. **Boot-time Claiming**: When a worker starts, it attempts to claim its partition by writing to `consumer_offsets`
+2. **TTL-based Leases**: Claims expire after 30 seconds if not renewed
+3. **Heartbeat Renewal**: Active workers renew their claims every 10 seconds via heartbeat
+4. **Graceful Exit**: Workers that can't claim exit with code 75 (`CLAIM_UNAVAILABLE`), supervisor delays restart by 15 seconds
+5. **Automatic Failover**: If a worker dies, claim expires after 30s and another worker takes over
+
+### Database Schema
+
+The feature uses two columns on `outbox_relay_consumer_offsets`:
+
+```ruby
+# Added in v0.8.0 migration
+t.string :claimed_by       # consumer_instance_id of claiming worker
+t.timestamp :claimed_until # TTL expiration timestamp
+
+add_index :outbox_relay_consumer_offsets,
+          [:claimed_by, :claimed_until],
+          name: "idx_consumer_offset_claim"
+```
+
+### Migration for Existing Installations
+
+If upgrading from v0.7.x, create a migration:
+
+```ruby
+class AddPartitionClaimingToOutboxRelayConsumerOffsets < ActiveRecord::Migration[7.0]
+  disable_ddl_transaction!
+
+  def change
+    safety_assured do
+      add_column :outbox_relay_consumer_offsets, :claimed_by, :string
+      add_column :outbox_relay_consumer_offsets, :claimed_until, :timestamp
+    end
+
+    add_index :outbox_relay_consumer_offsets,
+              [:claimed_by, :claimed_until],
+              name: "idx_consumer_offset_claim",
+              algorithm: :concurrently
+  end
+end
+```
+
+### Observability
+
+New log events for partition claiming:
+
+```bash
+# Successful claim
+INFO partition_claimed consumer_group="orders" partition_key=0
+     consumer_instance_id="orders-host1-12345-p0" claimed_until="2024-01-15T10:30:30Z"
+
+# Failed claim (another worker holds it)
+WARN partition_claim_failed consumer_group="orders" partition_key=0
+     claimed_by="orders-host2-67890-p0" claimed_until="2024-01-15T10:30:30Z"
+
+# Graceful exit (worker exits with code 75)
+INFO worker_exiting_claim_unavailable consumer_group="orders" partition_key=0
+     message="Partition already claimed by another worker. Exiting gracefully."
+
+# Supervisor acknowledges claim-unavailable exit and delays restart
+INFO worker_terminated_claim_unavailable worker_pid=12345 exit_status=75 partition_key=0
+INFO worker_restart_delayed_claim_unavailable partition_key=0 restart_in_seconds=15
+
+# Claim released on shutdown
+INFO partition_claim_released consumer_group="orders" partition_key=0
+
+# Claim lost (another worker stole it - worker stops)
+ERROR partition_claim_lost consumer_group="orders" partition_key=0
+      current_claimer="orders-host3-11111-p0"
+```
+
+### Configuration
+
+**No configuration required!** Partition claiming is automatic when columns exist.
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Claim TTL | 30s | How long a claim is valid without renewal |
+| Heartbeat interval | 10s | How often claims are renewed |
+| Restart delay | 15s | How long supervisor waits before restarting a claim-failed worker |
+| Exit code | 75 | `CLAIM_UNAVAILABLE` - signals supervisor to delay restart |
+
+The timing is designed for reliability:
+- 30s TTL gives ample time for failover detection
+- 10s renewal (via existing heartbeat) ensures claims don't expire during normal operation
+- 3x safety margin (10s renewal vs 30s expiry) handles transient issues
+- 15s restart delay prevents rapid churn when partitions are already claimed
+
+### SKIP LOCKED vs Partition Claiming
+
+| Feature | SKIP LOCKED | Partition Claiming |
+|---------|------------|-------------------|
+| **Scope** | Event-level | Partition-level |
+| **Prevents** | Duplicate event processing | Duplicate workers |
+| **Workers spawned** | All | Only needed |
+| **Resource usage** | Higher (redundant workers) | Optimal |
+| **Mechanism** | Row lock during fetch | TTL-based lease |
+| **Still needed?** | Yes (defense in depth) | Works together |
+
+Both mechanisms work together:
+1. **Partition Claiming** prevents redundant workers from spawning
+2. **SKIP LOCKED** provides defense-in-depth for race conditions within the claim window
+
+### Troubleshooting
+
+**Workers keep exiting immediately:**
+- Check logs for `partition_claim_failed` - another instance likely holds the claim
+- This is expected behavior! Only one worker per partition should run.
+
+**All workers exiting (none processing):**
+- Check if claims are stuck from a crashed instance
+- Wait 30 seconds for TTL expiration, or manually clear:
+  ```ruby
+  OutboxRelay::ConsumerOffset.update_all(claimed_by: nil, claimed_until: nil)
+  ```
+
+**Check current claims:**
+```ruby
+OutboxRelay::ConsumerOffset.all.each do |o|
+  puts "#{o.consumer_group}: claimed_by=#{o.claimed_by}, until=#{o.claimed_until}"
+end
+```
 
 ## 🔧 Troubleshooting
 
