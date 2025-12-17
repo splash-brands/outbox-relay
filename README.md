@@ -1283,7 +1283,7 @@ Total: 4 workers for 4 partitions (100% efficiency)
 1. **Boot-time Claiming**: When a worker starts, it attempts to claim its partition by writing to `consumer_offsets`
 2. **TTL-based Leases**: Claims expire after 30 seconds if not renewed
 3. **Heartbeat Renewal**: Active workers renew their claims every 10 seconds via heartbeat
-4. **Graceful Exit**: Workers that can't claim exit with code 0 (supervisor doesn't restart immediately)
+4. **Graceful Exit**: Workers that can't claim exit with code 75 (`CLAIM_UNAVAILABLE`), supervisor delays restart by 15 seconds
 5. **Automatic Failover**: If a worker dies, claim expires after 30s and another worker takes over
 
 ### Database Schema
@@ -1335,9 +1335,13 @@ INFO partition_claimed consumer_group="orders" partition_key=0
 WARN partition_claim_failed consumer_group="orders" partition_key=0
      claimed_by="orders-host2-67890-p0" claimed_until="2024-01-15T10:30:30Z"
 
-# Graceful exit
+# Graceful exit (worker exits with code 75)
 INFO worker_exiting_claim_unavailable consumer_group="orders" partition_key=0
      message="Partition already claimed by another worker. Exiting gracefully."
+
+# Supervisor acknowledges claim-unavailable exit and delays restart
+INFO worker_terminated_claim_unavailable worker_pid=12345 exit_status=75 partition_key=0
+INFO worker_restart_delayed_claim_unavailable partition_key=0 restart_in_seconds=15
 
 # Claim released on shutdown
 INFO partition_claim_released consumer_group="orders" partition_key=0
@@ -1351,10 +1355,18 @@ ERROR partition_claim_lost consumer_group="orders" partition_key=0
 
 **No configuration required!** Partition claiming is automatic when columns exist.
 
-The TTL (30 seconds) and renewal interval (10 seconds via heartbeat) are designed for reliability:
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Claim TTL | 30s | How long a claim is valid without renewal |
+| Heartbeat interval | 10s | How often claims are renewed |
+| Restart delay | 15s | How long supervisor waits before restarting a claim-failed worker |
+| Exit code | 75 | `CLAIM_UNAVAILABLE` - signals supervisor to delay restart |
+
+The timing is designed for reliability:
 - 30s TTL gives ample time for failover detection
 - 10s renewal (via existing heartbeat) ensures claims don't expire during normal operation
 - 3x safety margin (10s renewal vs 30s expiry) handles transient issues
+- 15s restart delay prevents rapid churn when partitions are already claimed
 
 ### SKIP LOCKED vs Partition Claiming
 
