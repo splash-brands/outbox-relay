@@ -1344,7 +1344,7 @@ INFO partition_claim_released consumer_group="orders" partition_key=0
 
 # Claim lost (another worker stole it - worker stops)
 ERROR partition_claim_lost consumer_group="orders" partition_key=0
-      current_holder="orders-host3-11111-p0"
+      current_claimer="orders-host3-11111-p0"
 ```
 
 ### Configuration

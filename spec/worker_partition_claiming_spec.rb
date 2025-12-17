@@ -172,7 +172,11 @@ RSpec.describe OutboxRelay::Worker, "partition claiming integration" do
         # Worker should exit because partition is claimed by different worker
         expect {
           worker2.claim_partition
-        }.to raise_error(SystemExit) { |e| expect(e.status).to eq(0) }
+        }.to raise_error(SystemExit) { |e|
+          expect(e.status).to eq(
+            OutboxRelay::Processes::PartitionClaiming::CLAIM_UNAVAILABLE_EXIT_STATUS
+          )
+        }
 
         # External worker still holds claim
         offset = OutboxRelay::ConsumerOffset.find_by(

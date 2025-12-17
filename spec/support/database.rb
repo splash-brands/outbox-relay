@@ -48,7 +48,7 @@ ActiveRecord::Schema.define do
     # Note: partition is encoded in consumer_group name (e.g., "notifications_p0")
     t.index [:consumer_group, :topic], unique: true, name: "index_consumer_offsets_unique"
     t.index :heartbeat_at
-    t.index [:claimed_by, :claimed_until], name: "index_consumer_offset_claim"
+    t.index [:claimed_by, :claimed_until], name: "idx_consumer_offset_claim"
   end
 
   create_table :outbox_relay_dead_letter_events, force: true do |t|

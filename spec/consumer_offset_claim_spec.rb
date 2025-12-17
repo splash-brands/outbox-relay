@@ -246,9 +246,10 @@ RSpec.describe OutboxRelay::ConsumerOffset, "partition claiming" do
         )
       end
 
-      it "does not renew expired claim (must reclaim)" do
-        # Even if claimed_by matches, the contract is that you must hold the claim
-        # Since claimed_by still matches, renewal should succeed but update claimed_until
+      it "renews expired claim when still owned by the same worker" do
+        # Renewal only checks that claimed_by matches the caller; it does not consider
+        # whether the existing claim has expired. Since claimed_by still matches, renewal
+        # should succeed and extend claimed_until.
         result = offset.renew_claim!(consumer_instance_id: "worker-1")
 
         expect(result).to be true

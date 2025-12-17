@@ -31,7 +31,7 @@ module OutboxRelay
     #
     #   1. Boot:     Worker calls claim_partition → try_claim!
     #   2. Success:  Worker registers and starts polling
-    #   3. Failure:  Worker exits gracefully (code 0, supervisor backoff)
+    #   3. Failure:  Worker exits gracefully (custom exit code, supervisor delay)
     #   4. Run:      Heartbeat calls renew_partition_claim every 10s
     #   5. Shutdown: Worker calls release_partition_claim → release_claim!
     #   6. Crash:    Claim expires after TTL (30s) → another worker claims
@@ -53,15 +53,17 @@ module OutboxRelay
     #
     module PartitionClaiming
       CLAIM_TTL = 30.seconds
+      CLAIM_UNAVAILABLE_EXIT_STATUS = 75
+      CLAIM_UNAVAILABLE_RETRY_DELAY = 15.seconds
 
       # Claim partition for exclusive processing.
       # Called during worker boot, after reconnect_after_fork, before register.
       #
       # If partition is already claimed by another active worker, this worker
-      # will exit gracefully (code 0) to avoid duplicate processing.
+      # will exit gracefully (custom exit code) to avoid duplicate processing.
       #
       # @return [void]
-      # @raise [SystemExit] if partition already claimed (exit code 0)
+      # @raise [SystemExit] if partition already claimed (custom exit code)
       def claim_partition
         offset = get_or_create_consumer_offset
 
@@ -165,9 +167,8 @@ module OutboxRelay
           message: "Partition already claimed by another worker. Exiting gracefully."
         )
 
-        # Exit with code 0 (success) so supervisor doesn't immediately restart.
-        # Supervisor will restart with backoff, giving time for claims to settle.
-        exit(0)
+        # Exit with distinctive code so supervisor can delay restart for this partition
+        exit(CLAIM_UNAVAILABLE_EXIT_STATUS)
       end
 
       def log_claim_failed(offset)
@@ -194,13 +195,19 @@ module OutboxRelay
       end
 
       def log_claim_lost
+        current_claimer = begin
+          @partition_offset.reload.claimed_by
+        rescue ActiveRecord::RecordNotFound
+          "(record deleted)"
+        end
+
         OutboxRelay.logger.error(
           event_name: "partition_claim_lost",
           consumer_group: consumer_group,
           topic: topic,
           partition_key: partition_key,
           consumer_instance_id: build_consumer_instance_id,
-          current_claimer: @partition_offset.reload.claimed_by,
+          current_claimer: current_claimer,
           message: "Lost partition claim! Another worker took over. Stopping."
         )
       end

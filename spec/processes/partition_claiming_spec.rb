@@ -88,10 +88,12 @@ RSpec.describe OutboxRelay::Processes::PartitionClaiming do
         )
       end
 
-      it "exits gracefully with code 0" do
+      it "exits gracefully with claim unavailable exit code" do
         expect {
           worker.claim_partition
-        }.to raise_error(SystemExit) { |e| expect(e.status).to eq(0) }
+        }.to raise_error(SystemExit) { |e|
+          expect(e.status).to eq(described_class::CLAIM_UNAVAILABLE_EXIT_STATUS)
+        }
       end
 
       it "logs claim failure" do
