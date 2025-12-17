@@ -198,7 +198,24 @@ OutboxEvent
 
 ### Q: Can I add a new consumer group to process historical events?
 
-**A:** Yes! New consumer groups start at offset 0 and can process all events in the log (unless TTL-deleted). You can also manually set the starting offset if you only want recent events.
+**A:** By default, new consumer groups start at the **latest** sequence (skipping historical events). This is safe for production deploys.
+
+To process historical events, use `auto_offset_reset: :earliest`:
+
+```ruby
+class BackfillConsumer < OutboxRelay::OutboxConsumer
+  def initialize(partition_key:)
+    super(
+      consumer_group: "backfill_consumer",
+      topic: "orders",
+      partition_key: partition_key,
+      auto_offset_reset: :earliest  # Start from sequence 0
+    )
+  end
+end
+```
+
+You can also manually set the starting offset via database if needed.
 
 ### Q: What happens if a worker crashes during processing?
 
@@ -301,7 +318,8 @@ class NotificationsConsumer < OutboxRelay::OutboxConsumer
       consumer_group: "notifications",
       topic: "order_events",
       partition_key: partition_key,
-      dead_letter_config: { max_retries: 3 }
+      dead_letter_config: { max_retries: 3 },
+      auto_offset_reset: :latest  # :latest (default) or :earliest
     )
   end
 
@@ -311,6 +329,10 @@ class NotificationsConsumer < OutboxRelay::OutboxConsumer
   end
 end
 ```
+
+**`auto_offset_reset` options:**
+- `:latest` (default) - New consumer groups start from current max sequence (skip history)
+- `:earliest` - New consumer groups start from 0 (process all historical events)
 
 ### Publishing an Event
 

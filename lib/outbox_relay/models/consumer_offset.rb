@@ -4,6 +4,7 @@ module OutboxRelay
   class ConsumerOffset < ApplicationRecord
   # Constants
   ACTIVE_TIMEOUT = 5.minutes
+  VALID_AUTO_OFFSET_RESET_VALUES = [:latest, :earliest].freeze
   CLAIM_TTL = 30.seconds
 
   # Validations
@@ -22,12 +23,48 @@ module OutboxRelay
   scope :unclaimed, -> { where(claimed_by: nil).or(where("claimed_until IS NULL OR claimed_until <= ?", Time.current)) }
 
   # Class methods
-  def self.find_or_initialize_for(consumer_group:, topic:)
+  #
+  # Find or initialize a consumer offset record for the given consumer group and topic.
+  #
+  # @param consumer_group [String] Consumer group name
+  # @param topic [String] Topic name
+  # @param auto_offset_reset [Symbol] Where to start consuming for NEW consumer groups:
+  #   - :latest (default) - Start from the latest event (skip historical events)
+  #   - :earliest - Start from the beginning (process all historical events)
+  #
+  # @return [ConsumerOffset] Found or initialized offset record
+  #
+  # @example New consumer with default :latest (safe for production deploys)
+  #   ConsumerOffset.find_or_initialize_for(
+  #     consumer_group: "my_new_consumer",
+  #     topic: "orders"
+  #   )
+  #   # => Starts from current max sequence, skips historical events
+  #
+  # @example New consumer with :earliest (reprocess all events)
+  #   ConsumerOffset.find_or_initialize_for(
+  #     consumer_group: "backfill_consumer",
+  #     topic: "orders",
+  #     auto_offset_reset: :earliest
+  #   )
+  #   # => Starts from sequence 0, processes all historical events
+  #
+  def self.find_or_initialize_for(consumer_group:, topic:, auto_offset_reset: :latest)
+    unless VALID_AUTO_OFFSET_RESET_VALUES.include?(auto_offset_reset)
+      raise ArgumentError,
+        "auto_offset_reset must be :latest or :earliest, got: #{auto_offset_reset.inspect}"
+    end
+
     find_or_initialize_by(
       consumer_group: consumer_group,
       topic: topic,
     ) do |offset|
-      offset.last_consumed_sequence = 0
+      offset.last_consumed_sequence = case auto_offset_reset
+        when :earliest
+          0
+        else # :latest (default)
+          OutboxRelay::OutboxEvent.where(topic: topic).maximum(:sequence) || 0
+        end
     end
   end
 

@@ -5,7 +5,42 @@ All notable changes to OutboxRelay will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2025-12-15
+
+### Added
+
+- **`auto_offset_reset` parameter** - Control where new consumer groups start consuming:
+  - `:latest` (default) - Start from the latest sequence, skip historical events (safe for production deploys)
+  - `:earliest` - Start from sequence 0, process all historical events (for backfill scenarios)
+  - Follows Kafka's `auto.offset.reset` semantics
+  - Prevents accidental reprocessing of all historical events when deploying new consumers
+
+### Changed
+
+- **ConsumerOffset.find_or_initialize_for** now accepts `auto_offset_reset` parameter
+- **OutboxConsumer#initialize** now accepts `auto_offset_reset` parameter (default: `:latest`)
+
+### Migration Notes
+
+**No migration required** - existing consumers continue to work as before.
+
+**New behavior for NEW consumer groups:**
+- Previously: New consumer groups started from sequence 0 (process all history)
+- Now: New consumer groups start from latest sequence by default (skip history)
+
+**To process historical events** (backfill scenario):
+```ruby
+class BackfillConsumer < OutboxRelay::OutboxConsumer
+  def initialize(partition_key:)
+    super(
+      consumer_group: "backfill_consumer",
+      topic: "order_lifecycle",
+      partition_key: partition_key,
+      auto_offset_reset: :earliest  # Process all historical events
+    )
+  end
+end
+```
 
 ## [0.4.0] - 2025-11-11
 
