@@ -172,7 +172,9 @@ module OutboxRelay
       end
 
       def log_claim_failed(offset)
-        OutboxRelay.logger.warn(
+        # DEBUG level: This is expected behavior when multiple instances compete for partitions.
+        # Not a warning - the system is working correctly by rejecting duplicate workers.
+        OutboxRelay.logger.debug(
           event_name: "partition_claim_failed",
           consumer_group: consumer_group,
           topic: topic,
