@@ -53,6 +53,15 @@ module OutboxRelay
       )
     end
 
+    # Must be public - overrides Processes::Base#metadata
+    # Called by LogSubscriber for instrumentation events
+    def metadata
+      super.merge(
+        workers_count: forks.size,
+        uptime: Time.current - (@started_at ||= Time.current),
+      )
+    end
+
     private
 
     def boot
@@ -585,13 +594,6 @@ module OutboxRelay
         process_id: process_id,
         supervisor_pid: ::Process.pid,
         uptime: metadata[:uptime],
-      )
-    end
-
-    def metadata
-      super.merge(
-        workers_count: forks.size,
-        uptime: Time.current - (@started_at ||= Time.current),
       )
     end
   end
