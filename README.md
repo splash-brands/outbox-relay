@@ -1384,9 +1384,9 @@ New log events for partition claiming:
 INFO partition_claimed consumer_group="orders" partition_key=0
      consumer_instance_id="orders-host1-12345-p0" claimed_until="2024-01-15T10:30:30Z"
 
-# Failed claim (another worker holds it)
-WARN partition_claim_failed consumer_group="orders" partition_key=0
-     claimed_by="orders-host2-67890-p0" claimed_until="2024-01-15T10:30:30Z"
+# Failed claim (another worker holds it) - DEBUG level, expected behavior
+DEBUG partition_claim_failed consumer_group="orders" partition_key=0
+      claimed_by="orders-host2-67890-p0" claimed_until="2024-01-15T10:30:30Z"
 
 # Graceful exit (worker exits with code 75)
 INFO worker_exiting_claim_unavailable consumer_group="orders" partition_key=0

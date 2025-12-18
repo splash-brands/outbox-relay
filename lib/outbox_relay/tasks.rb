@@ -187,7 +187,8 @@ namespace :outbox_relay do
       rescue Errno::ESRCH
         puts "⚠ Process #{process[:name]} (PID: #{process[:pid]}) not found (already stopped)"
 
-        OutboxRelay.logger.warn(
+        # DEBUG: Process already stopped is not a problem, just informational
+        OutboxRelay.logger.debug(
           event_name: "rake_stop_process_not_found",
           process_name: process[:name],
           pid: process[:pid]

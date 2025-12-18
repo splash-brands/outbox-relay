@@ -54,7 +54,8 @@ module OutboxRelay
 
       def deregister
         unless @db_process
-          OutboxRelay.logger.warn(
+          # DEBUG: Normal path if process failed to register initially
+          OutboxRelay.logger.debug(
             event_name: "deregister_skipped_no_process",
             name: name,
             reason: "Process was never successfully registered"

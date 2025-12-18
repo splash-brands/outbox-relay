@@ -105,8 +105,8 @@ module OutboxRelay
           begin
             ActiveRecord::Base.logger.silence { yield }
           rescue => e
-            # Logger silencing failed - log and continue without silencing
-            OutboxRelay.logger.warn(
+            # DEBUG: Logger silencing is a minor convenience feature, failure doesn't affect correctness
+            OutboxRelay.logger.debug(
               event_name: "logger_silencing_failed",
               process_id: process_id,
               error: e.message,

@@ -129,8 +129,8 @@ module OutboxRelay
 
         @partition_claimed = false
       rescue => e
-        # Best-effort cleanup - don't raise during shutdown
-        OutboxRelay.logger.warn(
+        # DEBUG: Best-effort cleanup during shutdown - not actionable
+        OutboxRelay.logger.debug(
           event_name: "partition_claim_release_failed",
           consumer_group: consumer_group,
           topic: topic,
@@ -172,7 +172,9 @@ module OutboxRelay
       end
 
       def log_claim_failed(offset)
-        OutboxRelay.logger.warn(
+        # DEBUG level: This is expected behavior when multiple instances compete for partitions.
+        # Not a warning - the system is working correctly by rejecting duplicate workers.
+        OutboxRelay.logger.debug(
           event_name: "partition_claim_failed",
           consumer_group: consumer_group,
           topic: topic,

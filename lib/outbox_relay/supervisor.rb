@@ -80,7 +80,8 @@ module OutboxRelay
     def safe_instrument(event_name, **metadata, &block)
       OutboxRelay.instrument(event_name, **metadata, &block)
     rescue => e
-      OutboxRelay.logger.warn(
+      # DEBUG: Instrumentation failure doesn't affect operation - continue anyway
+      OutboxRelay.logger.debug(
         event_name: "instrumentation_failed",
         failed_event: event_name,
         error: e.message,
