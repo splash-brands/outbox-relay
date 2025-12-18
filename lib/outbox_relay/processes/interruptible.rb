@@ -155,7 +155,8 @@ module OutboxRelay
         begin
           @self_pipe[:reader].close unless @self_pipe[:reader].closed?
         rescue => e
-          OutboxRelay.logger.warn(
+          # DEBUG: Cleanup errors during shutdown are not actionable
+          OutboxRelay.logger.debug(
             event_name: "self_pipe_reader_close_failed",
             error: e.message,
             error_class: e.class.name
@@ -165,7 +166,8 @@ module OutboxRelay
         begin
           @self_pipe[:writer].close unless @self_pipe[:writer].closed?
         rescue => e
-          OutboxRelay.logger.warn(
+          # DEBUG: Cleanup errors during shutdown are not actionable
+          OutboxRelay.logger.debug(
             event_name: "self_pipe_writer_close_failed",
             error: e.message,
             error_class: e.class.name

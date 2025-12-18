@@ -255,7 +255,8 @@ module OutboxRelay
       # This prevents aggressive polling during database issues which could worsen DB load
       # Trade-off: May increase latency if lag queries fail during normal operation,
       # but prevents exacerbating database problems during outages
-      OutboxRelay.logger.warn(
+      # DEBUG: The ERROR was already logged above, this just explains the fallback behavior
+      OutboxRelay.logger.debug(
         event_name: "using_conservative_delay_on_lag_failure",
         process_id: process_id,
         processed_count: processed_count,

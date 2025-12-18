@@ -264,8 +264,8 @@ RSpec.describe OutboxRelay::Processes::PartitionClaiming do
         }.not_to raise_error
       end
 
-      it "logs warning" do
-        expect(OutboxRelay.logger).to receive(:warn).with(
+      it "logs at debug level" do
+        expect(OutboxRelay.logger).to receive(:debug).with(
           hash_including(event_name: "partition_claim_release_failed")
         )
 

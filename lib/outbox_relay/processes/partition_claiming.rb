@@ -129,8 +129,8 @@ module OutboxRelay
 
         @partition_claimed = false
       rescue => e
-        # Best-effort cleanup - don't raise during shutdown
-        OutboxRelay.logger.warn(
+        # DEBUG: Best-effort cleanup during shutdown - not actionable
+        OutboxRelay.logger.debug(
           event_name: "partition_claim_release_failed",
           consumer_group: consumer_group,
           topic: topic,

@@ -68,7 +68,8 @@ module OutboxRelay
           .delete_all
 
         if deleted_count > 0
-          OutboxRelay.logger.warn(
+          # INFO: This is a successful cleanup operation, not a warning
+          OutboxRelay.logger.info(
             event_name: "outbox_relay_expired_events_cleaned",
             deleted_count: deleted_count,
             batch_size: batch_size,
