@@ -31,18 +31,23 @@ PostgreSQL advisory locks are **application-level locks** managed by the databas
 ```sql
 -- Session-level locks (manual release required)
 SELECT pg_advisory_lock(key);        -- Blocking
-SELECT pg_try_advisory_lock(key);    -- Non-blocking
+SELECT pg_try_advisory_lock(key);    -- Non-blocking (we use this!)
 SELECT pg_advisory_unlock(key);      -- Manual release
 
 -- Transaction-level locks (auto-release on COMMIT/ROLLBACK)
 SELECT pg_advisory_xact_lock(key);        -- Blocking
-SELECT pg_try_advisory_xact_lock(key);    -- Non-blocking (we use this!)
+SELECT pg_try_advisory_xact_lock(key);    -- Non-blocking
 -- No unlock needed - released automatically
 ```
 
-**OutboxRelay uses:** `pg_try_advisory_xact_lock`
+**OutboxRelay uses:** `pg_try_advisory_lock` (session-level)
 - **try**: Non-blocking (returns immediately)
-- **xact**: Transaction-scoped (auto-release)
+- **Session-scoped**: Persists across transactions, released via `pg_advisory_unlock` or on connection close
+
+**Why session-level instead of transaction-level?**
+- Transaction-level requires keeping transaction open during `consume_message`
+- Slow HTTP calls cause `idle_in_transaction_session_timeout` in PostgreSQL/Aurora
+- Session-level allows processing OUTSIDE transaction while still preventing duplicates
 
 ---
 
@@ -215,64 +220,84 @@ module OutboxRelay
 
     def acquire_advisory_lock(lock_key)
       result = ActiveRecord::Base.connection.execute(
-        "SELECT pg_try_advisory_xact_lock(#{lock_key})"
+        "SELECT pg_try_advisory_lock(#{lock_key})"
       ).first
 
-      result["pg_try_advisory_xact_lock"] == true
+      result["pg_try_advisory_lock"] == true
+    end
+
+    def release_advisory_lock(lock_key)
+      return unless lock_key
+      ActiveRecord::Base.connection.execute(
+        "SELECT pg_advisory_unlock(#{lock_key})"
+      )
+    rescue => e
+      # Log but don't raise - lock released on connection close anyway
+      logger.warn(event_name: "advisory_lock_release_failed", error: e.message)
     end
 
     def process_event(event)
       lock_key = advisory_lock_key(event)
 
-      ActiveRecord::Base.transaction do
-        # Try to acquire lock
-        locked = acquire_advisory_lock(lock_key)
+      # Phase 1: Check offset and acquire session lock
+      return false unless can_process_event?(event, lock_key)
 
-        unless locked
-          # Another worker in same consumer group is processing this event
-          logger.debug(
-            event_name: "event_locked_by_another_worker",
-            event_id: event.event_id,
-            sequence: event.sequence,
-            consumer_group: consumer_group,
-            lock_key: lock_key
-          )
-          return false  # Skip this event
-        end
-
-        # We have the lock - safe to process
+      begin
+        # Phase 2: Process OUTSIDE transaction (HTTP calls safe!)
         consume_message(event)
-        update_offset(event)
 
-        # Lock automatically released on COMMIT
+        # Phase 3: Update offset
+        commit_event_processed(event)
+
         true
+      rescue StandardError => e
+        handle_failure(event, e)
+        raise
+      ensure
+        # ALWAYS release lock
+        release_advisory_lock(lock_key)
       end
-    rescue StandardError => e
-      # Lock automatically released on ROLLBACK
-      handle_failure(event, e)
-      raise
+    end
+
+    def can_process_event?(event, lock_key)
+      # Skip if already processed
+      return false if event.sequence <= current_offset.last_consumed_sequence
+
+      # Try to acquire session-level lock
+      acquire_advisory_lock(lock_key)
+    end
+
+    def commit_event_processed(event)
+      update_offset(event)
     end
   end
 end
 ```
 
-### Transaction Flow
+### 3-Phase Processing Flow
 
-```ruby
-BEGIN TRANSACTION
-  ├─ SELECT pg_try_advisory_xact_lock(429496729723456789)
-  │  └─ Returns: true (acquired) or false (already locked)
-  │
-  ├─ IF locked:
-  │  ├─ consume_message(event)      # Your business logic
-  │  └─ UPDATE consumer_offsets     # Track progress
-  │
-  └─ COMMIT
-     └─ Lock automatically released! ✅
-
-If ROLLBACK (error):
-  └─ Lock automatically released! ✅
 ```
+Phase 1: Acquire Lock
+  ├─ Check if event.sequence > current_offset (skip if already processed)
+  └─ SELECT pg_try_advisory_lock(key) → true/false
+
+Phase 2: Process (NO TRANSACTION!)
+  └─ consume_message(event)
+     └─ HTTP calls, API calls - can take seconds! ✅
+
+Phase 3: Update Offset
+  └─ UPDATE consumer_offsets SET last_consumed_sequence = ...
+
+Finally (ensure block):
+  └─ SELECT pg_advisory_unlock(key)
+     └─ Lock released! ✅
+```
+
+**Why 3-phase?**
+- Phase 2 runs OUTSIDE any database transaction
+- Slow HTTP calls don't cause `idle_in_transaction_session_timeout`
+- Lock still prevents duplicate processing (session-level persists)
+- `ensure` block guarantees lock release even on exceptions
 
 ---
 
@@ -283,36 +308,35 @@ If ROLLBACK (error):
 **Scenario:**
 ```ruby
 Worker A:
-  BEGIN TRANSACTION
-    pg_try_advisory_xact_lock(123) → SUCCESS
-    consume_message()  # CRASH! 💥 (segfault, OOM, etc.)
+  pg_try_advisory_lock(123) → SUCCESS
+  consume_message()  # CRASH! 💥 (segfault, OOM, etc.)
 ```
 
 **What happens:**
 - PostgreSQL detects session disconnect
-- Automatically **ROLLBACK** transaction
-- Advisory lock **automatically released**
+- Advisory lock **automatically released** (connection close)
 - Offset **not updated** (event stays at old sequence)
 - Next worker can pick up event #100 again ✅
 
-**Result:** Safe! Event will be reprocessed.
+**Result:** Safe! Event will be reprocessed (at-least-once delivery).
 
-### 2. Long-Running Message Processing
+### 2. Long-Running Message Processing (HTTP Calls)
 
 **Scenario:**
 ```ruby
 Worker A (notifications, event #100):
-  BEGIN TRANSACTION  # t=0
-    pg_try_advisory_xact_lock(123) → SUCCESS
-    consume_message()  # Takes 30 seconds...
+  pg_try_advisory_lock(123) → SUCCESS
+  consume_message()  # HTTP call to external API - takes 30 seconds...
+  # NO idle_in_transaction_timeout! (no open transaction)
 
 Worker B (notifications, event #100):
-  BEGIN TRANSACTION  # t=5s
-    pg_try_advisory_xact_lock(123) → FALSE
-    Skip event #100, process event #101 instead ✅
+  pg_try_advisory_lock(123) → FALSE (Worker A holds it)
+  Skip event #100, process event #101 instead ✅
 ```
 
 **Result:** Worker B moves on to next event. Worker A completes eventually.
+
+**Key benefit:** HTTP calls don't cause `idle_in_transaction_session_timeout` because `consume_message` runs OUTSIDE any database transaction.
 
 **Important:** Offsets are updated independently per worker:
 - Worker B might update offset to 105
@@ -324,16 +348,14 @@ Worker B (notifications, event #100):
 **Scenario:**
 ```ruby
 Worker A:
-  BEGIN TRANSACTION
-    pg_try_advisory_xact_lock(123) → SUCCESS
-    consume_message()
-    # Connection lost! (network blip)
+  pg_try_advisory_lock(123) → SUCCESS
+  consume_message()
+  # Connection lost! (network blip)
 ```
 
 **What happens:**
 - PostgreSQL ends session
-- Transaction **ROLLBACK**
-- Lock **released**
+- Lock **released** (session close)
 - Worker reconnects, retries event ✅
 
 ### 4. Multiple Workers, Same Consumer Group, Different Partitions
@@ -507,18 +529,32 @@ end
 Event stuck forever, never processed
 ```
 
-**Cause:** Session-level lock used instead of transaction-level
+**Cause:** `ensure` block not releasing lock, or exception before `ensure`
 
 **Check:**
 ```ruby
-# BAD - session-level (manual unlock required)
-connection.execute("SELECT pg_advisory_lock(#{key})")
+# CORRECT - ensure block always releases
+def process_event(event)
+  lock_key = advisory_lock_key(event)
+  return false unless acquire_advisory_lock(lock_key)
 
-# GOOD - transaction-level (auto-release)
-connection.execute("SELECT pg_try_advisory_xact_lock(#{key})")
+  begin
+    consume_message(event)
+    commit_event_processed(event)
+    true
+  ensure
+    release_advisory_lock(lock_key)  # ALWAYS called!
+  end
+end
 ```
 
-**Solution:** Ensure using `pg_try_advisory_xact_lock` (with `xact`)
+**Solution:**
+1. Ensure `release_advisory_lock` is in `ensure` block
+2. If worker process is stuck, kill it - connection close releases lock
+3. Check `pg_locks` for stuck advisory locks:
+```sql
+SELECT objid AS lock_key, pid FROM pg_locks WHERE locktype = 'advisory';
+```
 
 ### Issue 4: High Lock Contention
 
@@ -550,21 +586,35 @@ ConsumerOffset.where(topic: "my_topic")
 
 1. **Advisory locks are application-level**: Database provides the mechanism, you define the semantics
 2. **Per-consumer-group locking**: Encode both event and consumer group in key
-3. **Transaction-scoped**: Automatic cleanup on COMMIT/ROLLBACK
-4. **Non-blocking**: Use `pg_try_advisory_xact_lock` to avoid deadlocks
+3. **Session-scoped**: Persists across transactions, released via `pg_advisory_unlock` or connection close
+4. **Non-blocking**: Use `pg_try_advisory_lock` to avoid deadlocks
 5. **Fast and lightweight**: Microsecond acquisition, in-memory
+6. **3-phase processing**: Lock → Process (no transaction) → Unlock
+
+### Why Session-Level Locks?
+
+**Problem with transaction-level locks:**
+- Transaction must stay open during `consume_message`
+- HTTP calls cause `idle_in_transaction_session_timeout` (PostgreSQL/Aurora)
+- Connection killed after ~30s of idle transaction
+
+**Solution with session-level locks:**
+- Lock persists across transactions
+- `consume_message` runs OUTSIDE any transaction
+- HTTP calls can take minutes without issues
+- `ensure` block guarantees lock release
 
 ### When to Use Advisory Locks
 
 ✅ **Use advisory locks when:**
 - Need distributed locking without external system (Redis, etc.)
 - Lock semantics are application-specific
-- Want automatic cleanup on transaction end
+- Want automatic cleanup on connection close
 - PostgreSQL is already your database
+- Processing involves slow external calls (HTTP, APIs)
 
 ❌ **Don't use advisory locks when:**
 - Need locks across multiple databases
-- Need locks to persist beyond transaction
 - Lock key space is too large (advisory locks are per-database)
 
 ### Alternative Approaches
@@ -574,7 +624,7 @@ ConsumerOffset.where(topic: "my_topic")
 3. **Optimistic locking**: Requires extra columns, blocks all consumers
 4. **No locking + idempotency**: Simplest, but requires idempotent consumers
 
-**For OutboxRelay:** Advisory locks are the sweet spot - native PostgreSQL, fast, correct.
+**For OutboxRelay:** Session-level advisory locks are the sweet spot - native PostgreSQL, fast, correct, and HTTP-call safe.
 
 ---
 
