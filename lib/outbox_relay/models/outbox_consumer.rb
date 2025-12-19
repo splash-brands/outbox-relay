@@ -467,14 +467,19 @@ module OutboxRelay
   end
 
   def process_event(event)
-    # 3-Phase Event Processing
-    # ========================
+    # 3-Phase Event Processing with Retriable Exception Support
+    # ==========================================================
     # Separates lock acquisition, business logic, and offset update to avoid
     # holding DB transaction during potentially slow operations (HTTP calls).
     #
     # Phase 1: Acquire session lock (instant)
     # Phase 2: Process event OUTSIDE transaction (can be slow - HTTP calls OK)
     # Phase 3: Update offset (instant)
+    #
+    # Retriable Exceptions (e.g., rate limiting):
+    # - Override retriable_exception?(e) to identify transient errors
+    # - OutboxRelay will sleep and retry instead of going to DLQ
+    # - After max_retriable_attempts, falls through to normal DLQ handling
     #
     # Why session-level locks instead of transaction-level?
     # - Transaction-level locks require keeping transaction open during consume_message
@@ -491,6 +496,8 @@ module OutboxRelay
     # Phase 1: Check offset and acquire session lock
     return false unless can_process_event?(event, lock_key)
 
+    retriable_attempt = 0
+
     begin
       # Phase 2: Process event OUTSIDE transaction
       # HTTP calls, API calls - can take seconds without holding DB transaction
@@ -500,7 +507,31 @@ module OutboxRelay
       commit_event_processed(event)
 
       true # Successfully processed
+
     rescue => e
+      # Check if this is a retriable exception (e.g., rate limiting)
+      if retriable_exception?(e) && retriable_attempt < max_retriable_attempts
+        retriable_attempt += 1
+        delay = retry_delay_for(e)
+
+        @logger.info(
+          event_name: "retriable_exception_waiting",
+          event_id: event.event_id,
+          sequence: event.sequence,
+          consumer_group: consumer_group,
+          error_class: e.class.name,
+          error: e.message,
+          attempt: retriable_attempt,
+          max_attempts: max_retriable_attempts,
+          retry_delay: delay
+        )
+
+        # Sleep and retry - don't go to DLQ yet
+        sleep(delay)
+        retry
+      end
+
+      # Non-retriable exception OR exceeded max retriable attempts
       @logger.error(
         event_name: "consume_message_failed",
         event_id: event.event_id,
@@ -508,6 +539,7 @@ module OutboxRelay
         consumer_group: consumer_group,
         error: e.message,
         error_class: e.class.name,
+        retriable_attempts_exhausted: retriable_attempt >= max_retriable_attempts,
         backtrace: e.backtrace&.first(10)&.join("\n")
       )
 
@@ -535,6 +567,72 @@ module OutboxRelay
     # To be implemented by subclasses
     raise NotImplementedError, "Subclasses must implement consume_message"
   end
+
+  # Protected hooks - designed to be overridden by subclasses
+  protected
+
+  # Hook: Determine if an exception should trigger retry with backoff instead of DLQ
+  #
+  # Override in subclass to handle rate limiting or transient errors:
+  #
+  #   def retriable_exception?(exception)
+  #     exception.is_a?(Prop::RateLimited) ||
+  #       exception.is_a?(Faraday::TimeoutError)
+  #   end
+  #
+  # When true, OutboxRelay will:
+  #   1. Sleep for retry_delay_for(exception) seconds
+  #   2. Retry the event (up to max_retriable_attempts times)
+  #   3. NOT count this as a DLQ failure
+  #
+  # @param exception [Exception] The caught exception
+  # @return [Boolean] true if should retry with backoff, false for normal DLQ handling
+  def retriable_exception?(exception)
+    false
+  end
+
+  # Hook: Determine how long to wait before retrying a retriable exception
+  #
+  # Override in subclass for custom delay logic:
+  #
+  #   def retry_delay_for(exception)
+  #     case exception
+  #     when Prop::RateLimited
+  #       exception.retry_after  # Use Prop's calculated delay
+  #     when Faraday::TimeoutError
+  #       5  # Fixed 5 second delay for timeouts
+  #     else
+  #       60  # Default fallback
+  #     end
+  #   end
+  #
+  # @param exception [Exception] The retriable exception
+  # @return [Numeric] Seconds to sleep before retry (default: 60, max: 300)
+  def retry_delay_for(exception)
+    delay = if exception.respond_to?(:retry_after)
+      exception.retry_after
+    else
+      60
+    end
+
+    # Cap at 5 minutes to prevent excessive blocking
+    [delay.to_i, 300].min
+  end
+
+  # Hook: Maximum retry attempts for retriable exceptions before giving up
+  #
+  # Override in subclass if needed:
+  #
+  #   def max_retriable_attempts
+  #     10  # More attempts for rate-limited APIs
+  #   end
+  #
+  # @return [Integer] Max attempts (default: 5)
+  def max_retriable_attempts
+    5
+  end
+
+  private
 
   def current_offset
     # Each partition has its own offset tracking
