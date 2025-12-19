@@ -260,15 +260,15 @@ module OutboxRelay
   #
   # PostgreSQL advisory locks are:
   #   - Lightweight (no row locking)
-  #   - Automatically released on connection close or transaction COMMIT/ROLLBACK
+  #   - Automatically released on connection close
   #   - Never escalate to table locks
   #   - Session or transaction-scoped
   #
-  # We use **transaction-scoped** locks (pg_try_advisory_xact_lock):
-  #   - Lock acquired within transaction
-  #   - Lock automatically released on COMMIT or ROLLBACK
-  #   - No need for explicit unlock
-  #   - Safe even if worker crashes mid-processing
+  # We use **session-scoped** locks (pg_try_advisory_lock):
+  #   - Lock persists across transactions until explicitly released
+  #   - Must call pg_advisory_unlock() to release (or connection closes)
+  #   - Allows consume_message() to run OUTSIDE transaction
+  #   - Prevents idle_in_transaction_session_timeout for slow HTTP calls
   #
   # ## Lock Key Design
   #
@@ -290,23 +290,23 @@ module OutboxRelay
   #
   #   Time | Worker A                    | Worker B
   #   -----|----------------------------|---------------------------
-  #   T1   | BEGIN                      | BEGIN
-  #   T2   | FETCH event 123            | FETCH event 123
-  #   T3   | TRY_LOCK(123) → SUCCESS    | TRY_LOCK(123) → FAIL
-  #   T4   | Process event              | Skip event (already locked)
-  #   T5   | Update offset → COMMIT     | Fetch next event
-  #   T6   | Lock auto-released         |
+  #   T1   | FETCH event 123            | FETCH event 123
+  #   T2   | TRY_LOCK(123) → SUCCESS    | TRY_LOCK(123) → FAIL
+  #   T3   | Process event (HTTP call)  | Skip event (already locked)
+  #   T4   | Update offset              | Fetch next event
+  #   T5   | UNLOCK(123)                |
   #
   # Result: Event processed exactly once by Worker A.
   #
   # ## Edge Cases
   #
-  # 1. **Worker crashes mid-processing**: Transaction rolls back → lock released
+  # 1. **Worker crashes mid-processing**: Connection closes → lock released → event retried
   # 2. **Database connection lost**: All locks auto-released
   # 3. **Hash collision** (extremely rare): CRC32 has 1 in 4 billion collision rate
   #    Impact: Different consumer groups might temporarily block each other
   # 4. **Sequence wraparound**: After 4 billion events, sequences repeat
   #    Impact: None - old events already processed and cleaned up
+  # 5. **Lock not released due to exception**: ensure block guarantees release
   #
   def advisory_lock_key(event)
     # Combine event sequence and consumer group into 64-bit lock key
@@ -318,13 +318,18 @@ module OutboxRelay
   end
 
   def acquire_advisory_lock(lock_key)
-    # Try to acquire transaction-level advisory lock (pg_try_advisory_xact_lock)
+    # Try to acquire SESSION-level advisory lock (pg_try_advisory_lock)
     # Returns true if lock acquired, false if already locked by another session
     #
     # Lock lifecycle:
-    # - Automatically released on COMMIT, ROLLBACK, or connection close
-    # - Session-scoped: Worker crash or SIGKILL releases lock immediately
-    # - Safe for fork-based architecture: No manual cleanup needed
+    # - Persists across transactions until explicitly released or connection closes
+    # - Must call release_advisory_lock() to release
+    # - Auto-released on connection close (worker crash = lock released)
+    #
+    # Why session-level instead of transaction-level?
+    # - Allows consume_message() to run OUTSIDE transaction (HTTP calls safe)
+    # - Prevents idle_in_transaction_session_timeout in PostgreSQL/Aurora
+    # - Lock still prevents duplicate processing across workers
 
     # Validate lock_key is a valid integer
     unless lock_key.is_a?(Integer)
@@ -334,7 +339,7 @@ module OutboxRelay
     # Use parameterized query to prevent SQL injection
     result = ActiveRecord::Base.connection.execute(
       ActiveRecord::Base.sanitize_sql_array([
-        "SELECT pg_try_advisory_xact_lock(?)",
+        "SELECT pg_try_advisory_lock(?)",
         lock_key
       ])
     ).first
@@ -347,7 +352,7 @@ module OutboxRelay
       return false  # Fail safe - don't process event
     end
 
-    lock_acquired = result["pg_try_advisory_xact_lock"]
+    lock_acquired = result["pg_try_advisory_lock"]
 
     if lock_acquired.nil?
       @logger.error(
@@ -380,127 +385,150 @@ module OutboxRelay
     false
   end
 
-  def process_event(event)
-    # Wrap in transaction for atomicity and concurrency safety
-    #
-    # CRITICAL: The transaction ensures:
-    #   1. Advisory lock prevents duplicate processing within same consumer group
-    #   2. Offset is updated atomically with message processing
-    #   3. Lock is automatically released on COMMIT or ROLLBACK
-    #
-    # Multi-consumer support:
-    # - Advisory lock key includes consumer group in the hash
-    # - Different consumer groups get different lock keys for same event
-    # - Consumer group A can process event 123 while group B processes it too
-    #
-    # Race condition prevention within same consumer group:
-    # - Multiple workers from SAME group can fetch same event from database
-    # - But only ONE succeeds at acquiring advisory lock
-    # - Failed worker skips silently (lock already held)
-    # - Database-level uniqueness on sequence prevents offset corruption
-    #
-    # Example concurrent execution (same consumer group):
-    #   Worker A: fetch event 123 → acquire lock → SUCCESS → process
-    #   Worker B: fetch event 123 → acquire lock → FAIL → skip silently
-    #   Worker B moves to next event, Worker A continues processing
-    ActiveRecord::Base.transaction do
-      # Calculate advisory lock key (unique per event + consumer group)
-      lock_key = advisory_lock_key(event)
+  def release_advisory_lock(lock_key)
+    # Release session-level advisory lock
+    # Should be called in ensure block to guarantee release
+    return unless lock_key
 
-      # Try to acquire lock - returns false if another worker already holds it
-      unless acquire_advisory_lock(lock_key)
-        # Lock held by another worker - skip silently (this is normal/expected)
-        # Advisory locks exist specifically to prevent duplicate processing
-        return false # Skip this event, another worker is processing it
-      end
+    ActiveRecord::Base.connection.execute(
+      ActiveRecord::Base.sanitize_sql_array([
+        "SELECT pg_advisory_unlock(?)",
+        lock_key
+      ])
+    )
+  rescue => e
+    # Log but don't raise - lock will be released when connection closes anyway
+    @logger.warn(
+      event_name: "advisory_lock_release_failed",
+      lock_key: lock_key,
+      error: e.message
+    )
+  end
 
-      # Delegate to subclass for actual processing
-      begin
-        consume_message(event)
-      rescue => e
-        @logger.error(
-          event_name: "consume_message_failed",
-          event_id: event.event_id,
-          sequence: event.sequence,
-          consumer_group: consumer_group,
-          error: e.message,
-          error_class: e.class.name,
-          backtrace: e.backtrace&.first(10)&.join("\n")
-        )
-
-        OutboxRelay::Instrumentation::Models.error(
-          e,
-          model: "OutboxConsumer",
-          operation: "consume_message",
-          event_id: event.event_id,
-          sequence: event.sequence,
-          consumer_group: consumer_group,
-          phase: "consume_message"
-        )
-
-        # Record failure in DLQ for retry/monitoring
-        handle_event_failure(event, e)
-
-        # Re-raise to abort transaction - UNRECOVERABLE because:
-        # 1. Event processing failed - can't mark as successfully processed
-        # 2. Transaction rollback releases advisory lock for retry
-        # 3. Offset not updated - event will be retried (with backoff via DLQ)
-        raise
-      end
-
-      # Update offset atomically (lock auto-released on COMMIT)
-      begin
-        offset_updated = update_offset(event)
-
-        # Log stale offset updates for visibility (Kafka-style out-of-order completion)
-        unless offset_updated
-          @logger.debug(
-            event_name: "stale_offset_skipped",
-            event_id: event.event_id,
-            sequence: event.sequence,
-            current_offset: current_offset.last_consumed_sequence,
-            consumer_group: consumer_group,
-            message: "Event processed successfully but offset not updated (out-of-order completion)"
-          )
-        end
-      rescue => e
-        # Offset update failures are CRITICAL - they indicate infrastructure issues
-        # and can cause event reprocessing or offset corruption
-        #
-        # UNRECOVERABLE because:
-        # 1. Message WAS successfully processed (can't undo side effects)
-        # 2. But we can't record progress (offset update failed)
-        # 3. Re-processing would cause duplicates (idempotency required)
-        # 4. This indicates database issues, not business logic errors
-        @logger.error(
-          event_name: "offset_update_failed",
-          event_id: event.event_id,
-          sequence: event.sequence,
-          consumer_group: consumer_group,
-          error: e.message,
-          error_class: e.class.name,
-          backtrace: e.backtrace&.first(10)&.join("\n"),
-          severity: "critical"
-        )
-
-        OutboxRelay::Instrumentation::Models.error(
-          e,
-          model: "OutboxConsumer",
-          operation: "offset_update",
-          event_id: event.event_id,
-          sequence: event.sequence,
-          consumer_group: consumer_group,
-          phase: "offset_update",
-          severity: "critical"
-        )
-
-        # Don't call handle_event_failure - message WAS processed successfully
-        # This is a tracking failure, not a business logic failure
-        raise # Re-raise to abort transaction and retry entire event
-      end
+  # Phase 1: Check if event can be processed and acquire session lock
+  # Returns false if:
+  #   - Event already processed (offset check)
+  #   - Lock held by another worker
+  def can_process_event?(event, lock_key)
+    # Check if event was already processed (offset comparison)
+    # This is a defensive check - shouldn't happen often due to fetch_batch filtering
+    if event.sequence <= current_offset.last_consumed_sequence
+      @logger.debug(
+        event_name: "event_already_processed",
+        event_id: event.event_id,
+        sequence: event.sequence,
+        current_offset: current_offset.last_consumed_sequence,
+        consumer_group: consumer_group
+      )
+      return false
     end
 
-    true # Successfully processed
+    # Try to acquire session-level lock
+    unless acquire_advisory_lock(lock_key)
+      # Lock held by another worker - skip silently (this is normal/expected)
+      return false
+    end
+
+    true
+  end
+
+  # Phase 3: Update offset after successful processing
+  # Includes defensive staleness check
+  def commit_event_processed(event)
+    # Defensive check: verify event wasn't processed while we were working
+    # This shouldn't happen due to advisory lock, but provides extra safety
+    current_seq = current_offset.reload.last_consumed_sequence
+    if event.sequence <= current_seq
+      @logger.warn(
+        event_name: "offset_already_advanced",
+        event_id: event.event_id,
+        sequence: event.sequence,
+        current_offset: current_seq,
+        consumer_group: consumer_group,
+        message: "Offset already advanced past this event - skipping update"
+      )
+      return false
+    end
+
+    offset_updated = update_offset(event)
+
+    unless offset_updated
+      @logger.debug(
+        event_name: "stale_offset_skipped",
+        event_id: event.event_id,
+        sequence: event.sequence,
+        current_offset: current_offset.last_consumed_sequence,
+        consumer_group: consumer_group,
+        message: "Event processed successfully but offset not updated (out-of-order completion)"
+      )
+    end
+
+    offset_updated
+  end
+
+  def process_event(event)
+    # 3-Phase Event Processing
+    # ========================
+    # Separates lock acquisition, business logic, and offset update to avoid
+    # holding DB transaction during potentially slow operations (HTTP calls).
+    #
+    # Phase 1: Acquire session lock (instant)
+    # Phase 2: Process event OUTSIDE transaction (can be slow - HTTP calls OK)
+    # Phase 3: Update offset (instant)
+    #
+    # Why session-level locks instead of transaction-level?
+    # - Transaction-level locks require keeping transaction open during consume_message
+    # - Slow HTTP calls cause idle_in_transaction_session_timeout in PostgreSQL/Aurora
+    # - Session locks persist across transactions, released explicitly or on connection close
+    #
+    # Safety guarantees:
+    # - Advisory lock prevents duplicate processing across workers
+    # - Worker crash → connection closes → lock auto-released → event retried
+    # - At-least-once delivery guaranteed (consumers must be idempotent)
+
+    lock_key = advisory_lock_key(event)
+
+    # Phase 1: Check offset and acquire session lock
+    return false unless can_process_event?(event, lock_key)
+
+    begin
+      # Phase 2: Process event OUTSIDE transaction
+      # HTTP calls, API calls - can take seconds without holding DB transaction
+      consume_message(event)
+
+      # Phase 3: Update offset
+      commit_event_processed(event)
+
+      true # Successfully processed
+    rescue => e
+      @logger.error(
+        event_name: "consume_message_failed",
+        event_id: event.event_id,
+        sequence: event.sequence,
+        consumer_group: consumer_group,
+        error: e.message,
+        error_class: e.class.name,
+        backtrace: e.backtrace&.first(10)&.join("\n")
+      )
+
+      OutboxRelay::Instrumentation::Models.error(
+        e,
+        model: "OutboxConsumer",
+        operation: "consume_message",
+        event_id: event.event_id,
+        sequence: event.sequence,
+        consumer_group: consumer_group,
+        phase: "consume_message"
+      )
+
+      # Record failure in DLQ for retry/monitoring
+      handle_event_failure(event, e)
+
+      raise
+    ensure
+      # ALWAYS release lock - even on success, failure, or unexpected exception
+      release_advisory_lock(lock_key)
+    end
   end
 
   def consume_message(_event)
