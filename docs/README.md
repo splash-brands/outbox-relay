@@ -83,7 +83,23 @@ Per-consumer group failure handling and retry strategies.
 
 ---
 
-### 5. [Migration Guide](./MIGRATION_GUIDE.md)
+### 5. [Retriable Exceptions](./RETRIABLE_EXCEPTIONS.md)
+**NEW!** Handle rate limiting and transient errors gracefully.
+
+**Topics covered:**
+- What are retriable exceptions?
+- Hook methods: `retriable_exception?`, `retry_delay_for`, `max_retriable_attempts`
+- How retry with backoff works
+- Integration with Prop, Rack::Attack, custom rate limiters
+- Best practices and common patterns
+
+**Audience:** Developers calling rate-limited APIs (ShipStation, Stripe, etc.)
+
+**Reading time:** 8 minutes
+
+---
+
+### 6. [Migration Guide](./MIGRATION_GUIDE.md)
 Step-by-step guide to migrate from old to new architecture.
 
 **Topics covered:**
@@ -219,7 +235,21 @@ You can also manually set the starting offset via database if needed.
 
 ### Q: What happens if a worker crashes during processing?
 
-**A:** Advisory lock is automatically released (transaction rollback). Offset is not updated. Event will be reprocessed by another worker or the same worker after restart.
+**A:** Advisory lock is automatically released (connection close). Offset is not updated. Event will be reprocessed by another worker or the same worker after restart.
+
+### Q: How do I handle rate limiting from external APIs?
+
+**A:** Use retriable exceptions! Override `retriable_exception?` to identify rate limit errors:
+
+```ruby
+class ShipstationConsumer < OutboxRelay::OutboxConsumer
+  def retriable_exception?(exception)
+    exception.is_a?(Prop::RateLimited)
+  end
+end
+```
+
+OutboxRelay will automatically sleep and retry instead of sending to DLQ. See [Retriable Exceptions](./RETRIABLE_EXCEPTIONS.md) for details.
 
 ---
 
@@ -334,6 +364,36 @@ end
 - `:latest` (default) - New consumer groups start from current max sequence (skip history)
 - `:earliest` - New consumer groups start from 0 (process all historical events)
 
+### Handling Rate-Limited APIs
+
+```ruby
+class ShipstationConsumer < OutboxRelay::OutboxConsumer
+  def initialize(partition_key:)
+    super(
+      consumer_group: "shipstation_sync",
+      topic: "order_lifecycle",
+      partition_key: partition_key,
+      dead_letter_config: { max_retries: 3 }
+    )
+  end
+
+  def consume_message(event)
+    ShipstationSyncService.new(event.payload).call
+  end
+
+  protected
+
+  # Handle Prop rate limiting gracefully
+  def retriable_exception?(exception)
+    exception.is_a?(Prop::RateLimited)
+  end
+
+  def retry_delay_for(exception)
+    exception.retry_after if exception.respond_to?(:retry_after)
+  end
+end
+```
+
 ### Publishing an Event
 
 ```ruby
@@ -392,6 +452,8 @@ end
 - **2025-11-03**: Initial documentation for multi-consumer architecture
 - **2025-11-03**: Architecture implementation completed
 - **2025-11-07**: Documentation updated to reflect implementation status
+- **2025-12-19**: Added session-level advisory locks (fix idle_in_transaction timeout)
+- **2025-12-19**: Added retriable exceptions for rate limiting support
 
 ---
 
