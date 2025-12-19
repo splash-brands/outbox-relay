@@ -227,9 +227,11 @@ module OutboxRelay
   end
 
   def load_dlq_event_ids
+    # Only exclude "unresolved" events (gave up after max retries)
+    # Events with "retrying" status should be retried automatically
     OutboxRelay::DeadLetterEvent
       .where(consumer_group: consumer_group)
-      .where(resolution_status: ["unresolved", "retrying"])
+      .where(resolution_status: "unresolved")
       .pluck(:outbox_relay_outbox_event_id)
   end
 
