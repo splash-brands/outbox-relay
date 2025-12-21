@@ -113,8 +113,12 @@ module OutboxRelay
     #   - false if offset was stale (sequence <= current)
     #   - Raises on other errors (DB connectivity, constraint violations)
     #
-    with_lock do
-      reload # Ensure we have latest offset value
+    # Note: Uses explicit reload + lock! pattern instead of with_lock to be compatible
+    # with Rails 7.1+ which raises error on with_lock if record has pending changes.
+    #
+    ActiveRecord::Base.transaction do
+      reload  # Clear any in-memory changes and ensure we have latest offset value
+      lock!
 
       # Check if this is a stale offset (event processed out-of-order)
       if sequence <= last_consumed_sequence
@@ -176,9 +180,13 @@ module OutboxRelay
   # @param consumer_instance_id [String] Unique ID of the claiming worker
   # @param ttl [ActiveSupport::Duration] How long the claim is valid (default: 30 seconds)
   # @return [Boolean] true if claim acquired, false if already claimed by another worker
+  #
+  # Note: Uses explicit reload + lock! pattern instead of with_lock to be compatible
+  # with Rails 7.1+ which raises error on with_lock if record has pending changes.
   def try_claim!(consumer_instance_id:, ttl: CLAIM_TTL)
-    with_lock do
-      reload
+    ActiveRecord::Base.transaction do
+      reload  # Clear any in-memory changes before locking
+      lock!
 
       # Check if already claimed by another worker (claim still active)
       if claimed? && claimed_by != consumer_instance_id
@@ -201,9 +209,13 @@ module OutboxRelay
   # @param consumer_instance_id [String] Unique ID of the claiming worker
   # @param ttl [ActiveSupport::Duration] New TTL from now
   # @return [Boolean] true if renewal successful, false if claim lost to another worker
+  #
+  # Note: Uses explicit reload + lock! pattern instead of with_lock to be compatible
+  # with Rails 7.1+ which raises error on with_lock if record has pending changes.
   def renew_claim!(consumer_instance_id:, ttl: CLAIM_TTL)
-    with_lock do
-      reload
+    ActiveRecord::Base.transaction do
+      reload  # Clear any in-memory changes before locking
+      lock!
 
       # Only renew if we still hold the claim
       return false unless claimed_by == consumer_instance_id
@@ -217,9 +229,13 @@ module OutboxRelay
   #
   # @param consumer_instance_id [String] Unique ID of the releasing worker
   # @return [Boolean] true if release successful, false if we don't hold the claim
+  #
+  # Note: Uses explicit reload + lock! pattern instead of with_lock to be compatible
+  # with Rails 7.1+ which raises error on with_lock if record has pending changes.
   def release_claim!(consumer_instance_id:)
-    with_lock do
-      reload
+    ActiveRecord::Base.transaction do
+      reload  # Clear any in-memory changes before locking
+      lock!
 
       # Only release if we hold the claim
       return false unless claimed_by == consumer_instance_id
