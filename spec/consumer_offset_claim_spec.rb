@@ -352,4 +352,79 @@ RSpec.describe OutboxRelay::ConsumerOffset, "partition claiming" do
       expect(offset.reload.claimed_by).to eq("worker-2")
     end
   end
+
+  # Rails 7.1+ compatibility tests
+  # In Rails 7.1+, with_lock raises error if record has unsaved changes.
+  # These tests verify our reload + lock! pattern handles this correctly.
+  describe "Rails 7.1+ compatibility (pending changes before locking)" do
+    it "try_claim! works when record has pending changes" do
+      # Simulate pending changes without saving
+      offset.claimed_until = 1.hour.from_now
+      offset.heartbeat_at = Time.current
+
+      # Verify record is dirty
+      expect(offset.changed?).to be true
+
+      # Should NOT raise "Locking a record with unpersisted changes is not supported"
+      result = offset.try_claim!(consumer_instance_id: "worker-1")
+
+      expect(result).to be true
+      expect(offset.reload.claimed_by).to eq("worker-1")
+    end
+
+    it "renew_claim! works when record has pending changes from previous claim" do
+      # First, claim the partition
+      offset.try_claim!(consumer_instance_id: "worker-1")
+
+      # Simulate what happens in production:
+      # The cached @partition_offset has in-memory state from try_claim!
+      # but then someone modifies it or time passes
+      offset.claimed_until = 1.hour.from_now  # Pending change
+
+      # Verify record is dirty
+      expect(offset.changed?).to be true
+
+      # Should NOT raise "Locking a record with unpersisted changes is not supported"
+      result = offset.renew_claim!(consumer_instance_id: "worker-1")
+
+      expect(result).to be true
+    end
+
+    it "release_claim! works when record has pending changes" do
+      # First, claim the partition
+      offset.try_claim!(consumer_instance_id: "worker-1")
+
+      # Add pending changes
+      offset.heartbeat_at = Time.current
+
+      # Verify record is dirty
+      expect(offset.changed?).to be true
+
+      # Should NOT raise error
+      result = offset.release_claim!(consumer_instance_id: "worker-1")
+
+      expect(result).to be true
+      expect(offset.reload.claimed_by).to be_nil
+    end
+
+    it "handles multiple consecutive renew_claim! calls (heartbeat simulation)" do
+      # Simulate the heartbeat loop that caused the production issue
+      offset.try_claim!(consumer_instance_id: "worker-1")
+
+      # First heartbeat - renew claim
+      result1 = offset.renew_claim!(consumer_instance_id: "worker-1")
+      expect(result1).to be true
+
+      # Don't reload - keep using the same object (like production)
+      # This leaves stale claimed_until in memory
+
+      # Second heartbeat - should still work
+      result2 = offset.renew_claim!(consumer_instance_id: "worker-1")
+      expect(result2).to be true
+
+      # Third heartbeat - should still work
+      result3 = offset.renew_claim!(consumer_instance_id: "worker-1")
+      expect(result3).to be true
+    end
+  end
 end

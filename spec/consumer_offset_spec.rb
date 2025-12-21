@@ -258,6 +258,39 @@ RSpec.describe OutboxRelay::ConsumerOffset do
         expect(offset.reload.last_consumed_sequence).to eq(115)
       end
     end
+
+    # Rails 7.1+ compatibility tests
+    context "Rails 7.1+ compatibility (pending changes before locking)" do
+      it "works when record has pending changes in memory" do
+        # Simulate scenario where record has unsaved changes
+        offset.heartbeat_at = Time.current
+        offset.last_consumed_at = Time.current
+
+        # Verify record is dirty
+        expect(offset.changed?).to be true
+
+        # Should NOT raise "Locking a record with unpersisted changes is not supported"
+        result = offset.update_offset!(sequence: 150, event_id: "event-150")
+
+        expect(result).to be true
+        expect(offset.reload.last_consumed_sequence).to eq(150)
+      end
+
+      it "handles multiple consecutive update_offset! calls without reload" do
+        # Simulate consumer loop processing events without manual reloads
+        result1 = offset.update_offset!(sequence: 110, event_id: "event-110")
+        expect(result1).to be true
+
+        # Don't reload - keep using the same object
+        result2 = offset.update_offset!(sequence: 120, event_id: "event-120")
+        expect(result2).to be true
+
+        result3 = offset.update_offset!(sequence: 130, event_id: "event-130")
+        expect(result3).to be true
+
+        expect(offset.reload.last_consumed_sequence).to eq(130)
+      end
+    end
   end
 
   describe "#heartbeat!" do
