@@ -52,7 +52,9 @@ ActiveRecord::Schema.define do
   end
 
   create_table :outbox_relay_dead_letter_events, force: true do |t|
+    t.references :outbox_relay_outbox_event, foreign_key: false, index: true  # Production uses FK
     t.string :consumer_group, null: false
+    t.string :consumer_class
     t.string :original_topic, null: false
     t.integer :original_sequence, null: false
     t.string :original_event_id, null: false
@@ -62,12 +64,16 @@ ActiveRecord::Schema.define do
     t.integer :original_partition_key, null: false, default: 0
     t.text :error_message
     t.text :error_backtrace
+    t.text :error_context  # JSON serialized for SQLite
     t.integer :total_retries, null: false, default: 0
     t.string :resolution_status, null: false, default: "retrying"
+    t.text :resolution_notes
+    t.datetime :resolved_at
     t.datetime :last_retry_at
+    t.datetime :retry_after  # Exponential backoff: exclude until this time passes
     t.timestamps
 
-    t.index [:consumer_group, :original_sequence], unique: true, name: "index_dead_letter_events_unique"
+    t.index [:consumer_group, :outbox_relay_outbox_event_id], unique: true, name: "idx_dlq_consumer_event"
     t.index :resolution_status
     t.index :created_at
   end
@@ -124,6 +130,7 @@ module OutboxRelay
 
     serialize :original_payload, coder: JSON
     serialize :original_headers, coder: JSON
+    serialize :error_context, coder: JSON
   end
 end
 

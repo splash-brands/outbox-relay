@@ -165,7 +165,7 @@ class OrderUpdatesConsumer < OutboxRelay::OutboxConsumer
       topic: "order_updates",
       partition_key: partition_key,
       event_filter: ["created", "updated"], # optional
-      dead_letter_config: { max_retries: 2 }, # optional
+      dead_letter_config: { max_retries: 5 }, # optional (default: 5)
       auto_offset_reset: :latest # optional, default: :latest
     )
   end
@@ -198,7 +198,7 @@ end
 | `topic` | Yes | - | Topic to consume from |
 | `partition_key` | Yes | - | Partition to process |
 | `event_filter` | No | `nil` | Array of event names to process (others are skipped) |
-| `dead_letter_config` | No | `{}` | DLQ configuration with `max_retries` |
+| `dead_letter_config` | No | See below | DLQ config with exponential backoff (see Dead Letter Queue section) |
 | `auto_offset_reset` | No | `:latest` | Where new consumers start (see below) |
 
 #### `auto_offset_reset` Option
@@ -736,7 +736,47 @@ end
 
 ## 💀 Dead Letter Queue
 
-Failed events are tracked per consumer group in the dead letter queue:
+Failed events are tracked per consumer group in the dead letter queue with **automatic exponential backoff**.
+
+### Configuration
+
+```ruby
+class OrderUpdatesConsumer < OutboxRelay::OutboxConsumer
+  def initialize(partition_key:)
+    super(
+      consumer_group: "order_processor",
+      topic: "order_updates",
+      partition_key: partition_key,
+      dead_letter_config: {
+        max_retries: 5,        # Default: 5 (then "unresolved")
+        retry_base_delay: 60,  # Default: 60 seconds
+        retry_max_delay: 1800, # Default: 1800 (30 minutes)
+      }
+    )
+  end
+end
+```
+
+### Exponential Backoff
+
+When an event fails, it's moved to the DLQ with a `retry_after` timestamp. The delay increases exponentially with each retry:
+
+```
+Retry 1: 60s  (1 minute)   - retry_after = now + 60s
+Retry 2: 120s (2 minutes)  - retry_after = now + 120s
+Retry 3: 240s (4 minutes)  - retry_after = now + 240s
+Retry 4: 480s (8 minutes)  - retry_after = now + 480s
+Retry 5: 960s (16 minutes) - retry_after = now + 960s (capped at max_delay)
+→ After 5 retries: status = "unresolved"
+```
+
+**Key behaviors:**
+- Worker continues processing other events (NOT blocked during backoff)
+- Events in backoff period are excluded from fetch queries
+- ±20% jitter prevents thundering herd on retries
+- Total retry timeline: ~15 minutes with default settings
+
+### Querying DLQ
 
 ```ruby
 # Query dead letter events for a specific consumer group
@@ -752,10 +792,11 @@ dead_event.error_message # => "ArgumentError: invalid order"
 dead_event.error_backtrace # => ["app/consumers/...", ...]
 dead_event.total_retries # => 3
 dead_event.resolution_status # => "retrying" or "unresolved"
+dead_event.retry_after # => 2024-01-15 10:35:00 UTC (next retry time)
 dead_event.original_payload # => { "order_id" => 123 }
 
 # Resolution statuses:
-# - "retrying": Event will be retried automatically
+# - "retrying": Event will be retried automatically after retry_after
 # - "unresolved": Max retries reached, needs manual intervention
 # - "resolved": Manually resolved without reprocessing
 # - "reprocessed": Successfully reprocessed
@@ -1373,6 +1414,33 @@ class AddPartitionClaimingToOutboxRelayConsumerOffsets < ActiveRecord::Migration
               algorithm: :concurrently
   end
 end
+```
+
+### DLQ Backoff Migration
+
+Add exponential backoff for DLQ retries (required for new installations):
+
+```bash
+rails generate outbox_relay:add_dlq_retry_backoff
+rails db:migrate
+```
+
+This adds the `retry_after` column to `dead_letter_events`. Backoff is **enabled by default** with these settings:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `max_retries` | 5 | Retries before "unresolved" status |
+| `retry_base_delay` | 60 | Base delay in seconds (1 minute) |
+| `retry_max_delay` | 1800 | Maximum delay cap (30 minutes) |
+
+You can customize per-consumer:
+
+```ruby
+dead_letter_config: {
+  max_retries: 3,         # Fewer retries for known-bad events
+  retry_base_delay: 30,   # Faster initial retry
+  retry_max_delay: 600,   # Cap at 10 minutes
+}
 ```
 
 ### Observability

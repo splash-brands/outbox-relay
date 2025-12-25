@@ -83,23 +83,7 @@ Per-consumer group failure handling and retry strategies.
 
 ---
 
-### 5. [Retriable Exceptions](./RETRIABLE_EXCEPTIONS.md)
-**NEW!** Handle rate limiting and transient errors gracefully.
-
-**Topics covered:**
-- What are retriable exceptions?
-- Hook methods: `retriable_exception?`, `retry_delay_for`, `max_retriable_attempts`
-- How retry with backoff works
-- Integration with Prop, Rack::Attack, custom rate limiters
-- Best practices and common patterns
-
-**Audience:** Developers calling rate-limited APIs (ShipStation, Stripe, etc.)
-
-**Reading time:** 8 minutes
-
----
-
-### 6. [Migration Guide](./MIGRATION_GUIDE.md)
+### 5. [Migration Guide](./MIGRATION_GUIDE.md)
 Step-by-step guide to migrate from old to new architecture.
 
 **Topics covered:**
@@ -239,17 +223,34 @@ You can also manually set the starting offset via database if needed.
 
 ### Q: How do I handle rate limiting from external APIs?
 
-**A:** Use retriable exceptions! Override `retriable_exception?` to identify rate limit errors:
+**A:** Use a `with_rate_limit` helper in your consumer to wait for rate limit tokens BEFORE calling the API. Rate limits are NOT errors - they mean we're consuming too fast. DLQ should be reserved for actual errors (timeouts, 500s, validation).
 
 ```ruby
 class ShipstationConsumer < OutboxRelay::OutboxConsumer
-  def retriable_exception?(exception)
-    exception.is_a?(Prop::RateLimited)
+  include MyApp::Concerns::RateLimitHelper
+
+  def consume_message(event)
+    with_rate_limit(:shipstation_minute_limit) do
+      ShipstationSyncService.new(event.payload).call
+    end
   end
+end
+
+# In your helper:
+def with_rate_limit(key)
+  loop do
+    begin
+      Prop.throttle!(key)
+      break
+    rescue Prop::RateLimited => e
+      sleep(e.retry_after || 1)
+    end
+  end
+  yield
 end
 ```
 
-OutboxRelay will automatically sleep and retry instead of sending to DLQ. See [Retriable Exceptions](./RETRIABLE_EXCEPTIONS.md) for details.
+This ensures workers block (wait) when rate limited instead of going to DLQ.
 
 ---
 
@@ -368,28 +369,41 @@ end
 
 ```ruby
 class ShipstationConsumer < OutboxRelay::OutboxConsumer
+  include MyApp::Concerns::RateLimitHelper
+
   def initialize(partition_key:)
     super(
       consumer_group: "shipstation_sync",
       topic: "order_lifecycle",
       partition_key: partition_key,
-      dead_letter_config: { max_retries: 3 }
+      dead_letter_config: { max_retries: 5 }  # DLQ for real errors
     )
   end
 
   def consume_message(event)
-    ShipstationSyncService.new(event.payload).call
+    # Wait for rate limit token BEFORE calling API
+    with_rate_limit(:shipstation_minute_limit) do
+      ShipstationSyncService.new(event.payload).call
+    end
   end
+end
+
+# RateLimitHelper concern:
+module MyApp::Concerns::RateLimitHelper
+  extend ActiveSupport::Concern
 
   protected
 
-  # Handle Prop rate limiting gracefully
-  def retriable_exception?(exception)
-    exception.is_a?(Prop::RateLimited)
-  end
-
-  def retry_delay_for(exception)
-    exception.retry_after if exception.respond_to?(:retry_after)
+  def with_rate_limit(key)
+    loop do
+      begin
+        Prop.throttle!(key)
+        break
+      rescue Prop::RateLimited => e
+        sleep(e.retry_after || 1)
+      end
+    end
+    yield
   end
 end
 ```
@@ -453,7 +467,8 @@ end
 - **2025-11-03**: Architecture implementation completed
 - **2025-11-07**: Documentation updated to reflect implementation status
 - **2025-12-19**: Added session-level advisory locks (fix idle_in_transaction timeout)
-- **2025-12-19**: Added retriable exceptions for rate limiting support
+- **2025-12-25**: Simplified DLQ architecture - removed retriable_exception?, enabled DLQ backoff by default
+- **2025-12-25**: Rate limiting now handled via `with_rate_limit` helper (rate limits ≠ errors)
 
 ---
 

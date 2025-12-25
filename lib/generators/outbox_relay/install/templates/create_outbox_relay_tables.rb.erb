@@ -125,6 +125,10 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
       t.text(:resolution_notes)
       t.timestamp(:resolved_at)
 
+      # Retry scheduling with exponential backoff
+      # Events with retry_after > NOW() are excluded from fetch until the time passes
+      t.timestamp(:retry_after)
+
       t.timestamps(null: false)
     end
 
@@ -139,6 +143,15 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
       :outbox_relay_dead_letter_events,
       [:resolution_status, :created_at],
       name: "idx_dlq_resolution"
+    )
+
+    # Partial index for retry scheduling queries
+    # Covers: WHERE resolution_status = 'retrying' AND retry_after > NOW()
+    add_index(
+      :outbox_relay_dead_letter_events,
+      [:resolution_status, :retry_after],
+      name: "idx_dlq_retry_schedule",
+      where: "resolution_status = 'retrying'"
     )
 
     # ============================================================================

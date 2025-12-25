@@ -1,0 +1,32 @@
+# frozen_string_literal: true
+
+# Migration to add retry_after column for DLQ exponential backoff
+#
+# This enables automatic retry delays between failed event processing attempts.
+# Events with retry_after > NOW() are excluded from fetch until the time passes.
+#
+# Backoff formula (default):
+#   retry_after = NOW() + base_delay * (2 ^ (retry_count - 1))
+#
+# With default 60s base:
+#   Retry 1: 1 min wait
+#   Retry 2: 2 min wait
+#   Retry 3: 4 min wait
+#   Retry 4: 8 min wait
+#   (capped at 30 min)
+#
+# Run with: rails generate outbox_relay:add_dlq_retry_backoff
+class AddRetryAfterToOutboxRelayDeadLetterEvents < ActiveRecord::Migration<%= migration_version %>
+  def change
+    add_column :outbox_relay_dead_letter_events, :retry_after, :timestamp
+
+    # Partial index for efficient retry scheduling queries
+    # Covers: WHERE resolution_status = 'retrying' AND retry_after > NOW()
+    add_index(
+      :outbox_relay_dead_letter_events,
+      [:resolution_status, :retry_after],
+      name: "idx_dlq_retry_schedule",
+      where: "resolution_status = 'retrying'"
+    )
+  end
+end

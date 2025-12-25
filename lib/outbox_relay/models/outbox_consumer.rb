@@ -12,7 +12,7 @@ module OutboxRelay
   #         topic: "my_topic",
   #         partition_key: partition_key,  # REQUIRED: Partition number (0-based) to process
   #         event_filter: ["created", "updated"],  # Optional: filter by event_name
-  #         dead_letter_config: { max_retries: 2 },  # Optional: DLQ configuration
+  #         dead_letter_config: { max_retries: 5 },  # Optional: DLQ configuration
   #         auto_offset_reset: :latest,  # Optional: :latest (default) or :earliest
   #       )
   #     end
@@ -21,6 +21,11 @@ module OutboxRelay
   #       # Process event
   #     end
   #   end
+  #
+  # Error Handling:
+  # - Errors go to DLQ with exponential backoff (60s base, up to 30 min)
+  # - After max_retries (default: 5), event marked as "unresolved"
+  # - For rate limiting, use a helper in your consumer to wait for tokens
   #
   # Partition Key:
   # - Required parameter that determines which partition this consumer processes
@@ -227,11 +232,21 @@ module OutboxRelay
   end
 
   def load_dlq_event_ids
-    # Only exclude "unresolved" events (gave up after max retries)
-    # Events with "retrying" status should be retried automatically
+    # Exclude events that should NOT be fetched:
+    # 1. "unresolved" - gave up after max retries, won't retry
+    # 2. "retrying" with retry_after > current time - still in backoff period
+    #
+    # Events with "retrying" AND (retry_after IS NULL OR retry_after <= current time)
+    # are ready for retry and should NOT be excluded
+    current_time = Time.current
+
     OutboxRelay::DeadLetterEvent
       .where(consumer_group: consumer_group)
-      .where(resolution_status: "unresolved")
+      .where(
+        "resolution_status = 'unresolved' OR " \
+        "(resolution_status = 'retrying' AND retry_after IS NOT NULL AND retry_after > ?)",
+        current_time
+      )
       .pluck(:outbox_relay_outbox_event_id)
   end
 
@@ -467,7 +482,7 @@ module OutboxRelay
   end
 
   def process_event(event)
-    # 3-Phase Event Processing with Retriable Exception Support
+    # 3-Phase Event Processing
     # ==========================================================
     # Separates lock acquisition, business logic, and offset update to avoid
     # holding DB transaction during potentially slow operations (HTTP calls).
@@ -476,15 +491,14 @@ module OutboxRelay
     # Phase 2: Process event OUTSIDE transaction (can be slow - HTTP calls OK)
     # Phase 3: Update offset (instant)
     #
-    # Retriable Exceptions (e.g., rate limiting):
-    # - Override retriable_exception?(e) to identify transient errors
-    # - OutboxRelay will sleep and retry instead of going to DLQ
-    # - After max_retriable_attempts, falls through to normal DLQ handling
-    #
     # Why session-level locks instead of transaction-level?
     # - Transaction-level locks require keeping transaction open during consume_message
     # - Slow HTTP calls cause idle_in_transaction_session_timeout in PostgreSQL/Aurora
     # - Session locks persist across transactions, released explicitly or on connection close
+    #
+    # Error handling:
+    # - Errors go to DLQ with exponential backoff (configurable)
+    # - For rate limiting, use with_rate_limit helper in your consumer
     #
     # Safety guarantees:
     # - Advisory lock prevents duplicate processing across workers
@@ -495,8 +509,6 @@ module OutboxRelay
 
     # Phase 1: Check offset and acquire session lock
     return false unless can_process_event?(event, lock_key)
-
-    retriable_attempt = 0
 
     begin
       # Phase 2: Process event OUTSIDE transaction
@@ -509,29 +521,6 @@ module OutboxRelay
       true # Successfully processed
 
     rescue => e
-      # Check if this is a retriable exception (e.g., rate limiting)
-      if retriable_exception?(e) && retriable_attempt < max_retriable_attempts
-        retriable_attempt += 1
-        delay = retry_delay_for(e)
-
-        @logger.info(
-          event_name: "retriable_exception_waiting",
-          event_id: event.event_id,
-          sequence: event.sequence,
-          consumer_group: consumer_group,
-          error_class: e.class.name,
-          error: e.message,
-          attempt: retriable_attempt,
-          max_attempts: max_retriable_attempts,
-          retry_delay: delay
-        )
-
-        # Sleep and retry - don't go to DLQ yet
-        sleep(delay)
-        retry
-      end
-
-      # Non-retriable exception OR exceeded max retriable attempts
       @logger.error(
         event_name: "consume_message_failed",
         event_id: event.event_id,
@@ -539,7 +528,6 @@ module OutboxRelay
         consumer_group: consumer_group,
         error: e.message,
         error_class: e.class.name,
-        retriable_attempts_exhausted: retriable_attempt >= max_retriable_attempts,
         backtrace: e.backtrace&.first(10)&.join("\n")
       )
 
@@ -553,7 +541,7 @@ module OutboxRelay
         phase: "consume_message"
       )
 
-      # Record failure in DLQ for retry/monitoring
+      # Record failure in DLQ for retry with backoff
       handle_event_failure(event, e)
 
       raise
@@ -571,65 +559,28 @@ module OutboxRelay
   # Protected hooks - designed to be overridden by subclasses
   protected
 
-  # Hook: Determine if an exception should trigger retry with backoff instead of DLQ
+  # Hook: Base delay for DLQ-level exponential backoff (in seconds)
   #
-  # Override in subclass to handle rate limiting or transient errors:
+  # Default: 60 seconds (1 minute)
+  # Override in subclass or configure via dead_letter_config[:retry_base_delay]
   #
-  #   def retriable_exception?(exception)
-  #     exception.is_a?(Prop::RateLimited) ||
-  #       exception.is_a?(Faraday::TimeoutError)
-  #   end
+  # Formula: base_delay * (2 ^ (retry_count - 1)) + jitter
+  #   Retry 1: 1 min (with 60s base)
+  #   Retry 2: 2 min
+  #   Retry 3: 4 min
+  #   Retry 4: 8 min
+  #   Retry 5: 16 min (capped at dlq_retry_max_delay)
   #
-  # When true, OutboxRelay will:
-  #   1. Sleep for retry_delay_for(exception) seconds
-  #   2. Retry the event (up to max_retriable_attempts times)
-  #   3. NOT count this as a DLQ failure
-  #
-  # @param exception [Exception] The caught exception
-  # @return [Boolean] true if should retry with backoff, false for normal DLQ handling
-  def retriable_exception?(exception)
-    false
+  # @return [Integer] Base delay in seconds (default: 60)
+  def dlq_retry_base_delay
+    dead_letter_config[:retry_base_delay] || 60
   end
 
-  # Hook: Determine how long to wait before retrying a retriable exception
+  # Hook: Maximum delay for DLQ-level backoff (in seconds)
   #
-  # Override in subclass for custom delay logic:
-  #
-  #   def retry_delay_for(exception)
-  #     case exception
-  #     when Prop::RateLimited
-  #       exception.retry_after  # Use Prop's calculated delay
-  #     when Faraday::TimeoutError
-  #       5  # Fixed 5 second delay for timeouts
-  #     else
-  #       60  # Default fallback
-  #     end
-  #   end
-  #
-  # @param exception [Exception] The retriable exception
-  # @return [Numeric] Seconds to sleep before retry (default: 60, max: 300)
-  def retry_delay_for(exception)
-    delay = if exception.respond_to?(:retry_after)
-      exception.retry_after
-    else
-      60
-    end
-
-    # Cap at 5 minutes to prevent excessive blocking
-    [delay.to_i, 300].min
-  end
-
-  # Hook: Maximum retry attempts for retriable exceptions before giving up
-  #
-  # Override in subclass if needed:
-  #
-  #   def max_retriable_attempts
-  #     10  # More attempts for rate-limited APIs
-  #   end
-  #
-  # @return [Integer] Max attempts (default: 5)
-  def max_retriable_attempts
-    5
+  # @return [Integer] Max delay in seconds (default: 1800 = 30 minutes)
+  def dlq_retry_max_delay
+    dead_letter_config[:retry_max_delay] || 1800
   end
 
   private
@@ -667,7 +618,7 @@ module OutboxRelay
   end
 
   def should_dead_letter?(event)
-    max_retries = dead_letter_config[:max_retries] || 2
+    max_retries = dead_letter_config[:max_retries] || 5
 
     # Check if this event already has a DLQ entry for this consumer group
     dlq_entry = OutboxRelay::DeadLetterEvent.find_by(
@@ -679,6 +630,35 @@ module OutboxRelay
 
     # Check if we've exceeded max retries
     dlq_entry.total_retries >= max_retries
+  end
+
+  # Calculate retry_after timestamp with exponential backoff and jitter
+  #
+  # Formula: NOW() + base_delay * (2 ^ (retry_count - 1)) * jitter
+  #
+  # Examples with 60s base (default):
+  #   retry_count=1: 60s * 2^0 = 60s (1 min)
+  #   retry_count=2: 60s * 2^1 = 120s (2 min)
+  #   retry_count=3: 60s * 2^2 = 240s (4 min)
+  #   retry_count=4: 60s * 2^3 = 480s (8 min)
+  #   retry_count=5: 60s * 2^4 = 960s (16 min)
+  #
+  # Jitter adds ±20% randomness to prevent thundering herd
+  def calculate_retry_after(retry_count)
+    base = dlq_retry_base_delay
+    max_delay = dlq_retry_max_delay
+
+    # Exponential backoff: base * 2^(n-1)
+    delay = base * (2 ** [retry_count - 1, 0].max)
+
+    # Cap at maximum
+    delay = [delay, max_delay].min
+
+    # Add jitter: ±20%
+    jitter_factor = 0.8 + (rand * 0.4)  # 0.8 to 1.2
+    delay = (delay * jitter_factor).to_i
+
+    Time.current + delay.seconds
   end
 
   def move_to_dead_letter_queue(event, error)
@@ -704,9 +684,17 @@ module OutboxRelay
       )
 
       # Increment retry count
+      new_retry_count = (dlq_entry.total_retries || 0) + 1
+      will_dead_letter = should_dead_letter?(event)
+      new_status = will_dead_letter ? "unresolved" : "retrying"
+
+      # Calculate retry_after with exponential backoff (only for "retrying" status)
+      # Events marked "unresolved" won't be retried, so no delay needed
+      new_retry_after = will_dead_letter ? nil : calculate_retry_after(new_retry_count)
+
       dlq_entry.assign_attributes(
         consumer_class: self.class.name,
-        total_retries: (dlq_entry.total_retries || 0) + 1,
+        total_retries: new_retry_count,
         error_message: error.message,
         error_backtrace: error.backtrace&.first(20)&.join("\n"),
         error_context: build_error_context(event, error),
@@ -714,7 +702,8 @@ module OutboxRelay
         original_event_name: event.event_name,
         original_payload: event.payload,
         original_headers: event.headers,
-        resolution_status: should_dead_letter?(event) ? "unresolved" : "retrying"
+        resolution_status: new_status,
+        retry_after: new_retry_after
       )
 
       begin
@@ -726,12 +715,18 @@ module OutboxRelay
           outbox_relay_outbox_event_id: event.id,
           consumer_group: consumer_group
         )
+        updated_retry_count = dlq_entry.total_retries + 1
+        will_dead_letter_now = should_dead_letter?(event)
+        updated_status = will_dead_letter_now ? "unresolved" : "retrying"
+        updated_retry_after = will_dead_letter_now ? nil : calculate_retry_after(updated_retry_count)
+
         dlq_entry.update!(
-          total_retries: dlq_entry.total_retries + 1,
+          total_retries: updated_retry_count,
           error_message: error.message,
           error_backtrace: error.backtrace&.first(20)&.join("\n"),
           error_context: build_error_context(event, error),
-          resolution_status: should_dead_letter?(event) ? "unresolved" : "retrying"
+          resolution_status: updated_status,
+          retry_after: updated_retry_after
         )
       end
     end
@@ -745,6 +740,7 @@ module OutboxRelay
       consumer_group: consumer_group,
       total_retries: dlq_entry.total_retries,
       resolution_status: dlq_entry.resolution_status,
+      retry_after: dlq_entry.retry_after&.iso8601,
       error: error.message,
     )
   end
