@@ -49,9 +49,10 @@ module OutboxRelay
     # @param auto_offset_reset [Symbol] Where to start for NEW consumer groups:
     #   - :latest (default) - Start from latest event (safe for production deploys)
     #   - :earliest - Start from beginning (reprocess all historical events)
-    VALID_AUTO_OFFSET_RESET_VALUES = [:latest, :earliest].freeze
+    VALID_AUTO_OFFSET_RESET_VALUES = %i[latest earliest].freeze
 
-    def initialize(consumer_group:, topic:, partition_key:, event_filter: nil, dead_letter_config: {}, auto_offset_reset: :latest)
+    def initialize(consumer_group:, topic:, partition_key:, event_filter: nil, dead_letter_config: {},
+                   auto_offset_reset: :latest)
       validate_auto_offset_reset!(auto_offset_reset)
 
       @consumer_group = consumer_group
@@ -70,794 +71,805 @@ module OutboxRelay
       return if VALID_AUTO_OFFSET_RESET_VALUES.include?(value)
 
       raise ArgumentError,
-        "auto_offset_reset must be :latest or :earliest, got: #{value.inspect}"
+            "auto_offset_reset must be :latest or :earliest, got: #{value.inspect}"
     end
 
     public
 
-  # Main consumption loop
-  def consume_batch(batch_size: 50)
-    events = fetch_batch(batch_size)
-    return 0 if events.empty?
+    # Main consumption loop
+    def consume_batch(batch_size: 50)
+      events = fetch_batch(batch_size)
+      return 0 if events.empty?
 
-    processed_count = 0
+      processed_count = 0
 
-    events.each do |event|
-      process_event(event)
-      processed_count += 1
-    rescue ActiveRecord::ConnectionNotEstablished, PG::Error => db_error
-      # Database connectivity issue - stop processing this batch
-      @logger.error(
-        event_name: "database_connectivity_error",
-        event_id: event.event_id,
-        error: db_error.message,
-        backtrace: db_error.backtrace&.first(10)&.join("\n"),
-      )
-      raise # Stop processing batch - let supervisor restart worker
-    rescue ActiveRecord::RecordInvalid, ActiveRecord::StatementInvalid => validation_error
-      # Invalid data or constraint violation - this is a bug
-      @logger.error(
-        event_name: "critical_event_validation_error",
-        event_id: event.event_id,
-        consumer_group: consumer_group,
-        error: validation_error.message,
-        backtrace: validation_error.backtrace&.first(10)&.join("\n"),
-      )
-
-      OutboxRelay::Instrumentation::Models.error(
-        validation_error,
-        model: "OutboxConsumer",
-        operation: "consume_event_validation",
-        event_id: event.event_id,
-        consumer_group: consumer_group,
-        severity: "critical"
-      )
-
-      # Add to DLQ immediately - don't retry validation errors
-      move_to_dead_letter_queue(event, validation_error)
-      # Don't increment processed_count for failures
-    rescue StandardError => e
-      # Application-level errors in consume_message
-      # Only catch errors from consumer logic, not infrastructure
-      if recoverable_error?(e)
-        handle_error(event, e)
-        # Don't increment processed_count for failures
-      else
-        # System-level error - stop processing
+      events.each do |event|
+        process_event(event)
+        processed_count += 1
+      rescue ActiveRecord::ConnectionNotEstablished, PG::Error => e
+        # Database connectivity issue - stop processing this batch
         @logger.error(
-          event_name: "critical_system_error_in_consumer",
+          event_name: 'database_connectivity_error',
           event_id: event.event_id,
-          error_class: e.class.name,
           error: e.message,
-          backtrace: e.backtrace&.first(10)&.join("\n"),
+          backtrace: e.backtrace&.first(10)&.join("\n")
+        )
+        raise # Stop processing batch - let supervisor restart worker
+      rescue ActiveRecord::RecordInvalid, ActiveRecord::StatementInvalid => e
+        # Invalid data or constraint violation - this is a bug
+        @logger.error(
+          event_name: 'critical_event_validation_error',
+          event_id: event.event_id,
+          consumer_group: consumer_group,
+          error: e.message,
+          backtrace: e.backtrace&.first(10)&.join("\n")
         )
 
         OutboxRelay::Instrumentation::Models.error(
           e,
-          model: "OutboxConsumer",
-          operation: "consume_event_system_error",
-          event_id: event.event_id
+          model: 'OutboxConsumer',
+          operation: 'consume_event_validation',
+          event_id: event.event_id,
+          consumer_group: consumer_group,
+          severity: 'critical'
         )
 
-        raise # Stop processing - let supervisor handle
+        # Add to DLQ immediately - don't retry validation errors
+        move_to_dead_letter_queue(event, e)
+        # Don't increment processed_count for failures
+      rescue StandardError => e
+        # Application-level errors in consume_message
+        # Only catch errors from consumer logic, not infrastructure
+        if recoverable_error?(e)
+          handle_error(event, e)
+          # Don't increment processed_count for failures
+        else
+          # System-level error - stop processing
+          @logger.error(
+            event_name: 'critical_system_error_in_consumer',
+            event_id: event.event_id,
+            error_class: e.class.name,
+            error: e.message,
+            backtrace: e.backtrace&.first(10)&.join("\n")
+          )
+
+          OutboxRelay::Instrumentation::Models.error(
+            e,
+            model: 'OutboxConsumer',
+            operation: 'consume_event_system_error',
+            event_id: event.event_id
+          )
+
+          raise # Stop processing - let supervisor handle
+        end
       end
+
+      processed_count
     end
 
-    processed_count
-  end
+    # Consume all pending events
+    def consume_all(batch_size: 100)
+      total_processed = 0
 
-  # Consume all pending events
-  def consume_all(batch_size: 100)
-    total_processed = 0
+      loop do
+        count = consume_batch(batch_size: batch_size)
+        total_processed += count
+        break if count.zero?
 
-    loop do
-      count = consume_batch(batch_size: batch_size)
-      total_processed += count
-      break if count.zero?
+        # Small delay to prevent tight loop
+        sleep(0.01) if count < batch_size
+      end
 
-      # Small delay to prevent tight loop
-      sleep(0.01) if count < batch_size
+      total_processed
     end
 
-    total_processed
-  end
-
-  # Check if there are pending events
-  def pending_events?
-    fetch_batch(1).any?
-  end
-
-  # Get consumer lag for THIS partition only (partition-aware)
-  # This is the accurate lag metric for partition-specific workers
-  #
-  # NOTE: ConsumerOffset#lag calculates GLOBAL lag across all partitions,
-  # which is incorrect for partition-specific consumers. Always use this method
-  # for per-worker lag calculation.
-  #
-  # Use case: Dynamic delay calculation, monitoring dashboards
-  def lag
-    # Get latest sequence for this specific partition
-    latest_sequence = OutboxRelay::OutboxEvent.where(topic: topic, partition_key: partition_key).maximum(:sequence) || 0
-    latest_sequence - current_offset.last_consumed_sequence
-  end
-
-  private
-
-  def fetch_batch(batch_size)
-    # Get current offset
-    offset = current_offset
-
-    # Get IDs of events in DLQ for this consumer group (with caching)
-    # These events should not be fetched again by this consumer group
-    dlq_event_ids = fetch_dlq_event_ids
-
-    # Fetch events after current offset, excluding DLQ events for this consumer group
-    query = OutboxRelay::OutboxEvent
-      .where(topic: topic)
-      .where("sequence > ?", offset.last_consumed_sequence)
-      .where.not(id: dlq_event_ids)
-      .not_expired
-      .by_sequence
-      .limit(batch_size)
-
-    # Apply partition filtering for parallel processing
-    # Each worker processes only its assigned partition
-    query = query.where(partition_key: partition_key)
-
-    # Apply event filtering (matches Karafka's MarkingEventTypeFilter)
-    query = query.where(event_name: event_filter) if event_filter.present?
-
-    # Add FOR UPDATE SKIP LOCKED for efficient multi-worker operation
-    # This allows workers to grab different events in parallel instead of competing
-    # NOTE: This changes query semantics - events locked by other transactions are skipped
-    query = query.lock("FOR UPDATE SKIP LOCKED")
-
-    query.to_a
-  end
-
-  # Cache DLQ event IDs to avoid subquery on every poll
-  # DLQ list changes infrequently but is queried constantly (every 10ms-1s)
-  def fetch_dlq_event_ids
-    @dlq_event_ids_cache ||= begin
-      @dlq_cache_expires_at = Time.current + 5.seconds
-      load_dlq_event_ids
+    # Check if there are pending events
+    def pending_events?
+      fetch_batch(1).any?
     end
 
-    if Time.current > @dlq_cache_expires_at
-      @dlq_event_ids_cache = load_dlq_event_ids
-      @dlq_cache_expires_at = Time.current + 5.seconds
-    end
-
-    @dlq_event_ids_cache
-  end
-
-  def load_dlq_event_ids
-    # Exclude events that should NOT be fetched:
-    # 1. "unresolved" - gave up after max retries, won't retry
-    # 2. "retrying" with retry_after > current time - still in backoff period
+    # Get consumer lag for THIS partition only (partition-aware)
+    # This is the accurate lag metric for partition-specific workers
     #
-    # Events with "retrying" AND (retry_after IS NULL OR retry_after <= current time)
-    # are ready for retry and should NOT be excluded
-    current_time = Time.current
-
-    OutboxRelay::DeadLetterEvent
-      .where(consumer_group: consumer_group)
-      .where(
-        "resolution_status = 'unresolved' OR " \
-        "(resolution_status = 'retrying' AND retry_after IS NOT NULL AND retry_after > ?)",
-        current_time
-      )
-      .pluck(:outbox_relay_outbox_event_id)
-  end
-
-  # Advisory lock methods for duplicate prevention
-  # ============================================================================
-  # PostgreSQL advisory locks replace optimistic locking for concurrent safety.
-  #
-  # ## Why Advisory Locks?
-  #
-  # Traditional approaches don't work well for high-throughput event processing:
-  #
-  # 1. **Optimistic Locking** (version column):
-  #    - Creates UPDATE contention on event records
-  #    - Events are immutable facts - shouldn't be modified
-  #    - Doesn't scale with multiple workers
-  #
-  # 2. **Database Transactions + SELECT FOR UPDATE**:
-  #    - Long-running transactions block other workers
-  #    - Lock escalation under high load
-  #
-  # 3. **Application-level Locks** (Redis, etc.):
-  #    - Adds external dependency
-  #    - Network calls for every event
-  #
-  # ## Advisory Lock Algorithm
-  #
-  # PostgreSQL advisory locks are:
-  #   - Lightweight (no row locking)
-  #   - Automatically released on connection close
-  #   - Never escalate to table locks
-  #   - Session or transaction-scoped
-  #
-  # We use **session-scoped** locks (pg_try_advisory_lock):
-  #   - Lock persists across transactions until explicitly released
-  #   - Must call pg_advisory_unlock() to release (or connection closes)
-  #   - Allows consume_message() to run OUTSIDE transaction
-  #   - Prevents idle_in_transaction_session_timeout for slow HTTP calls
-  #
-  # ## Lock Key Design
-  #
-  # Lock key must be unique per (event, consumer_group) to allow:
-  #   - Multiple consumer groups processing same event (different lock keys)
-  #   - Same consumer group NOT processing same event twice (same lock key)
-  #
-  # We use a 64-bit integer lock key:
-  #   - High 32 bits: event sequence number (supports 4 billion events)
-  #   - Low 32 bits: CRC32 hash of consumer_group name
-  #
-  # Example:
-  #   Event sequence: 12345, Consumer group: "notifications"
-  #   Lock key: (12345 << 32) | CRC32("notifications")
-  #
-  # ## Concurrency Example
-  #
-  # Given event 123 and two workers (Worker A, Worker B) in same consumer group:
-  #
-  #   Time | Worker A                    | Worker B
-  #   -----|----------------------------|---------------------------
-  #   T1   | FETCH event 123            | FETCH event 123
-  #   T2   | TRY_LOCK(123) → SUCCESS    | TRY_LOCK(123) → FAIL
-  #   T3   | Process event (HTTP call)  | Skip event (already locked)
-  #   T4   | Update offset              | Fetch next event
-  #   T5   | UNLOCK(123)                |
-  #
-  # Result: Event processed exactly once by Worker A.
-  #
-  # ## Edge Cases
-  #
-  # 1. **Worker crashes mid-processing**: Connection closes → lock released → event retried
-  # 2. **Database connection lost**: All locks auto-released
-  # 3. **Hash collision** (extremely rare): CRC32 has 1 in 4 billion collision rate
-  #    Impact: Different consumer groups might temporarily block each other
-  # 4. **Sequence wraparound**: After 4 billion events, sequences repeat
-  #    Impact: None - old events already processed and cleaned up
-  # 5. **Lock not released due to exception**: ensure block guarantees release
-  #
-  def advisory_lock_key(event)
-    # Combine event sequence and consumer group into 64-bit lock key
-    # High 32 bits: event sequence (max 4 billion events)
-    # Low 32 bits: CRC32 hash of consumer group name
-    event_sequence = event.sequence & 0xFFFFFFFF
-    group_hash = Zlib.crc32(consumer_group) & 0xFFFFFFFF
-    (event_sequence << 32) | group_hash
-  end
-
-  def acquire_advisory_lock(lock_key)
-    # Try to acquire SESSION-level advisory lock (pg_try_advisory_lock)
-    # Returns true if lock acquired, false if already locked by another session
+    # NOTE: ConsumerOffset#lag calculates GLOBAL lag across all partitions,
+    # which is incorrect for partition-specific consumers. Always use this method
+    # for per-worker lag calculation.
     #
-    # Lock lifecycle:
-    # - Persists across transactions until explicitly released or connection closes
-    # - Must call release_advisory_lock() to release
-    # - Auto-released on connection close (worker crash = lock released)
-    #
-    # Why session-level instead of transaction-level?
-    # - Allows consume_message() to run OUTSIDE transaction (HTTP calls safe)
-    # - Prevents idle_in_transaction_session_timeout in PostgreSQL/Aurora
-    # - Lock still prevents duplicate processing across workers
-
-    # Validate lock_key is a valid integer
-    unless lock_key.is_a?(Integer)
-      raise ArgumentError, "lock_key must be an integer, got #{lock_key.class}"
+    # Use case: Dynamic delay calculation, monitoring dashboards
+    def lag
+      # Get latest sequence for this specific partition
+      latest_sequence = OutboxRelay::OutboxEvent.where(topic: topic,
+                                                       partition_key: partition_key).maximum(:sequence) || 0
+      latest_sequence - current_offset.last_consumed_sequence
     end
 
-    # Use parameterized query to prevent SQL injection
-    result = ActiveRecord::Base.connection.execute(
-      ActiveRecord::Base.sanitize_sql_array([
-        "SELECT pg_try_advisory_lock(?)",
-        lock_key
-      ])
-    ).first
+    private
 
-    if result.nil?
+    def fetch_batch(batch_size)
+      # Get current offset
+      offset = current_offset
+
+      # Get IDs of events in DLQ for this consumer group (with caching)
+      # These events should not be fetched again by this consumer group
+      dlq_event_ids = fetch_dlq_event_ids
+
+      # Fetch events after current offset, excluding DLQ events for this consumer group
+      query = OutboxRelay::OutboxEvent
+              .where(topic: topic)
+              .where('sequence > ?', offset.last_consumed_sequence)
+              .where.not(id: dlq_event_ids)
+              .not_expired
+              .by_sequence
+              .limit(batch_size)
+
+      # Apply partition filtering for parallel processing
+      # Each worker processes only its assigned partition
+      query = query.where(partition_key: partition_key)
+
+      # Apply event filtering (matches Karafka's MarkingEventTypeFilter)
+      query = query.where(event_name: event_filter) if event_filter.present?
+
+      # Add FOR UPDATE SKIP LOCKED for efficient multi-worker operation
+      # This allows workers to grab different events in parallel instead of competing
+      # NOTE: This changes query semantics - events locked by other transactions are skipped
+      query = query.lock('FOR UPDATE SKIP LOCKED')
+
+      query.to_a
+    end
+
+    # Cache DLQ event IDs to avoid subquery on every poll
+    # DLQ list changes infrequently but is queried constantly (every 10ms-1s)
+    def fetch_dlq_event_ids
+      @dlq_event_ids_cache ||= begin
+        @dlq_cache_expires_at = Time.current + 5.seconds
+        load_dlq_event_ids
+      end
+
+      if Time.current > @dlq_cache_expires_at
+        @dlq_event_ids_cache = load_dlq_event_ids
+        @dlq_cache_expires_at = Time.current + 5.seconds
+      end
+
+      @dlq_event_ids_cache
+    end
+
+    def load_dlq_event_ids
+      # Exclude events that should NOT be fetched:
+      # 1. "unresolved" - gave up after max retries, won't retry
+      # 2. "retrying" with retry_after > current time - still in backoff period
+      #
+      # Events with "retrying" AND (retry_after IS NULL OR retry_after <= current time)
+      # are ready for retry and should NOT be excluded
+      current_time = Time.current
+
+      OutboxRelay::DeadLetterEvent
+        .where(consumer_group: consumer_group)
+        .where(
+          "resolution_status = 'unresolved' OR " \
+          "(resolution_status = 'retrying' AND retry_after IS NOT NULL AND retry_after > ?)",
+          current_time
+        )
+        .pluck(:outbox_relay_outbox_event_id)
+    end
+
+    # Advisory lock methods for duplicate prevention
+    # ============================================================================
+    # PostgreSQL advisory locks replace optimistic locking for concurrent safety.
+    #
+    # ## Why Advisory Locks?
+    #
+    # Traditional approaches don't work well for high-throughput event processing:
+    #
+    # 1. **Optimistic Locking** (version column):
+    #    - Creates UPDATE contention on event records
+    #    - Events are immutable facts - shouldn't be modified
+    #    - Doesn't scale with multiple workers
+    #
+    # 2. **Database Transactions + SELECT FOR UPDATE**:
+    #    - Long-running transactions block other workers
+    #    - Lock escalation under high load
+    #
+    # 3. **Application-level Locks** (Redis, etc.):
+    #    - Adds external dependency
+    #    - Network calls for every event
+    #
+    # ## Advisory Lock Algorithm
+    #
+    # PostgreSQL advisory locks are:
+    #   - Lightweight (no row locking)
+    #   - Automatically released on connection close
+    #   - Never escalate to table locks
+    #   - Session or transaction-scoped
+    #
+    # We use **session-scoped** locks (pg_try_advisory_lock):
+    #   - Lock persists across transactions until explicitly released
+    #   - Must call pg_advisory_unlock() to release (or connection closes)
+    #   - Allows consume_message() to run OUTSIDE transaction
+    #   - Prevents idle_in_transaction_session_timeout for slow HTTP calls
+    #
+    # ## Lock Key Design
+    #
+    # Lock key must be unique per (event, consumer_group) to allow:
+    #   - Multiple consumer groups processing same event (different lock keys)
+    #   - Same consumer group NOT processing same event twice (same lock key)
+    #
+    # We use a 64-bit integer lock key:
+    #   - High 32 bits: event sequence number (supports 4 billion events)
+    #   - Low 32 bits: CRC32 hash of consumer_group name
+    #
+    # Example:
+    #   Event sequence: 12345, Consumer group: "notifications"
+    #   Lock key: (12345 << 32) | CRC32("notifications")
+    #
+    # ## Concurrency Example
+    #
+    # Given event 123 and two workers (Worker A, Worker B) in same consumer group:
+    #
+    #   Time | Worker A                    | Worker B
+    #   -----|----------------------------|---------------------------
+    #   T1   | FETCH event 123            | FETCH event 123
+    #   T2   | TRY_LOCK(123) → SUCCESS    | TRY_LOCK(123) → FAIL
+    #   T3   | Process event (HTTP call)  | Skip event (already locked)
+    #   T4   | Update offset              | Fetch next event
+    #   T5   | UNLOCK(123)                |
+    #
+    # Result: Event processed exactly once by Worker A.
+    #
+    # ## Edge Cases
+    #
+    # 1. **Worker crashes mid-processing**: Connection closes → lock released → event retried
+    # 2. **Database connection lost**: All locks auto-released
+    # 3. **Hash collision** (extremely rare): CRC32 has 1 in 4 billion collision rate
+    #    Impact: Different consumer groups might temporarily block each other
+    # 4. **Sequence wraparound**: After 4 billion events, sequences repeat
+    #    Impact: None - old events already processed and cleaned up
+    # 5. **Lock not released due to exception**: ensure block guarantees release
+    #
+    def advisory_lock_key(event)
+      # Combine event sequence and consumer group into 64-bit lock key
+      # High 32 bits: event sequence (max 4 billion events)
+      # Low 32 bits: CRC32 hash of consumer group name
+      event_sequence = event.sequence & 0xFFFFFFFF
+      group_hash = Zlib.crc32(consumer_group) & 0xFFFFFFFF
+      (event_sequence << 32) | group_hash
+    end
+
+    def acquire_advisory_lock(lock_key)
+      # Try to acquire SESSION-level advisory lock (pg_try_advisory_lock)
+      # Returns true if lock acquired, false if already locked by another session
+      #
+      # Lock lifecycle:
+      # - Persists across transactions until explicitly released or connection closes
+      # - Must call release_advisory_lock() to release
+      # - Auto-released on connection close (worker crash = lock released)
+      #
+      # Why session-level instead of transaction-level?
+      # - Allows consume_message() to run OUTSIDE transaction (HTTP calls safe)
+      # - Prevents idle_in_transaction_session_timeout in PostgreSQL/Aurora
+      # - Lock still prevents duplicate processing across workers
+
+      # Validate lock_key is a valid integer
+      raise ArgumentError, "lock_key must be an integer, got #{lock_key.class}" unless lock_key.is_a?(Integer)
+
+      # Use parameterized query to prevent SQL injection
+      result = ActiveRecord::Base.connection.execute(
+        ActiveRecord::Base.sanitize_sql_array([
+                                                'SELECT pg_try_advisory_lock(?)',
+                                                lock_key
+                                              ])
+      ).first
+
+      if result.nil?
+        @logger.error(
+          event_name: 'advisory_lock_query_returned_nil',
+          lock_key: lock_key
+        )
+        return false  # Fail safe - don't process event
+      end
+
+      lock_acquired = result['pg_try_advisory_lock']
+
+      if lock_acquired.nil?
+        @logger.error(
+          event_name: 'advisory_lock_result_unexpected_format',
+          lock_key: lock_key,
+          result: result.inspect
+        )
+        return false  # Fail safe
+      end
+
+      lock_acquired == true
+    rescue StandardError => e
       @logger.error(
-        event_name: "advisory_lock_query_returned_nil",
-        lock_key: lock_key
-      )
-      return false  # Fail safe - don't process event
-    end
-
-    lock_acquired = result["pg_try_advisory_lock"]
-
-    if lock_acquired.nil?
-      @logger.error(
-        event_name: "advisory_lock_result_unexpected_format",
+        event_name: 'advisory_lock_failed',
         lock_key: lock_key,
-        result: result.inspect
-      )
-      return false  # Fail safe
-    end
-
-    lock_acquired == true
-
-  rescue => e
-    @logger.error(
-      event_name: "advisory_lock_failed",
-      lock_key: lock_key,
-      error: e.message,
-      backtrace: e.backtrace&.first(10)&.join("\n")
-    )
-
-    OutboxRelay::Instrumentation::Models.error(
-      e,
-      model: "OutboxConsumer",
-      operation: "advisory_lock",
-      lock_key: lock_key,
-      consumer_group: consumer_group
-    )
-
-    # Fail safe - if we can't acquire lock, don't process
-    false
-  end
-
-  def release_advisory_lock(lock_key)
-    # Release session-level advisory lock
-    # Should be called in ensure block to guarantee release
-    return unless lock_key
-
-    ActiveRecord::Base.connection.execute(
-      ActiveRecord::Base.sanitize_sql_array([
-        "SELECT pg_advisory_unlock(?)",
-        lock_key
-      ])
-    )
-  rescue => e
-    # Log but don't raise - lock will be released when connection closes anyway
-    @logger.warn(
-      event_name: "advisory_lock_release_failed",
-      lock_key: lock_key,
-      error: e.message
-    )
-  end
-
-  # Phase 1: Check if event can be processed and acquire session lock
-  # Returns false if:
-  #   - Event already processed (offset check)
-  #   - Lock held by another worker
-  def can_process_event?(event, lock_key)
-    # Check if event was already processed (offset comparison)
-    # This is a defensive check - shouldn't happen often due to fetch_batch filtering
-    if event.sequence <= current_offset.last_consumed_sequence
-      @logger.debug(
-        event_name: "event_already_processed",
-        event_id: event.event_id,
-        sequence: event.sequence,
-        current_offset: current_offset.last_consumed_sequence,
-        consumer_group: consumer_group
-      )
-      return false
-    end
-
-    # Try to acquire session-level lock
-    unless acquire_advisory_lock(lock_key)
-      # Lock held by another worker - skip silently (this is normal/expected)
-      return false
-    end
-
-    true
-  end
-
-  # Phase 3: Update offset after successful processing
-  # Includes defensive staleness check
-  def commit_event_processed(event)
-    # Defensive check: verify event wasn't processed while we were working
-    # This shouldn't happen due to advisory lock, but provides extra safety
-    current_seq = current_offset.reload.last_consumed_sequence
-    if event.sequence <= current_seq
-      @logger.warn(
-        event_name: "offset_already_advanced",
-        event_id: event.event_id,
-        sequence: event.sequence,
-        current_offset: current_seq,
-        consumer_group: consumer_group,
-        message: "Offset already advanced past this event - skipping update"
-      )
-      return false
-    end
-
-    offset_updated = update_offset(event)
-
-    unless offset_updated
-      @logger.debug(
-        event_name: "stale_offset_skipped",
-        event_id: event.event_id,
-        sequence: event.sequence,
-        current_offset: current_offset.last_consumed_sequence,
-        consumer_group: consumer_group,
-        message: "Event processed successfully but offset not updated (out-of-order completion)"
-      )
-    end
-
-    offset_updated
-  end
-
-  def process_event(event)
-    # 3-Phase Event Processing
-    # ==========================================================
-    # Separates lock acquisition, business logic, and offset update to avoid
-    # holding DB transaction during potentially slow operations (HTTP calls).
-    #
-    # Phase 1: Acquire session lock (instant)
-    # Phase 2: Process event OUTSIDE transaction (can be slow - HTTP calls OK)
-    # Phase 3: Update offset (instant)
-    #
-    # Why session-level locks instead of transaction-level?
-    # - Transaction-level locks require keeping transaction open during consume_message
-    # - Slow HTTP calls cause idle_in_transaction_session_timeout in PostgreSQL/Aurora
-    # - Session locks persist across transactions, released explicitly or on connection close
-    #
-    # Error handling:
-    # - Errors go to DLQ with exponential backoff (configurable)
-    # - For rate limiting, use with_rate_limit helper in your consumer
-    #
-    # Safety guarantees:
-    # - Advisory lock prevents duplicate processing across workers
-    # - Worker crash → connection closes → lock auto-released → event retried
-    # - At-least-once delivery guaranteed (consumers must be idempotent)
-
-    lock_key = advisory_lock_key(event)
-
-    # Phase 1: Check offset and acquire session lock
-    return false unless can_process_event?(event, lock_key)
-
-    begin
-      # Phase 2: Process event OUTSIDE transaction
-      # HTTP calls, API calls - can take seconds without holding DB transaction
-      consume_message(event)
-
-      # Phase 3: Update offset
-      commit_event_processed(event)
-
-      true # Successfully processed
-
-    rescue => e
-      @logger.error(
-        event_name: "consume_message_failed",
-        event_id: event.event_id,
-        sequence: event.sequence,
-        consumer_group: consumer_group,
         error: e.message,
-        error_class: e.class.name,
         backtrace: e.backtrace&.first(10)&.join("\n")
       )
 
       OutboxRelay::Instrumentation::Models.error(
         e,
-        model: "OutboxConsumer",
-        operation: "consume_message",
-        event_id: event.event_id,
-        sequence: event.sequence,
-        consumer_group: consumer_group,
-        phase: "consume_message"
+        model: 'OutboxConsumer',
+        operation: 'advisory_lock',
+        lock_key: lock_key,
+        consumer_group: consumer_group
       )
 
-      # Record failure in DLQ for retry with backoff
-      handle_event_failure(event, e)
-
-      raise
-    ensure
-      # ALWAYS release lock - even on success, failure, or unexpected exception
-      release_advisory_lock(lock_key)
+      # Fail safe - if we can't acquire lock, don't process
+      false
     end
-  end
 
-  def consume_message(_event)
-    # To be implemented by subclasses
-    raise NotImplementedError, "Subclasses must implement consume_message"
-  end
+    def release_advisory_lock(lock_key)
+      # Release session-level advisory lock
+      # Should be called in ensure block to guarantee release
+      return unless lock_key
 
-  # Protected hooks - designed to be overridden by subclasses
-  protected
-
-  # Hook: Base delay for DLQ-level exponential backoff (in seconds)
-  #
-  # Default: 60 seconds (1 minute)
-  # Override in subclass or configure via dead_letter_config[:retry_base_delay]
-  #
-  # Formula: base_delay * (2 ^ (retry_count - 1)) + jitter
-  #   Retry 1: 1 min (with 60s base)
-  #   Retry 2: 2 min
-  #   Retry 3: 4 min
-  #   Retry 4: 8 min
-  #   Retry 5: 16 min (capped at dlq_retry_max_delay)
-  #
-  # @return [Integer] Base delay in seconds (default: 60)
-  def dlq_retry_base_delay
-    dead_letter_config[:retry_base_delay] || 60
-  end
-
-  # Hook: Maximum delay for DLQ-level backoff (in seconds)
-  #
-  # @return [Integer] Max delay in seconds (default: 1800 = 30 minutes)
-  def dlq_retry_max_delay
-    dead_letter_config[:retry_max_delay] || 1800
-  end
-
-  private
-
-  def current_offset
-    # Each partition has its own offset tracking
-    # This allows parallel processing without conflicts
-    @current_offset ||= OutboxRelay::ConsumerOffset.find_or_initialize_for(
-      consumer_group: consumer_group_with_partition,
-      topic: topic,
-      auto_offset_reset: auto_offset_reset,
-    ).tap do |offset|
-      offset.consumer_instance_id = @consumer_instance_id
-      # Set heartbeat on new records to indicate this consumer is active
-      offset.heartbeat_at = Time.current if offset.new_record?
-      # Always save to persist consumer_instance_id before locking
-      offset.save!
+      ActiveRecord::Base.connection.execute(
+        ActiveRecord::Base.sanitize_sql_array([
+                                                'SELECT pg_advisory_unlock(?)',
+                                                lock_key
+                                              ])
+      )
+    rescue StandardError => e
+      # Log but don't raise - lock will be released when connection closes anyway
+      @logger.warn(
+        event_name: 'advisory_lock_release_failed',
+        lock_key: lock_key,
+        error: e.message
+      )
     end
-  end
 
-  def consumer_group_with_partition
-    "#{consumer_group}_p#{partition_key}"
-  end
+    # Phase 1: Check if event can be processed and acquire session lock
+    # Returns false if:
+    #   - Event already processed (offset check)
+    #   - Lock held by another worker
+    def can_process_event?(event, lock_key)
+      # Check if event was already processed (offset comparison)
+      # This is a defensive check - shouldn't happen often due to fetch_batch filtering
+      if event.sequence <= current_offset.last_consumed_sequence
+        @logger.debug(
+          event_name: 'event_already_processed',
+          event_id: event.event_id,
+          sequence: event.sequence,
+          current_offset: current_offset.last_consumed_sequence,
+          consumer_group: consumer_group
+        )
+        return false
+      end
 
-  def build_consumer_instance_id
-    # Include partition in instance ID for better tracking
-    "#{consumer_group}-#{Socket.gethostname}-#{::Process.pid}-p#{partition_key}"
-  end
+      # Try to acquire session-level lock
+      unless acquire_advisory_lock(lock_key)
+        # Lock held by another worker - skip silently (this is normal/expected)
+        return false
+      end
 
-  def update_offset(event)
-    current_offset.update_offset!(
-      sequence: event.sequence,
-      event_id: event.event_id,
-    )
-  end
+      true
+    end
 
-  def should_dead_letter?(event)
-    max_retries = dead_letter_config[:max_retries] || 5
+    # Phase 3: Update offset after successful processing
+    # Includes defensive staleness check
+    def commit_event_processed(event)
+      # Defensive check: verify event wasn't processed while we were working
+      # This shouldn't happen due to advisory lock, but provides extra safety
+      current_seq = current_offset.reload.last_consumed_sequence
+      if event.sequence <= current_seq
+        @logger.warn(
+          event_name: 'offset_already_advanced',
+          event_id: event.event_id,
+          sequence: event.sequence,
+          current_offset: current_seq,
+          consumer_group: consumer_group,
+          message: 'Offset already advanced past this event - skipping update'
+        )
+        return false
+      end
 
-    # Check if this event already has a DLQ entry for this consumer group
-    dlq_entry = OutboxRelay::DeadLetterEvent.find_by(
-      outbox_relay_outbox_event_id: event.id,
-      consumer_group: consumer_group
-    )
+      offset_updated = update_offset(event)
 
-    return false unless dlq_entry
+      unless offset_updated
+        @logger.debug(
+          event_name: 'stale_offset_skipped',
+          event_id: event.event_id,
+          sequence: event.sequence,
+          current_offset: current_offset.last_consumed_sequence,
+          consumer_group: consumer_group,
+          message: 'Event processed successfully but offset not updated (out-of-order completion)'
+        )
+      end
 
-    # Check if we've exceeded max retries
-    dlq_entry.total_retries >= max_retries
-  end
+      offset_updated
+    end
 
-  # Calculate retry_after timestamp with exponential backoff and jitter
-  #
-  # Formula: NOW() + base_delay * (2 ^ (retry_count - 1)) * jitter
-  #
-  # Examples with 60s base (default):
-  #   retry_count=1: 60s * 2^0 = 60s (1 min)
-  #   retry_count=2: 60s * 2^1 = 120s (2 min)
-  #   retry_count=3: 60s * 2^2 = 240s (4 min)
-  #   retry_count=4: 60s * 2^3 = 480s (8 min)
-  #   retry_count=5: 60s * 2^4 = 960s (16 min)
-  #
-  # Jitter adds ±20% randomness to prevent thundering herd
-  def calculate_retry_after(retry_count)
-    base = dlq_retry_base_delay
-    max_delay = dlq_retry_max_delay
+    def process_event(event)
+      # 3-Phase Event Processing
+      # ==========================================================
+      # Separates lock acquisition, business logic, and offset update to avoid
+      # holding DB transaction during potentially slow operations (HTTP calls).
+      #
+      # Phase 1: Acquire session lock (instant)
+      # Phase 2: Process event OUTSIDE transaction (can be slow - HTTP calls OK)
+      # Phase 3: Update offset (instant)
+      #
+      # Why session-level locks instead of transaction-level?
+      # - Transaction-level locks require keeping transaction open during consume_message
+      # - Slow HTTP calls cause idle_in_transaction_session_timeout in PostgreSQL/Aurora
+      # - Session locks persist across transactions, released explicitly or on connection close
+      #
+      # Error handling:
+      # - Errors go to DLQ with exponential backoff (configurable)
+      # - For rate limiting, use with_rate_limit helper in your consumer
+      #
+      # Safety guarantees:
+      # - Advisory lock prevents duplicate processing across workers
+      # - Worker crash → connection closes → lock auto-released → event retried
+      # - At-least-once delivery guaranteed (consumers must be idempotent)
 
-    # Exponential backoff: base * 2^(n-1)
-    delay = base * (2 ** [retry_count - 1, 0].max)
+      lock_key = advisory_lock_key(event)
 
-    # Cap at maximum
-    delay = [delay, max_delay].min
+      # Phase 1: Check offset and acquire session lock
+      return false unless can_process_event?(event, lock_key)
 
-    # Add jitter: ±20%
-    jitter_factor = 0.8 + (rand * 0.4)  # 0.8 to 1.2
-    delay = (delay * jitter_factor).to_i
+      begin
+        # Phase 2: Process event OUTSIDE transaction
+        # HTTP calls, API calls - can take seconds without holding DB transaction
+        consume_message(event)
 
-    Time.current + delay.seconds
-  end
+        # Phase 3: Update offset
+        commit_event_processed(event)
 
-  def move_to_dead_letter_queue(event, error)
-    # CRITICAL: Use requires_new to create independent transaction
-    # This ensures DLQ entry is persisted even when the outer transaction rolls back
+        true # Successfully processed
+      rescue StandardError => e
+        @logger.error(
+          event_name: 'consume_message_failed',
+          event_id: event.event_id,
+          sequence: event.sequence,
+          consumer_group: consumer_group,
+          error: e.message,
+          error_class: e.class.name,
+          backtrace: e.backtrace&.first(10)&.join("\n")
+        )
+
+        OutboxRelay::Instrumentation::Models.error(
+          e,
+          model: 'OutboxConsumer',
+          operation: 'consume_message',
+          event_id: event.event_id,
+          sequence: event.sequence,
+          consumer_group: consumer_group,
+          phase: 'consume_message'
+        )
+
+        # Record failure in DLQ for retry with backoff
+        handle_event_failure(event, e)
+
+        raise
+      ensure
+        # ALWAYS release lock - even on success, failure, or unexpected exception
+        release_advisory_lock(lock_key)
+      end
+    end
+
+    def consume_message(_event)
+      # To be implemented by subclasses
+      raise NotImplementedError, 'Subclasses must implement consume_message'
+    end
+
+    # Protected hooks - designed to be overridden by subclasses
+    protected
+
+    # Hook: Base delay for DLQ-level exponential backoff (in seconds)
     #
-    # Flow:
-    #   1. Outer transaction: process_event starts
-    #   2. consume_message fails with error
-    #   3. handle_event_failure -> move_to_dead_letter_queue
-    #   4. NEW independent transaction: DLQ entry saved and COMMITTED
-    #   5. Outer transaction: raise causes ROLLBACK
-    #   6. DLQ entry survives because it was committed in step 4
+    # Default: 60 seconds (1 minute)
+    # Override in subclass or configure via dead_letter_config[:retry_base_delay]
     #
-    # Without requires_new, the DLQ save would be rolled back with the outer transaction
-    dlq_entry = nil
+    # Formula: base_delay * (2 ^ (retry_count - 1)) + jitter
+    #   Retry 1: 1 min (with 60s base)
+    #   Retry 2: 2 min
+    #   Retry 3: 4 min
+    #   Retry 4: 8 min
+    #   Retry 5: 16 min (capped at dlq_retry_max_delay)
+    #
+    # @return [Integer] Base delay in seconds (default: 60)
+    def dlq_retry_base_delay
+      dead_letter_config[:retry_base_delay] || 60
+    end
 
-    ActiveRecord::Base.transaction(requires_new: true) do
-      # Find or create DLQ entry for this consumer group
-      dlq_entry = OutboxRelay::DeadLetterEvent.find_or_initialize_by(
+    # Hook: Maximum delay for DLQ-level backoff (in seconds)
+    #
+    # @return [Integer] Max delay in seconds (default: 1800 = 30 minutes)
+    def dlq_retry_max_delay
+      dead_letter_config[:retry_max_delay] || 1800
+    end
+
+    private
+
+    def current_offset
+      # Each partition has its own offset tracking
+      # This allows parallel processing without conflicts
+      @current_offset ||= OutboxRelay::ConsumerOffset.find_or_initialize_for(
+        consumer_group: consumer_group_with_partition,
+        topic: topic,
+        auto_offset_reset: auto_offset_reset
+      ).tap do |offset|
+        offset.consumer_instance_id = @consumer_instance_id
+        # Set heartbeat on new records to indicate this consumer is active
+        offset.heartbeat_at = Time.current if offset.new_record?
+        # Always save to persist consumer_instance_id before locking
+        offset.save!
+      end
+    end
+
+    def consumer_group_with_partition
+      "#{consumer_group}_p#{partition_key}"
+    end
+
+    def build_consumer_instance_id
+      # Include partition in instance ID for better tracking
+      "#{consumer_group}-#{Socket.gethostname}-#{::Process.pid}-p#{partition_key}"
+    end
+
+    def update_offset(event)
+      current_offset.update_offset!(
+        sequence: event.sequence,
+        event_id: event.event_id
+      )
+    end
+
+    def should_dead_letter?(event)
+      max_retries = dead_letter_config[:max_retries] || 5
+
+      # Check if this event already has a DLQ entry for this consumer group
+      dlq_entry = OutboxRelay::DeadLetterEvent.find_by(
         outbox_relay_outbox_event_id: event.id,
         consumer_group: consumer_group
       )
 
-      # Increment retry count
-      new_retry_count = (dlq_entry.total_retries || 0) + 1
-      will_dead_letter = should_dead_letter?(event)
-      new_status = will_dead_letter ? "unresolved" : "retrying"
+      return false unless dlq_entry
 
-      # Calculate retry_after with exponential backoff (only for "retrying" status)
-      # Events marked "unresolved" won't be retried, so no delay needed
-      new_retry_after = will_dead_letter ? nil : calculate_retry_after(new_retry_count)
+      # Check if we've exceeded max retries
+      dlq_entry.total_retries >= max_retries
+    end
 
-      dlq_entry.assign_attributes(
-        consumer_class: self.class.name,
-        total_retries: new_retry_count,
-        error_message: error.message,
-        error_backtrace: error.backtrace&.first(20)&.join("\n"),
-        error_context: build_error_context(event, error),
-        original_topic: event.topic,
-        original_event_name: event.event_name,
-        original_payload: event.payload,
-        original_headers: event.headers,
-        resolution_status: new_status,
-        retry_after: new_retry_after
-      )
+    # Calculate retry_after timestamp with exponential backoff and jitter
+    #
+    # Formula: NOW() + base_delay * (2 ^ (retry_count - 1)) * jitter
+    #
+    # Examples with 60s base (default):
+    #   retry_count=1: 60s * 2^0 = 60s (1 min)
+    #   retry_count=2: 60s * 2^1 = 120s (2 min)
+    #   retry_count=3: 60s * 2^2 = 240s (4 min)
+    #   retry_count=4: 60s * 2^3 = 480s (8 min)
+    #   retry_count=5: 60s * 2^4 = 960s (16 min)
+    #
+    # Jitter adds ±20% randomness to prevent thundering herd
+    def calculate_retry_after(retry_count)
+      base = dlq_retry_base_delay
+      max_delay = dlq_retry_max_delay
 
-      begin
-        dlq_entry.save!
-      rescue ActiveRecord::RecordNotUnique
-        # Race condition - another worker created DLQ entry first
-        # Reload and update the existing entry
-        dlq_entry = OutboxRelay::DeadLetterEvent.find_by!(
+      # Exponential backoff: base * 2^(n-1)
+      delay = base * (2**[retry_count - 1, 0].max)
+
+      # Cap at maximum
+      delay = [delay, max_delay].min
+
+      # Add jitter: ±20%
+      jitter_factor = 0.8 + (rand * 0.4) # 0.8 to 1.2
+      delay = (delay * jitter_factor).to_i
+
+      Time.current + delay.seconds
+    end
+
+    def move_to_dead_letter_queue(event, error)
+      # CRITICAL: Use requires_new to create independent transaction
+      # This ensures DLQ entry is persisted even when the outer transaction rolls back
+      #
+      # Flow:
+      #   1. Outer transaction: process_event starts
+      #   2. consume_message fails with error
+      #   3. handle_event_failure -> move_to_dead_letter_queue
+      #   4. NEW independent transaction: DLQ entry saved and COMMITTED
+      #   5. Outer transaction: raise causes ROLLBACK
+      #   6. DLQ entry survives because it was committed in step 4
+      #
+      # Without requires_new, the DLQ save would be rolled back with the outer transaction
+      dlq_entry = nil
+
+      ActiveRecord::Base.transaction(requires_new: true) do
+        # Find or create DLQ entry for this consumer group
+        dlq_entry = OutboxRelay::DeadLetterEvent.find_or_initialize_by(
           outbox_relay_outbox_event_id: event.id,
           consumer_group: consumer_group
         )
-        updated_retry_count = dlq_entry.total_retries + 1
-        will_dead_letter_now = should_dead_letter?(event)
-        updated_status = will_dead_letter_now ? "unresolved" : "retrying"
-        updated_retry_after = will_dead_letter_now ? nil : calculate_retry_after(updated_retry_count)
 
-        dlq_entry.update!(
-          total_retries: updated_retry_count,
+        # Increment retry count
+        new_retry_count = (dlq_entry.total_retries || 0) + 1
+        will_dead_letter = should_dead_letter?(event)
+        new_status = will_dead_letter ? 'unresolved' : 'retrying'
+
+        # Calculate retry_after with exponential backoff (only for "retrying" status)
+        # Events marked "unresolved" won't be retried, so no delay needed
+        new_retry_after = will_dead_letter ? nil : calculate_retry_after(new_retry_count)
+
+        dlq_entry.assign_attributes(
+          consumer_class: self.class.name,
+          total_retries: new_retry_count,
           error_message: error.message,
           error_backtrace: error.backtrace&.first(20)&.join("\n"),
           error_context: build_error_context(event, error),
-          resolution_status: updated_status,
-          retry_after: updated_retry_after
+          original_topic: event.topic,
+          original_sequence: event.sequence,
+          original_event_id: event.event_id,
+          original_event_name: event.event_name,
+          original_payload: event.payload,
+          original_headers: event.headers,
+          original_partition_key: event.partition_key,
+          resolution_status: new_status,
+          retry_after: new_retry_after
         )
+
+        begin
+          dlq_entry.save!
+        rescue ActiveRecord::RecordNotUnique
+          # Race condition - another worker created DLQ entry first
+          # Reload and update the existing entry
+          dlq_entry = OutboxRelay::DeadLetterEvent.find_by!(
+            outbox_relay_outbox_event_id: event.id,
+            consumer_group: consumer_group
+          )
+          updated_retry_count = dlq_entry.total_retries + 1
+          will_dead_letter_now = should_dead_letter?(event)
+          updated_status = will_dead_letter_now ? 'unresolved' : 'retrying'
+          updated_retry_after = will_dead_letter_now ? nil : calculate_retry_after(updated_retry_count)
+
+          dlq_entry.update!(
+            total_retries: updated_retry_count,
+            error_message: error.message,
+            error_backtrace: error.backtrace&.first(20)&.join("\n"),
+            error_context: build_error_context(event, error),
+            resolution_status: updated_status,
+            retry_after: updated_retry_after
+          )
+        end
       end
+      # End of requires_new transaction - DLQ entry is now committed independently
+
+      # CRITICAL: Immediately add event to DLQ cache to prevent re-fetching
+      # Without this, the event could be fetched again before cache expires (5s)
+      # and retried immediately, burning through all retries in seconds instead of
+      # respecting the exponential backoff delay.
+      #
+      # This is a hot-path fix: instead of invalidating the entire cache (which would
+      # cause a DB query), we surgically add just this event ID to the exclusion list.
+      if @dlq_event_ids_cache && dlq_entry.resolution_status == 'retrying' && !@dlq_event_ids_cache.include?(event.id)
+        @dlq_event_ids_cache << event.id
+      end
+
+      @logger.error(
+        event_name: 'event_moved_to_dead_letter_queue',
+        event_id: event.event_id,
+        topic: topic,
+        consumer_event_name: event.event_name,
+        consumer_group: consumer_group,
+        total_retries: dlq_entry.total_retries,
+        resolution_status: dlq_entry.resolution_status,
+        retry_after: dlq_entry.retry_after&.iso8601,
+        error: error.message
+      )
     end
-    # End of requires_new transaction - DLQ entry is now committed independently
 
-    @logger.error(
-      event_name: "event_moved_to_dead_letter_queue",
-      event_id: event.event_id,
-      topic: topic,
-      consumer_event_name: event.event_name,
-      consumer_group: consumer_group,
-      total_retries: dlq_entry.total_retries,
-      resolution_status: dlq_entry.resolution_status,
-      retry_after: dlq_entry.retry_after&.iso8601,
-      error: error.message,
-    )
-  end
+    def handle_error(event, error)
+      # Get current DLQ entry for this consumer group to include retry count in logs
+      dlq_entry = OutboxRelay::DeadLetterEvent.find_by(
+        outbox_relay_outbox_event_id: event.id,
+        consumer_group: consumer_group
+      )
 
-  def handle_error(event, error)
-    # Get current DLQ entry for this consumer group to include retry count in logs
-    dlq_entry = OutboxRelay::DeadLetterEvent.find_by(
-      outbox_relay_outbox_event_id: event.id,
-      consumer_group: consumer_group
-    )
+      @logger.error(
+        event_name: 'error_processing_event',
+        event_id: event.event_id,
+        topic: topic,
+        consumer_event_name: event.event_name,
+        consumer_group: consumer_group,
+        error: error.message,
+        retry_count: dlq_entry&.total_retries || 0,
+        backtrace: error.backtrace&.first(5)&.join("\n")
+      )
+    end
 
-    @logger.error(
-      event_name: "error_processing_event",
-      event_id: event.event_id,
-      topic: topic,
-      consumer_event_name: event.event_name,
-      consumer_group: consumer_group,
-      error: error.message,
-      retry_count: dlq_entry&.total_retries || 0,
-      backtrace: error.backtrace&.first(5)&.join("\n"),
-    )
-  end
+    def build_error_context(event, error)
+      {
+        consumer_group: consumer_group,
+        consumer_class: self.class.name,
+        consumer_instance_id: @consumer_instance_id,
+        event_id: event.event_id,
+        sequence: event.sequence,
+        error_class: error.class.name,
+        timestamp: Time.current.iso8601
+      }
+    end
 
-  def build_error_context(event, error)
-    {
-      consumer_group: consumer_group,
-      consumer_class: self.class.name,
-      consumer_instance_id: @consumer_instance_id,
-      event_id: event.event_id,
-      sequence: event.sequence,
-      error_class: error.class.name,
-      timestamp: Time.current.iso8601,
-    }
-  end
+    def report_unknown_event(event)
+      @logger.warn(
+        event_name: 'unknown_event_name',
+        consumer_event_name: event.event_name,
+        topic: topic,
+        consumer_group: consumer_group,
+        event_id: event.event_id
+      )
+    end
 
-  def report_unknown_event(event)
-    @logger.warn(
-      event_name: "unknown_event_name",
-      consumer_event_name: event.event_name,
-      topic: topic,
-      consumer_group: consumer_group,
-      event_id: event.event_id,
-    )
-  end
+    # Handle event processing failure with proper error reporting and state management
+    def handle_event_failure(event, error)
+      # Report error to monitoring backend via ActiveSupport::Notifications
+      report_processing_error(event, error)
 
-  # Handle event processing failure with proper error reporting and state management
-  def handle_event_failure(event, error)
-    # Report error to monitoring backend via ActiveSupport::Notifications
-    report_processing_error(event, error)
+      # Attempt to update event state for retry/DLQ
+      update_failed_event_state(event, error)
+    rescue StandardError => e
+      # Critical: Failed to update event state after processing error
+      log_critical_state_error(event, error, e)
+    end
 
-    # Attempt to update event state for retry/DLQ
-    update_failed_event_state(event, error)
-  rescue => state_error
-    # Critical: Failed to update event state after processing error
-    log_critical_state_error(event, error, state_error)
-  end
+    def report_processing_error(event, error)
+      # Get current DLQ entry for retry count
+      dlq_entry = OutboxRelay::DeadLetterEvent.find_by(
+        outbox_relay_outbox_event_id: event.id,
+        consumer_group: consumer_group
+      )
 
-  def report_processing_error(event, error)
-    # Get current DLQ entry for retry count
-    dlq_entry = OutboxRelay::DeadLetterEvent.find_by(
-      outbox_relay_outbox_event_id: event.id,
-      consumer_group: consumer_group
-    )
+      OutboxRelay::Instrumentation::Models.error(
+        error,
+        model: 'OutboxConsumer',
+        operation: 'event_processing',
+        event_id: event.event_id,
+        consumer_group: consumer_group,
+        topic: topic,
+        event_name: event.event_name,
+        sequence: event.sequence,
+        retry_count: dlq_entry&.total_retries || 0,
+        partition_key: partition_key
+      )
+    end
 
-    OutboxRelay::Instrumentation::Models.error(
-      error,
-      model: "OutboxConsumer",
-      operation: "event_processing",
-      event_id: event.event_id,
-      consumer_group: consumer_group,
-      topic: topic,
-      event_name: event.event_name,
-      sequence: event.sequence,
-      retry_count: dlq_entry&.total_retries || 0,
-      partition_key: partition_key
-    )
-  end
+    def update_failed_event_state(event, error)
+      # Add or update DLQ entry for this consumer group
+      # This tracks per-consumer-group failures and retry attempts
+      move_to_dead_letter_queue(event, error)
 
-  def update_failed_event_state(event, error)
-    # Add or update DLQ entry for this consumer group
-    # This tracks per-consumer-group failures and retry attempts
-    move_to_dead_letter_queue(event, error)
+      # NOTE: Event itself remains unchanged - failures are tracked in DLQ
+      # The event will be excluded from future fetches by fetch_batch
+    end
 
-    # Note: Event itself remains unchanged - failures are tracked in DLQ
-    # The event will be excluded from future fetches by fetch_batch
-  end
+    def log_critical_state_error(event, original_error, state_error)
+      @logger.error(
+        event_name: 'critical_failed_to_update_dlq',
+        event_id: event.event_id,
+        original_error: original_error.message,
+        state_error: state_error.message,
+        consumer_group: consumer_group,
+        backtrace: state_error.backtrace&.first(10)&.join("\n")
+      )
 
-  def log_critical_state_error(event, original_error, state_error)
-    @logger.error(
-      event_name: "critical_failed_to_update_dlq",
-      event_id: event.event_id,
-      original_error: original_error.message,
-      state_error: state_error.message,
-      consumer_group: consumer_group,
-      backtrace: state_error.backtrace&.first(10)&.join("\n"),
-    )
+      # Alert monitoring - this is a critical system failure
+      OutboxRelay::Instrumentation::Models.error(
+        state_error,
+        model: 'OutboxConsumer',
+        operation: 'update_failed_event_state',
+        original_error: original_error.message,
+        event_id: event.event_id,
+        consumer_group: consumer_group,
+        severity: 'critical'
+      )
+    end
 
-    # Alert monitoring - this is a critical system failure
-    OutboxRelay::Instrumentation::Models.error(
-      state_error,
-      model: "OutboxConsumer",
-      operation: "update_failed_event_state",
-      original_error: original_error.message,
-      event_id: event.event_id,
-      consumer_group: consumer_group,
-      severity: "critical"
-    )
-  end
-
-  def recoverable_error?(error)
-    # Only business logic errors are recoverable
-    # System errors should stop processing
-    !error.is_a?(SystemStackError) &&
-      !error.is_a?(NoMemoryError) &&
-      !error.is_a?(SignalException) &&
-      !error.is_a?(SystemExit) &&
-      !error.message.match?(/stack level too deep|out of memory/i)
-  end
+    def recoverable_error?(error)
+      # Only business logic errors are recoverable
+      # System errors should stop processing
+      !error.is_a?(SystemStackError) &&
+        !error.is_a?(NoMemoryError) &&
+        !error.is_a?(SignalException) &&
+        !error.is_a?(SystemExit) &&
+        !error.message.match?(/stack level too deep|out of memory/i)
+    end
   end
 end
