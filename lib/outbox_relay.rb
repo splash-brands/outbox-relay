@@ -1,14 +1,14 @@
 # frozen_string_literal: true
 
-require "outbox_relay/version"
+require 'outbox_relay/version'
 
-require "active_support"
-require "active_support/core_ext/numeric/time"
-require "active_record"
-require "concurrent-ruby"
+require 'active_support'
+require 'active_support/core_ext/numeric/time'
+require 'active_record'
+require 'concurrent-ruby'
 
 module OutboxRelay
-  extend self
+  module_function
 
   class Error < StandardError; end
   class ConfigurationError < Error; end
@@ -65,65 +65,66 @@ module OutboxRelay
   def setup_macos_fork_safety!
     return unless macos?
 
-    if ENV["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] == "YES" && ENV["PGGSSENCMODE"] == "disable"
+    if ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] == 'YES' && ENV['PGGSSENCMODE'] == 'disable'
       logger.info(
-        event_name: "macos_fork_safety_configured",
-        pggssencmode: ENV["PGGSSENCMODE"],
-        objc_disable_fork_safety: ENV["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"]
+        event_name: 'macos_fork_safety_configured',
+        pggssencmode: ENV['PGGSSENCMODE'],
+        objc_disable_fork_safety: ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY']
       )
     else
       logger.warn(
-        event_name: "macos_fork_safety_not_configured",
-        pggssencmode: ENV["PGGSSENCMODE"],
-        objc_disable_fork_safety: ENV["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"],
-        message: "macOS fork-safety environment not properly configured. Workers may crash!"
+        event_name: 'macos_fork_safety_not_configured',
+        pggssencmode: ENV['PGGSSENCMODE'],
+        objc_disable_fork_safety: ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'],
+        message: 'macOS fork-safety environment not properly configured. Workers may crash!'
       )
     end
   end
 
   def macos?
-    RUBY_PLATFORM.include?("darwin")
+    RUBY_PLATFORM.include?('darwin')
   end
 end
 
 # Load models first (base class first)
-require "outbox_relay/models/application_record"
-require "outbox_relay/models/outbox_event"
-require "outbox_relay/models/consumer_offset"
-require "outbox_relay/models/dead_letter_event"
-require "outbox_relay/process"
+require 'outbox_relay/models/application_record'
+require 'outbox_relay/models/outbox_event'
+require 'outbox_relay/models/consumer_offset'
+require 'outbox_relay/models/dead_letter_event'
+require 'outbox_relay/process'
 
 # Load core components
-require "outbox_relay/instrumentation"
-require "outbox_relay/yaml_config_loader"
-require "outbox_relay/configuration"
-require "outbox_relay/cli"
-require "outbox_relay/outbox_publisher"
+require 'outbox_relay/instrumentation'
+require 'outbox_relay/yaml_config_loader'
+require 'outbox_relay/configuration'
+require 'outbox_relay/cli'
+require 'outbox_relay/outbox_publisher'
 
 # Load jobs (optional features)
-require "outbox_relay/jobs/cleanup_expired_events_job"
+require 'outbox_relay/jobs/cleanup_expired_events_job'
 
 # Load process management (modules first, then classes in dependency order)
-require "outbox_relay/processes/callbacks"
-require "outbox_relay/processes/interruptible"
-require "outbox_relay/processes/procline"
-require "outbox_relay/processes/registrable"
-require "outbox_relay/processes/heartbeat"
-require "outbox_relay/processes/runnable"
-require "outbox_relay/processes/signals"
-require "outbox_relay/processes/app_executor"  # Rails executor wrapper
-require "outbox_relay/processes/partition_claiming"  # Distributed partition locking
-require "outbox_relay/processes/base"      # Base uses above modules
-require "outbox_relay/processes/poller"    # Poller < Base
+require 'outbox_relay/processes/callbacks'
+require 'outbox_relay/processes/interruptible'
+require 'outbox_relay/processes/procline'
+require 'outbox_relay/processes/registrable'
+require 'outbox_relay/processes/heartbeat'
+require 'outbox_relay/processes/runnable'
+require 'outbox_relay/processes/signals'
+require 'outbox_relay/processes/app_executor' # Rails executor wrapper
+require 'outbox_relay/processes/partition_claiming' # Distributed partition locking
+require 'outbox_relay/processes/base'      # Base uses above modules
+require 'outbox_relay/processes/poller'    # Poller < Base
 
-require "outbox_relay/worker"
-require "outbox_relay/supervisor"
+require 'outbox_relay/worker'
+require 'outbox_relay/supervisor'
+require 'outbox_relay/partition_monitor'
 
 # Load LogSubscriber for structured logging
-require "outbox_relay/log_subscriber"
+require 'outbox_relay/log_subscriber'
 
 # Load Rails integration if Rails is present
-require "outbox_relay/engine" if defined?(Rails::Engine)
+require 'outbox_relay/engine' if defined?(Rails::Engine)
 
 # Run load hooks for extensions
 ActiveSupport.run_load_hooks(:outbox_relay, self)

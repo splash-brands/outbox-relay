@@ -34,7 +34,7 @@ module OutboxRelay
 
     def initialize(base_path:, env: nil)
       @base_path = base_path
-      @env = env || (defined?(Rails) ? Rails.env : "development")
+      @env = env || (defined?(Rails) ? Rails.env : 'development')
     end
 
     def load
@@ -51,22 +51,22 @@ module OutboxRelay
       # Sanitize base_path to prevent path traversal attacks
       # Expand to absolute path and validate it's within expected directory structure
       safe_base_path = File.expand_path(base_path)
-      config_dir = File.expand_path("config", safe_base_path)
+      config_dir = File.expand_path('config', safe_base_path)
 
-      base_config_file = File.expand_path("outbox_consumers.yml", config_dir)
+      base_config_file = File.expand_path('outbox_consumers.yml', config_dir)
       env_config_file = File.expand_path("outbox_consumers.#{env}.yml", config_dir)
 
       # Validate resolved paths stay within config directory (prevents traversal)
       # Using expand_path ensures ".." sequences are resolved before checking
       unless base_config_file.start_with?(config_dir) && env_config_file.start_with?(config_dir)
-        raise ConfigurationError, "Configuration path traversal detected"
+        raise ConfigurationError, 'Configuration path traversal detected'
       end
 
       unless File.exist?(base_config_file)
         raise ConfigurationError, "Missing OutboxRelay configuration file: #{base_config_file}"
       end
 
-      base_config = load_yaml_file(base_config_file, "base")
+      base_config = load_yaml_file(base_config_file, 'base')
 
       # Merge environment-specific overrides if they exist
       if File.exist?(env_config_file)
@@ -74,10 +74,10 @@ module OutboxRelay
         merged_config = deep_merge(base_config, env_config)
 
         OutboxRelay.logger.info(
-          event_name: "yaml_config_environment_override",
+          event_name: 'yaml_config_environment_override',
           env: env,
           file: env_config_file,
-          message: "Loaded environment-specific configuration overrides"
+          message: 'Loaded environment-specific configuration overrides'
         )
 
         merged_config
@@ -90,12 +90,10 @@ module OutboxRelay
       errors = []
 
       # Validate topics section exists and is a Hash
-      unless config.is_a?(Hash) && config["topics"].is_a?(Hash)
-        errors << "Configuration must contain a 'topics' hash"
-      end
+      errors << "Configuration must contain a 'topics' hash" unless config.is_a?(Hash) && config['topics'].is_a?(Hash)
 
       # Validate consumer_groups section exists and is a Hash
-      unless config.is_a?(Hash) && config["consumer_groups"].is_a?(Hash)
+      unless config.is_a?(Hash) && config['consumer_groups'].is_a?(Hash)
         errors << "Configuration must contain a 'consumer_groups' hash"
       end
 
@@ -103,52 +101,52 @@ module OutboxRelay
       raise ConfigurationError, "Invalid configuration:\n  - #{errors.join("\n  - ")}" if errors.any?
 
       # Validate each topic
-      config["topics"]&.each do |topic_name, topic_config|
+      config['topics']&.each do |topic_name, topic_config|
         unless topic_config.is_a?(Hash)
           errors << "Topic '#{topic_name}' must be a hash"
           next
         end
 
-        unless topic_config["partitions"].is_a?(Integer) && topic_config["partitions"] > 0
+        unless topic_config['partitions'].is_a?(Integer) && topic_config['partitions'].positive?
           errors << "Topic '#{topic_name}' must have a positive integer 'partitions' value"
         end
       end
 
       # Validate each consumer group
-      config["consumer_groups"]&.each do |group_name, group_config|
+      config['consumer_groups']&.each do |group_name, group_config|
         unless group_config.is_a?(Hash)
           errors << "Consumer group '#{group_name}' must be a hash"
           next
         end
 
-        unless group_config["topics"].is_a?(Array)
+        unless group_config['topics'].is_a?(Array)
           errors << "Consumer group '#{group_name}' must have a 'topics' array"
           next
         end
 
-        group_config["topics"].each do |topic_config|
+        group_config['topics'].each do |topic_config|
           unless topic_config.is_a?(Hash)
             errors << "Consumer group '#{group_name}' topics must be hashes"
             next
           end
 
-          unless topic_config["name"].is_a?(String)
+          unless topic_config['name'].is_a?(String)
             errors << "Consumer group '#{group_name}' topic must have a 'name' string"
           end
 
-          unless topic_config["class"].is_a?(String)
+          unless topic_config['class'].is_a?(String)
             errors << "Consumer group '#{group_name}' topic must have a 'class' string"
           end
 
           # Validate topic exists in topics section
-          topic_name = topic_config["name"]
-          unless config["topics"]&.key?(topic_name)
+          topic_name = topic_config['name']
+          unless config['topics']&.key?(topic_name)
             errors << "Consumer group '#{group_name}' references undefined topic '#{topic_name}'"
           end
 
           # Validate partitions if specified
-          partitions = topic_config["partitions"]
-          next if partitions.nil? || partitions == "all"
+          partitions = topic_config['partitions']
+          next if partitions.nil? || partitions == 'all'
 
           unless partitions.is_a?(Array) && partitions.all? { |p| p.is_a?(Integer) && p >= 0 }
             errors << "Consumer group '#{group_name}' topic '#{topic_name}' partitions must be 'all' or array of non-negative integers"
@@ -161,29 +159,30 @@ module OutboxRelay
 
     def transform(config)
       {
-        partitions: build_partitions(config["topics"]),
-        topic_descriptions: build_topic_descriptions(config["topics"]),
-        consumer_groups: build_consumer_groups(config["consumer_groups"]),
+        partitions: build_partitions(config['topics']),
+        topic_descriptions: build_topic_descriptions(config['topics']),
+        consumer_groups: build_consumer_groups(config['consumer_groups']),
+        monitoring: config['monitoring'] || {}
       }
     end
 
     def build_partitions(topics)
-      topics.each_with_object({}) do |(topic_name, topic_config), hash|
-        hash[topic_name] = topic_config["partitions"] || 1
+      topics.transform_values do |topic_config|
+        topic_config['partitions'] || 1
       end
     end
 
     def build_topic_descriptions(topics)
-      topics.each_with_object({}) do |(topic_name, topic_config), hash|
-        hash[topic_name] = topic_config["description"] || ""
+      topics.transform_values do |topic_config|
+        topic_config['description'] || ''
       end
     end
 
     def build_consumer_groups(consumer_groups)
-      consumer_groups.each_with_object({}) do |(group_name, group_config), hash|
-        hash[group_name] = {
-          "description" => group_config["description"] || "",
-          "topics" => group_config["topics"] || [],
+      consumer_groups.transform_values do |group_config|
+        {
+          'description' => group_config['description'] || '',
+          'topics' => group_config['topics'] || []
         }
       end
     end
@@ -203,7 +202,8 @@ module OutboxRelay
     rescue Errno::ENOENT => e
       raise ConfigurationError, "Configuration file not found: #{file_path} (#{e.message})"
     rescue Errno::EMFILE, Errno::ENFILE => e
-      raise ConfigurationError, "Too many open files - cannot load #{file_type} configuration: #{file_path} (#{e.message})"
+      raise ConfigurationError,
+            "Too many open files - cannot load #{file_type} configuration: #{file_path} (#{e.message})"
     rescue Psych::SyntaxError => e
       raise ConfigurationError, "Invalid YAML syntax in #{file_type} configuration file: #{file_path}\n#{e.message}"
     rescue Psych::BadAlias => e
@@ -211,14 +211,15 @@ module OutboxRelay
     rescue StandardError => e
       # Log unexpected errors for debugging
       OutboxRelay.logger.error(
-        event_name: "unexpected_yaml_load_error",
+        event_name: 'unexpected_yaml_load_error',
         file_type: file_type,
         file_path: file_path,
         error_class: e.class.name,
         error: e.message,
         backtrace: e.backtrace&.first(10)&.join("\n")
       )
-      raise ConfigurationError, "Unexpected error loading #{file_type} configuration file: #{file_path} (#{e.class}: #{e.message})"
+      raise ConfigurationError,
+            "Unexpected error loading #{file_type} configuration file: #{file_path} (#{e.class}: #{e.message})"
     end
 
     # Deep merge two hashes (environment overrides base config)
