@@ -9,6 +9,9 @@ module OutboxRelay
     CLAIM_UNAVAILABLE_RETRY_DELAY =
       Processes::PartitionClaiming::CLAIM_UNAVAILABLE_RETRY_DELAY
 
+    # Default interval for partition health checks (can be overridden via configuration)
+    DEFAULT_HEALTH_CHECK_INTERVAL = 30.seconds
+
     after_boot :log_supervisor_start
     before_shutdown :log_supervisor_stop
 
@@ -19,7 +22,7 @@ module OutboxRelay
         if configuration.valid?
           new(configuration).tap(&:start)
         else
-          abort("OutboxRelay configuration errors:\n" + configuration.errors.join("\n") + "\nExiting...")
+          abort("OutboxRelay configuration errors:\n#{configuration.errors.join("\n")}\nExiting...")
         end
       end
     end
@@ -34,6 +37,7 @@ module OutboxRelay
       @restart_attempts = Hash.new(0)  # Track restart attempts per worker
       @restart_backoff_until = {}      # Track when worker can restart
       @failed_worker_starts = []       # Track workers that failed to start
+      @last_health_check = Time.current # Track last partition health check
 
       super()
     end
@@ -47,9 +51,9 @@ module OutboxRelay
     def stop
       super
       OutboxRelay.logger.info(
-        event_name: "supervisor_stopping",
+        event_name: 'supervisor_stopping',
         process_id: process_id,
-        supervisor_pid: ::Process.pid,
+        supervisor_pid: ::Process.pid
       )
     end
 
@@ -58,7 +62,7 @@ module OutboxRelay
     def metadata
       super.merge(
         workers_count: forks.size,
-        uptime: Time.current - (@started_at ||= Time.current),
+        uptime: Time.current - (@started_at ||= Time.current)
       )
     end
 
@@ -69,7 +73,7 @@ module OutboxRelay
         run_callbacks(:boot) do
           sync_std_streams
           register
-          start_heartbeat  # Start automatic heartbeat after registration
+          start_heartbeat # Start automatic heartbeat after registration
           register_signal_handlers
           set_procline
         end
@@ -79,10 +83,10 @@ module OutboxRelay
     # Safely wrap instrumentation - continue even if instrumentation fails
     def safe_instrument(event_name, **metadata, &block)
       OutboxRelay.instrument(event_name, **metadata, &block)
-    rescue => e
+    rescue StandardError => e
       # DEBUG: Instrumentation failure doesn't affect operation - continue anyway
       OutboxRelay.logger.debug(
-        event_name: "instrumentation_failed",
+        event_name: 'instrumentation_failed',
         failed_event: event_name,
         error: e.message,
         error_class: e.class.name
@@ -101,28 +105,28 @@ module OutboxRelay
       end
 
       # Report startup status including any failures
-      if @failed_worker_starts.any?
-        OutboxRelay.logger.error(
-          event_name: "supervisor_boot_incomplete",
-          total_expected: total_expected,
-          running_workers: forks.size,
-          failed_workers: @failed_worker_starts.size,
-          failed_details: @failed_worker_starts.map { |f|
-            {
-              topic: f[:worker_config].topic,
-              partition_key: f[:partition_key],
-              error: f[:error]
-            }
-          }
-        )
+      return unless @failed_worker_starts.any?
 
-        OutboxRelay::Instrumentation::Supervisor.boot_incomplete(
-          total_expected: total_expected,
-          running_workers: forks.size,
-          failed_workers: @failed_worker_starts.size,
-          failed_details: @failed_worker_starts
-        )
-      end
+      OutboxRelay.logger.error(
+        event_name: 'supervisor_boot_incomplete',
+        total_expected: total_expected,
+        running_workers: forks.size,
+        failed_workers: @failed_worker_starts.size,
+        failed_details: @failed_worker_starts.map do |f|
+          {
+            topic: f[:worker_config].topic,
+            partition_key: f[:partition_key],
+            error: f[:error]
+          }
+        end
+      )
+
+      OutboxRelay::Instrumentation::Supervisor.boot_incomplete(
+        total_expected: total_expected,
+        running_workers: forks.size,
+        failed_workers: @failed_worker_starts.size,
+        failed_details: @failed_worker_starts
+      )
     end
 
     # Fork Safety - Critical considerations for forking workers
@@ -212,7 +216,7 @@ module OutboxRelay
       worker_params = worker_config.instantiate(partition_key: partition_key).merge(
         polling_interval: configuration.polling_interval,
         batch_size: configuration.batch_size,
-        max_loops: configuration.max_loops,
+        max_loops: configuration.max_loops
       )
 
       worker = Worker.new(**worker_params)
@@ -234,16 +238,14 @@ module OutboxRelay
         end
 
         # Check if fork succeeded
-        if pid.nil?
-          raise OutboxRelay::Error, "fork() returned nil - system may be out of resources (ENOMEM or EAGAIN)"
-        end
+        raise OutboxRelay::Error, 'fork() returned nil - system may be out of resources (ENOMEM or EAGAIN)' if pid.nil?
 
         # In parent process
         worker_configs[pid] = worker_config
         forks[pid] = {
           worker: worker,
           partition_key: partition_key,
-          started_at: Time.current,
+          started_at: Time.current
         }
 
         safe_instrument(
@@ -255,10 +257,9 @@ module OutboxRelay
           topic: worker_config.topic,
           partition_key: partition_key
         )
-
-      rescue => e
+      rescue StandardError => e
         OutboxRelay.logger.error(
-          event_name: "fork_system_error",
+          event_name: 'fork_system_error',
           worker_name: worker.name,
           error: e.message,
           error_class: e.class.name,
@@ -281,9 +282,9 @@ module OutboxRelay
 
         # Don't crash supervisor - log and continue with other workers
         OutboxRelay.logger.error(
-          event_name: "worker_fork_abandoned",
+          event_name: 'worker_fork_abandoned',
           worker_name: worker.name,
-          message: "Failed to fork worker - continuing with other workers"
+          message: 'Failed to fork worker - continuing with other workers'
         )
       end
     end
@@ -295,14 +296,94 @@ module OutboxRelay
         set_procline
         process_signal_queue
 
-        unless stopped?
-          reap_and_restart_terminated_forks
-          restart_workers_after_backoff
-          interruptible_sleep(1.second)
-        end
+        next if stopped?
+
+        reap_and_restart_terminated_forks
+        restart_workers_after_backoff
+        check_partition_health if should_check_health?
+        interruptible_sleep(1.second)
       end
     ensure
       shutdown
+    end
+
+    # ============================================================================
+    # Partition Health Monitoring
+    # ============================================================================
+    # Periodically checks partition health and emits instrumentation events
+    # for orphaned partitions (no active worker) and high-lag partitions.
+    #
+    # This enables external monitoring systems (Datadog, Sentry, etc.) to
+    # detect and alert on partition issues before they cause production problems.
+
+    def should_check_health?
+      Time.current - @last_health_check >= health_check_interval
+    end
+
+    def health_check_interval
+      configuration.monitoring_config[:orphan_check_interval]&.seconds || DEFAULT_HEALTH_CHECK_INTERVAL
+    end
+
+    def check_partition_health
+      @last_health_check = Time.current
+
+      monitor = PartitionMonitor.new(configuration)
+      report = monitor.health_report
+
+      # Emit events for orphaned partitions
+      report[:orphaned].each do |partition|
+        Instrumentation::PartitionHealth.orphaned(
+          consumer_group: partition[:consumer_group],
+          topic: partition[:topic],
+          partition_key: partition[:partition_key],
+          claimed_until: partition[:claimed_until],
+          last_consumed_at: partition[:last_consumed_at],
+          lag: partition[:lag]
+        )
+      end
+
+      # Emit events for stale workers
+      report[:high_lag].select { |p| p[:status] == :stale }.each do |partition|
+        Instrumentation::PartitionHealth.stale_worker(
+          consumer_group: partition[:consumer_group],
+          topic: partition[:topic],
+          partition_key: partition[:partition_key],
+          last_heartbeat_at: partition[:heartbeat_at],
+          stale_threshold: configuration.monitoring_config[:stale_worker_timeout] || 60
+        )
+      end
+
+      # Emit events for high-lag partitions (excluding orphaned - they already have an alert)
+      lag_threshold = configuration.monitoring_config[:lag_alert_threshold] || 100
+      report[:high_lag].reject { |p| p[:status] == :orphaned }.each do |partition|
+        Instrumentation::PartitionHealth.high_lag(
+          consumer_group: partition[:consumer_group],
+          topic: partition[:topic],
+          partition_key: partition[:partition_key],
+          lag: partition[:lag],
+          threshold: lag_threshold
+        )
+      end
+
+      # Log summary if any issues found
+      if report[:orphaned].any? || report[:high_lag].any?
+        OutboxRelay.logger.warn(
+          event_name: 'partition_health_issues_detected',
+          total_partitions: report[:total],
+          active_partitions: report[:active],
+          stale_partitions: report[:stale],
+          orphaned_count: report[:orphaned].size,
+          high_lag_count: report[:high_lag].size
+        )
+      end
+    rescue StandardError => e
+      # Don't let health check failures affect the supervisor
+      OutboxRelay.logger.error(
+        event_name: 'partition_health_check_failed',
+        error: e.message,
+        error_class: e.class.name,
+        backtrace: e.backtrace&.first(5)&.join("\n")
+      )
     end
 
     def reap_and_restart_terminated_forks
@@ -328,7 +409,7 @@ module OutboxRelay
         partition_key = backoff_info[:partition_key]
 
         OutboxRelay.logger.info(
-          event_name: "worker_restarting_after_backoff",
+          event_name: 'worker_restarting_after_backoff',
           worker_key: worker_key,
           partition_key: partition_key,
           topic: worker_config.topic
@@ -373,11 +454,11 @@ module OutboxRelay
               # Check if we've exceeded max attempts
               if attempts > 10
                 OutboxRelay.logger.error(
-                  event_name: "worker_restart_abandoned",
+                  event_name: 'worker_restart_abandoned',
                   worker_name: fork_info[:worker]&.name,
                   restart_attempts: attempts,
-                  reason: "Too many restart attempts - indicates systemic issue",
-                  action: "Manual intervention required"
+                  reason: 'Too many restart attempts - indicates systemic issue',
+                  action: 'Manual intervention required'
                 )
 
                 OutboxRelay::Instrumentation::Supervisor.restart_abandoned(
@@ -392,7 +473,7 @@ module OutboxRelay
               end
 
               # Calculate backoff
-              backoff_seconds = [2 ** (attempts - 1), 60].min  # Max 60 seconds
+              backoff_seconds = [2**(attempts - 1), 60].min # Max 60 seconds
               restart_at = Time.current + backoff_seconds
               @restart_backoff_until[worker_key] = {
                 restart_at: restart_at,
@@ -401,7 +482,7 @@ module OutboxRelay
               }
 
               OutboxRelay.logger.warn(
-                event_name: "worker_restart_delayed",
+                event_name: 'worker_restart_delayed',
                 worker_name: fork_info[:worker]&.name,
                 restart_attempts: attempts,
                 backoff_seconds: backoff_seconds,
@@ -429,7 +510,7 @@ module OutboxRelay
       }
 
       OutboxRelay.logger.info(
-        event_name: "worker_restart_delayed_claim_unavailable",
+        event_name: 'worker_restart_delayed_claim_unavailable',
         worker_key: worker_key,
         worker_name: worker_name,
         partition_key: partition_key,
@@ -448,32 +529,32 @@ module OutboxRelay
     def log_fork_terminated(pid, fork_info, status)
       if status.success?
         OutboxRelay.logger.info(
-          event_name: "worker_terminated_successfully",
+          event_name: 'worker_terminated_successfully',
           supervisor_pid: ::Process.pid,
           worker_pid: pid,
           worker_name: fork_info[:worker]&.name,
-          uptime: Time.current - fork_info[:started_at],
+          uptime: Time.current - fork_info[:started_at]
         )
       elsif claim_unavailable_exit_status?(status)
         OutboxRelay.logger.info(
-          event_name: "worker_terminated_claim_unavailable",
+          event_name: 'worker_terminated_claim_unavailable',
           supervisor_pid: ::Process.pid,
           worker_pid: pid,
           worker_name: fork_info[:worker]&.name,
           exit_status: status.exitstatus,
           partition_key: fork_info[:partition_key],
-          uptime: Time.current - fork_info[:started_at],
+          uptime: Time.current - fork_info[:started_at]
         )
       else
         OutboxRelay.logger.error(
-          event_name: "worker_terminated_with_error",
+          event_name: 'worker_terminated_with_error',
           supervisor_pid: ::Process.pid,
           worker_pid: pid,
           worker_name: fork_info[:worker]&.name,
           exit_status: status.exitstatus,
           signaled: status.signaled?,
           signal: status.termsig,
-          uptime: Time.current - fork_info[:started_at],
+          uptime: Time.current - fork_info[:started_at]
         )
       end
     end
@@ -483,7 +564,7 @@ module OutboxRelay
         :graceful_termination,
         process_id: process_id,
         supervisor_pid: ::Process.pid,
-        worker_pids: forks.keys,
+        worker_pids: forks.keys
       ) do |payload|
         stop
 
@@ -492,9 +573,9 @@ module OutboxRelay
 
         if failed.any?
           OutboxRelay.logger.error(
-            event_name: "graceful_shutdown_signal_failures",
+            event_name: 'graceful_shutdown_signal_failures',
             failed_pids: failed,
-            message: "Some workers did not receive TERM signal"
+            message: 'Some workers did not receive TERM signal'
           )
           payload[:signal_failures] = failed
         end
@@ -520,16 +601,16 @@ module OutboxRelay
         :immediate_termination,
         process_id: process_id,
         supervisor_pid: ::Process.pid,
-        worker_pids: forks.keys,
+        worker_pids: forks.keys
       ) do |payload|
         # Send KILL to all remaining workers
         failed = signal_processes(forks.keys, :KILL)
 
         if failed.any?
           OutboxRelay.logger.error(
-            event_name: "kill_signal_failures",
+            event_name: 'kill_signal_failures',
             failed_pids: failed,
-            message: "Some workers did not receive KILL signal - may be zombie processes"
+            message: 'Some workers did not receive KILL signal - may be zombie processes'
           )
           payload[:signal_failures] = failed
         end
@@ -556,8 +637,8 @@ module OutboxRelay
     def shutdown
       safe_instrument(:shutdown_supervisor, process: self) do
         run_callbacks(:shutdown) do
-          stop_heartbeat  # Stop heartbeat before deregistration
-          restore_signal_handlers  # Restore original signal handlers
+          stop_heartbeat # Stop heartbeat before deregistration
+          restore_signal_handlers # Restore original signal handlers
           deregister
         end
       end
@@ -579,22 +660,22 @@ module OutboxRelay
 
     def log_supervisor_start
       OutboxRelay.logger.info(
-        event_name: "supervisor_started",
+        event_name: 'supervisor_started',
         process_id: process_id,
         supervisor_pid: ::Process.pid,
         hostname: hostname,
         workers_count: configuration.workers.sum(&:partition_count),
         polling_interval: configuration.polling_interval,
-        batch_size: configuration.batch_size,
+        batch_size: configuration.batch_size
       )
     end
 
     def log_supervisor_stop
       OutboxRelay.logger.info(
-        event_name: "supervisor_stopped",
+        event_name: 'supervisor_stopped',
         process_id: process_id,
         supervisor_pid: ::Process.pid,
-        uptime: metadata[:uptime],
+        uptime: metadata[:uptime]
       )
     end
   end

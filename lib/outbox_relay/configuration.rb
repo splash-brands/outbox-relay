@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require "concurrent"
+require 'concurrent'
 
 module OutboxRelay
   class Configuration
@@ -10,10 +10,14 @@ module OutboxRelay
     DEFAULT_CLEANUP_ENABLED = false
     DEFAULT_CLEANUP_BATCH_SIZE = 10_000
 
-    attr_accessor :polling_interval, :batch_size, :max_loops, :workers_config
-    attr_accessor :topic_descriptions, :consumer_group_configs
-    attr_accessor :cleanup_enabled, :cleanup_batch_size
-    attr_reader :partitions
+    # Monitoring defaults
+    DEFAULT_LAG_ALERT_THRESHOLD = 100
+    DEFAULT_ORPHAN_CHECK_INTERVAL = 30 # seconds
+    DEFAULT_STALE_WORKER_TIMEOUT = 60 # seconds
+
+    attr_accessor :polling_interval, :batch_size, :max_loops, :workers_config, :topic_descriptions,
+                  :consumer_group_configs, :cleanup_enabled, :cleanup_batch_size
+    attr_reader :partitions, :monitoring_config
 
     def initialize(options = {})
       @polling_interval = options[:polling_interval] || DEFAULT_POLLING_INTERVAL
@@ -27,6 +31,7 @@ module OutboxRelay
       @partitions = (yaml_config[:partitions] || {}).freeze
       @topic_descriptions = (yaml_config[:topic_descriptions] || {}).freeze
       @consumer_group_configs = (yaml_config[:consumer_groups] || {}).freeze
+      @monitoring_config = build_monitoring_config(yaml_config[:monitoring] || {}).freeze
 
       @workers_config = load_workers_config(options).freeze
 
@@ -50,10 +55,23 @@ module OutboxRelay
       # Do NOT memoize - errors must reflect current state
       # Configuration attrs (polling_interval, batch_size) can change after initialization
       [].tap do |errs|
-        errs << "No workers configured" if workers.empty?
-        errs << "Invalid polling interval" if polling_interval <= 0
-        errs << "Invalid batch size" if batch_size <= 0
+        errs << 'No workers configured' if workers.empty?
+        errs << 'Invalid polling interval' if polling_interval <= 0
+        errs << 'Invalid batch size' if batch_size <= 0
       end
+    end
+
+    # Monitoring configuration convenience accessors
+    def lag_alert_threshold
+      monitoring_config[:lag_alert_threshold]
+    end
+
+    def orphan_check_interval
+      monitoring_config[:orphan_check_interval]
+    end
+
+    def stale_worker_timeout
+      monitoring_config[:stale_worker_timeout]
     end
 
     private
@@ -64,19 +82,35 @@ module OutboxRelay
       YamlConfigLoader.load(base_path: base_path)
     rescue YamlConfigLoader::ConfigurationError => e
       OutboxRelay.logger.error(
-        event_name: "yaml_config_load_failed",
+        event_name: 'yaml_config_load_failed',
         error: e.message,
-        message: "Failed to load OutboxRelay configuration from YAML"
+        message: 'Failed to load OutboxRelay configuration from YAML'
       )
       raise
     end
 
-    def load_workers_config(options)
+    # Build monitoring configuration with defaults
+    #
+    # Example YAML config:
+    #   monitoring:
+    #     lag_alert_threshold: 100     # Alert when partition lag exceeds this value
+    #     orphan_check_interval: 30    # How often to check for orphaned partitions (seconds)
+    #     stale_worker_timeout: 60     # Consider worker stale after no heartbeat for this long
+    #
+    def build_monitoring_config(yaml_monitoring)
+      {
+        lag_alert_threshold: yaml_monitoring['lag_alert_threshold'] || DEFAULT_LAG_ALERT_THRESHOLD,
+        orphan_check_interval: yaml_monitoring['orphan_check_interval'] || DEFAULT_ORPHAN_CHECK_INTERVAL,
+        stale_worker_timeout: yaml_monitoring['stale_worker_timeout'] || DEFAULT_STALE_WORKER_TIMEOUT
+      }
+    end
+
+    def load_workers_config(_options)
       # Load from consumer_group_configs (loaded from YAML)
       workers = []
 
       @consumer_group_configs.each do |consumer_group, group_config|
-        group_config["topics"].each do |topic_config|
+        group_config['topics'].each do |topic_config|
           # CRITICAL: Do NOT query database OR load consumer classes before forking!
           #
           # Why: Fork-safety on macOS (and some Linux versions) requires:
@@ -93,29 +127,30 @@ module OutboxRelay
           #
           # See: lib/outbox_relay/processes/runnable.rb:39-63 for post-fork reconnection
 
-          topic_name = topic_config["name"]
-          consumer_class = topic_config["class"]
+          topic_name = topic_config['name']
+          consumer_class = topic_config['class']
 
           # Partition configuration from YAML (if specified)
           # Can be "all" (process all partitions) or [0, 1, 2] (specific partitions)
-          partition_spec = topic_config["partitions"]
+          partition_spec = topic_config['partitions']
 
           # Convert "all" to nil (will fetch all partitions from configuration)
-          partition_count = if partition_spec == "all" || partition_spec.nil?
-            nil # Will be fetched from configuration.partitions
-          elsif partition_spec.is_a?(Array)
-            # Specific partitions specified - extract unique partition keys
-            partition_spec.uniq
-          else
-            raise OutboxRelay::ConfigurationError, "Invalid partitions specification for #{consumer_group}/#{topic_name}: #{partition_spec.inspect}"
-          end
+          partition_count = if partition_spec == 'all' || partition_spec.nil?
+                              nil # Will be fetched from configuration.partitions
+                            elsif partition_spec.is_a?(Array)
+                              # Specific partitions specified - extract unique partition keys
+                              partition_spec.uniq
+                            else
+                              raise OutboxRelay::ConfigurationError,
+                                    "Invalid partitions specification for #{consumer_group}/#{topic_name}: #{partition_spec.inspect}"
+                            end
 
           workers << {
             consumer_group: consumer_group,
             topic: topic_name,
             consumer_class: consumer_class,
             partition_spec: partition_spec, # Store original spec for validation
-            partition_count: partition_count, # nil or Array of specific partitions
+            partition_count: partition_count # nil or Array of specific partitions
           }
         end
       end
@@ -151,12 +186,10 @@ module OutboxRelay
 
       def partitions
         # If specific partitions are configured, use those
-        if @explicit_partitions.is_a?(Array)
-          return @explicit_partitions.uniq.sort
-        end
+        return @explicit_partitions.uniq.sort if @explicit_partitions.is_a?(Array)
 
         # Otherwise, use all partitions (0...partition_count)
-        range = (0...partition_count).to_a
+        (0...partition_count).to_a
 
         # REMOVED: Orphaned partition check
         # Previously queried database here to check for orphaned events
@@ -166,8 +199,6 @@ module OutboxRelay
         #
         # NOTE: If you need to check for orphaned partitions, run a rake task
         # after workers are started, not during configuration loading
-
-        range
       end
 
       def instantiate(partition_key:)
@@ -175,7 +206,7 @@ module OutboxRelay
           consumer_class: consumer_class,
           consumer_group: consumer_group,
           topic: topic,
-          partition_key: partition_key,
+          partition_key: partition_key
         }
       end
 
@@ -183,43 +214,38 @@ module OutboxRelay
 
       def fetch_partition_count
         # Priority 1: Explicit partition list in config
-        if @explicit_partitions.is_a?(Array)
-          return @explicit_partitions.size
-        end
+        return @explicit_partitions.size if @explicit_partitions.is_a?(Array)
 
         # Priority 2: Configuration partitions (from YAML)
-        if OutboxRelay.configuration.partitions[topic]
-          return OutboxRelay.configuration.partitions[topic]
-        end
+        return OutboxRelay.configuration.partitions[topic] if OutboxRelay.configuration.partitions[topic]
 
         # Priority 3: Query database for actual partitions (fallback)
         OutboxRelay.logger.warn(
-          event_name: "partition_count_not_in_yaml",
+          event_name: 'partition_count_not_in_yaml',
           topic: topic,
-          message: "Topic not found in configuration, querying database..."
+          message: 'Topic not found in configuration, querying database...'
         )
 
         count = OutboxRelay::OutboxEvent
-          .where(topic: topic)
-          .distinct
-          .count(:partition_key)
+                .where(topic: topic)
+                .distinct
+                .count(:partition_key)
 
         if count.zero?
           OutboxRelay.logger.warn(
-            event_name: "partition_count_zero_defaulting",
+            event_name: 'partition_count_zero_defaulting',
             topic: topic,
             partition_count: 1,
-            message: "No events found for topic - defaulting to 1 partition. " \
-                     "Add topic to config/outbox_consumers.yml with partition count."
+            message: 'No events found for topic - defaulting to 1 partition. ' \
+                     'Add topic to config/outbox_consumers.yml with partition count.'
           )
           return 1
         end
 
         count
-
-      rescue => e
+      rescue StandardError => e
         OutboxRelay.logger.error(
-          event_name: "partition_count_query_failed",
+          event_name: 'partition_count_query_failed',
           topic: topic,
           error: e.message,
           error_class: e.class.name,
