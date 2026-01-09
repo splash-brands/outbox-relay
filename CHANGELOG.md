@@ -5,6 +5,41 @@ All notable changes to OutboxRelay will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **PartitionMonitor class** - Detects orphaned partitions and monitors partition health
+  - `orphaned_partitions` - Returns partitions without active workers
+  - `partition_health` - Returns status for all expected partitions (`:active`, `:stale`, `:orphaned`)
+  - `health_report` - Comprehensive report with totals and problem partitions
+  - `partition_lag` - Returns lag for specific partition
+  - Addresses production incident where ShipStation partition went unprocessed for 5+ hours
+
+- **Supervisor health check loop** - Periodic health monitoring (default: every 30 seconds)
+  - Emits instrumentation events for orphaned partitions
+  - Emits instrumentation events for high lag partitions
+  - Emits instrumentation events for stale workers
+
+- **Partition health instrumentation events**:
+  - `outbox_relay.partition_health.orphaned` - Critical: partition has no active worker
+  - `outbox_relay.partition_health.high_lag` - Warning: partition lag exceeds threshold
+  - `outbox_relay.partition_health.stale_worker` - Warning: worker heartbeat is stale
+  - `outbox_relay.partition_health.worker_missing` - Critical: expected worker not found
+
+- **Monitoring configuration** in `config/outbox_consumers.yml`:
+  - `lag_alert_threshold` - Alert when lag exceeds this (default: 100)
+  - `orphan_check_interval` - Health check interval in seconds (default: 30)
+  - `stale_worker_timeout` - Consider worker stale after this many seconds (default: 60)
+
+- **ConsumerOffset scopes**:
+  - `.orphaned` - Partitions without active claims
+  - `.actively_claimed` - Partitions with active claims
+
+### Fixed
+
+- **DLQ cache invalidation** - Immediately invalidate DLQ cache after adding event to prevent retry burn
+
 ## [0.8.0] - 2025-12-15
 
 ### Added

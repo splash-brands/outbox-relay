@@ -493,6 +493,98 @@ consumer.last_consumed_sequence # => 12345
 consumer.last_consumed_at # => 2024-11-03 10:30:00 UTC
 ```
 
+### Partition Health Monitoring
+
+OutboxRelay includes `PartitionMonitor` for detecting orphaned partitions and monitoring partition health. This is critical for preventing situations where events stop being processed without anyone noticing.
+
+**The Problem It Solves:**
+
+Without partition monitoring, a worker can die and its partition can remain unprocessed for hours. The `PartitionMonitor` class:
+1. Detects orphaned partitions (no active claim)
+2. Detects stale partitions (claim active but no recent heartbeat)
+3. Detects high-lag partitions (falling behind)
+4. Provides health reports for dashboards and alerts
+
+**Basic Usage:**
+
+```ruby
+monitor = OutboxRelay::PartitionMonitor.new
+
+# Get all orphaned partitions (no active worker)
+monitor.orphaned_partitions
+# => [{ consumer_group: "shipstation", topic: "orders", partition_key: 0, lag: 150 }]
+
+# Get health status for all partitions
+monitor.partition_health
+# => [{ consumer_group: "shipstation", topic: "orders", partition_key: 0, status: :active, lag: 0 }]
+
+# Get comprehensive health report
+monitor.health_report
+# => { total: 18, active: 16, stale: 1, orphaned: [...], high_lag: [...], timestamp: "..." }
+
+# Get lag for specific partition
+monitor.partition_lag(consumer_group: "shipstation", topic: "orders", partition_key: 0)
+# => 150
+```
+
+**Partition Statuses:**
+
+| Status | Meaning |
+|--------|---------|
+| `:active` | Partition has active claim and recent heartbeat |
+| `:stale` | Partition has active claim but heartbeat is old (> 60s) |
+| `:orphaned` | Partition has no active claim - events NOT being processed! |
+
+**Supervisor Health Checks:**
+
+The Supervisor automatically runs periodic health checks (default: every 30 seconds) and emits instrumentation events for monitoring:
+
+```ruby
+# In config/outbox_consumers.yml
+monitoring:
+  lag_alert_threshold: 100      # Alert when lag exceeds this
+  orphan_check_interval: 30     # Health check interval (seconds)
+  stale_worker_timeout: 60      # Consider worker stale after this many seconds
+```
+
+**Instrumentation Events:**
+
+Subscribe to partition health events for alerting:
+
+```ruby
+# config/initializers/outbox_relay_instrumentation.rb
+
+# Critical: Partition has no worker processing events
+ActiveSupport::Notifications.subscribe("outbox_relay.partition_health.orphaned") do |name, _, _, _, payload|
+  Rails.logger.error(event: name, **payload)
+  Sentry.capture_message("Orphaned partition detected!", level: :error, extra: payload)
+end
+
+# Warning: Partition lag is high
+ActiveSupport::Notifications.subscribe("outbox_relay.partition_health.high_lag") do |name, _, _, _, payload|
+  Rails.logger.warn(event: name, **payload)
+end
+
+# Warning: Worker heartbeat is stale
+ActiveSupport::Notifications.subscribe("outbox_relay.partition_health.stale_worker") do |name, _, _, _, payload|
+  Rails.logger.warn(event: name, **payload)
+end
+```
+
+**Health Check Endpoint:**
+
+```ruby
+# app/controllers/health_controller.rb
+def outbox_relay
+  monitor = OutboxRelay::PartitionMonitor.new
+  report = monitor.health_report
+
+  healthy = report[:orphaned].empty?
+
+  render json: report.merge(healthy: healthy), status: healthy ? 200 : 503
+end
+```
+
 ### Automatic Structured Logging (New!)
 
 OutboxRelay now includes **LogSubscriber** for automatic, unified logging of all operations:
