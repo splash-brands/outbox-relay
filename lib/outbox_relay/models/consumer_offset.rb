@@ -197,9 +197,11 @@ module OutboxRelay
         return false if claimed? && claimed_by != consumer_instance_id
 
         # Acquire or renew claim
+        # Also set heartbeat_at to prove worker liveness from the start
         update!(
           claimed_by: consumer_instance_id,
-          claimed_until: Time.current + ttl
+          claimed_until: Time.current + ttl,
+          heartbeat_at: Time.current
         )
 
         true
@@ -215,6 +217,11 @@ module OutboxRelay
     #
     # Note: Uses explicit reload + lock! pattern instead of with_lock to be compatible
     # with Rails 7.1+ which raises error on with_lock if record has pending changes.
+    #
+    # IMPORTANT: Also updates heartbeat_at to prove worker liveness. This is critical
+    # for PartitionMonitor to correctly identify active vs stale workers, especially
+    # when a partition has no new events to process (heartbeat_at would otherwise
+    # only update in update_offset! when processing events).
     def renew_claim!(consumer_instance_id:, ttl: CLAIM_TTL)
       ActiveRecord::Base.transaction do
         reload # Clear any in-memory changes before locking
@@ -223,7 +230,10 @@ module OutboxRelay
         # Only renew if we still hold the claim
         return false unless claimed_by == consumer_instance_id
 
-        update!(claimed_until: Time.current + ttl)
+        update!(
+          claimed_until: Time.current + ttl,
+          heartbeat_at: Time.current
+        )
         true
       end
     end
