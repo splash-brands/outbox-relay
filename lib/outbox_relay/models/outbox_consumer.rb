@@ -193,18 +193,24 @@ module OutboxRelay
       # These events should not be fetched again by this consumer group
       dlq_event_ids = fetch_dlq_event_ids
 
-      # Fetch events after current offset, excluding DLQ events for this consumer group
+      # Get IDs of DLQ events ready for retry (retrying with retry_after <= now)
+      # These need to be explicitly included since their sequence is before last_consumed_sequence
+      retry_ready_ids = fetch_retry_ready_event_ids
+
+      # Build query for normal events (after current offset) + retry-ready events
+      # Using OR to combine: (sequence > offset AND not in DLQ) OR (ready for retry)
       query = OutboxRelay::OutboxEvent
               .where(topic: topic)
-              .where('sequence > ?', offset.last_consumed_sequence)
-              .where.not(id: dlq_event_ids)
+              .where(partition_key: partition_key)
+              .where(
+                '(sequence > :offset AND id NOT IN (:dlq_ids)) OR id IN (:retry_ids)',
+                offset: offset.last_consumed_sequence,
+                dlq_ids: dlq_event_ids.presence || [0], # [0] for empty array to avoid SQL syntax error
+                retry_ids: retry_ready_ids.presence || [0]
+              )
               .not_expired
               .by_sequence
               .limit(batch_size)
-
-      # Apply partition filtering for parallel processing
-      # Each worker processes only its assigned partition
-      query = query.where(partition_key: partition_key)
 
       # Apply event filtering (matches Karafka's MarkingEventTypeFilter)
       query = query.where(event_name: event_filter) if event_filter.present?
@@ -250,6 +256,59 @@ module OutboxRelay
           current_time
         )
         .pluck(:outbox_relay_outbox_event_id)
+    end
+
+    # Get IDs of events ready for retry from DLQ
+    # These are events with "retrying" status and retry_after <= current time
+    # They need to be explicitly included in fetch since their sequence is before last_consumed_sequence
+    def fetch_retry_ready_event_ids
+      @retry_ready_cache ||= begin
+        @retry_ready_cache_expires_at = Time.current + 5.seconds
+        load_retry_ready_event_ids
+      end
+
+      if Time.current > @retry_ready_cache_expires_at
+        @retry_ready_cache = load_retry_ready_event_ids
+        @retry_ready_cache_expires_at = Time.current + 5.seconds
+      end
+
+      @retry_ready_cache
+    end
+
+    def load_retry_ready_event_ids
+      current_time = Time.current
+
+      OutboxRelay::DeadLetterEvent
+        .where(consumer_group: consumer_group)
+        .where(resolution_status: 'retrying')
+        .where('retry_after IS NULL OR retry_after <= ?', current_time)
+        .pluck(:outbox_relay_outbox_event_id)
+    end
+
+    # Mark DLQ entry as successfully reprocessed
+    # Called after consume_message succeeds for an event that was in DLQ
+    def mark_dlq_event_reprocessed(event)
+      dlq_entry = OutboxRelay::DeadLetterEvent.find_by(
+        consumer_group: consumer_group,
+        outbox_relay_outbox_event_id: event.id,
+        resolution_status: 'retrying'
+      )
+
+      return unless dlq_entry
+
+      dlq_entry.mark_as_reprocessed!(notes: "Successfully reprocessed after #{dlq_entry.total_retries} retries")
+
+      # Invalidate retry cache so this event is not fetched again
+      @retry_ready_cache = nil
+
+      @logger.info(
+        event_name: 'dlq_event_reprocessed',
+        event_id: event.event_id,
+        sequence: event.sequence,
+        consumer_group: consumer_group,
+        total_retries: dlq_entry.total_retries,
+        message: 'DLQ event successfully reprocessed'
+      )
     end
 
     # Advisory lock methods for duplicate prevention
@@ -513,6 +572,9 @@ module OutboxRelay
         # Phase 2: Process event OUTSIDE transaction
         # HTTP calls, API calls - can take seconds without holding DB transaction
         consume_message(event)
+
+        # Mark DLQ entry as reprocessed if this was a retry
+        mark_dlq_event_reprocessed(event)
 
         # Phase 3: Update offset
         commit_event_processed(event)
