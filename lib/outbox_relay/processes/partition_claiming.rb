@@ -97,10 +97,10 @@ module OutboxRelay
           ttl: CLAIM_TTL
         )
 
-        unless renewed
-          log_claim_lost
-          stop  # Stop worker - supervisor will restart and it can try to reclaim
-        end
+        return if renewed
+
+        log_claim_lost
+        stop # Stop worker - supervisor will restart and it can try to reclaim
       end
 
       # Release partition claim during shutdown.
@@ -119,7 +119,7 @@ module OutboxRelay
 
         if released
           OutboxRelay.logger.info(
-            event_name: "partition_claim_released",
+            event_name: 'partition_claim_released',
             consumer_group: consumer_group,
             topic: topic,
             partition_key: partition_key,
@@ -128,10 +128,10 @@ module OutboxRelay
         end
 
         @partition_claimed = false
-      rescue => e
+      rescue StandardError => e
         # DEBUG: Best-effort cleanup during shutdown - not actionable
         OutboxRelay.logger.debug(
-          event_name: "partition_claim_release_failed",
+          event_name: 'partition_claim_release_failed',
           consumer_group: consumer_group,
           topic: topic,
           partition_key: partition_key,
@@ -142,12 +142,33 @@ module OutboxRelay
       private
 
       def get_or_create_consumer_offset
-        OutboxRelay::ConsumerOffset.find_or_create_by!(
+        OutboxRelay::ConsumerOffset.find_or_initialize_for(
           consumer_group: consumer_group_with_partition,
-          topic: topic
-        ) do |offset|
-          offset.last_consumed_sequence = 0
-        end
+          topic: topic,
+          auto_offset_reset: resolve_auto_offset_reset
+        ).tap(&:save!)
+      end
+
+      # Resolve auto_offset_reset from consumer class if available.
+      # Falls back to :latest (safe default) when consumer_class_name is not defined
+      # (e.g., in tests or standalone usage of PartitionClaiming module).
+      #
+      # This ensures new consumer groups respect the consumer's auto_offset_reset setting,
+      # which determines whether they start from the latest position (skip historical events)
+      # or earliest position (process all historical events).
+      def resolve_auto_offset_reset
+        return :latest unless respond_to?(:consumer_class_name) && consumer_class_name
+
+        consumer_class_name.constantize.new(partition_key: partition_key).auto_offset_reset
+      rescue StandardError => e
+        OutboxRelay.logger.warn(
+          event_name: 'auto_offset_reset_resolution_failed',
+          consumer_class: consumer_class_name,
+          partition_key: partition_key,
+          error: e.message,
+          fallback: :latest
+        )
+        :latest
       end
 
       def consumer_group_with_partition
@@ -155,16 +176,16 @@ module OutboxRelay
       end
 
       def build_consumer_instance_id
-        @consumer_instance_id ||= "#{consumer_group}-#{Socket.gethostname}-#{::Process.pid}-p#{partition_key}"
+        @build_consumer_instance_id ||= "#{consumer_group}-#{Socket.gethostname}-#{::Process.pid}-p#{partition_key}"
       end
 
       def exit_gracefully_for_claim_failure
         OutboxRelay.logger.info(
-          event_name: "worker_exiting_claim_unavailable",
+          event_name: 'worker_exiting_claim_unavailable',
           consumer_group: consumer_group,
           topic: topic,
           partition_key: partition_key,
-          message: "Partition already claimed by another worker. Exiting gracefully."
+          message: 'Partition already claimed by another worker. Exiting gracefully.'
         )
 
         # Exit with distinctive code so supervisor can delay restart for this partition
@@ -175,7 +196,7 @@ module OutboxRelay
         # DEBUG level: This is expected behavior when multiple instances compete for partitions.
         # Not a warning - the system is working correctly by rejecting duplicate workers.
         OutboxRelay.logger.debug(
-          event_name: "partition_claim_failed",
+          event_name: 'partition_claim_failed',
           consumer_group: consumer_group,
           topic: topic,
           partition_key: partition_key,
@@ -187,7 +208,7 @@ module OutboxRelay
 
       def log_claim_success(offset)
         OutboxRelay.logger.info(
-          event_name: "partition_claimed",
+          event_name: 'partition_claimed',
           consumer_group: consumer_group,
           topic: topic,
           partition_key: partition_key,
@@ -200,17 +221,17 @@ module OutboxRelay
         current_claimer = begin
           @partition_offset.reload.claimed_by
         rescue ActiveRecord::RecordNotFound
-          "(record deleted)"
+          '(record deleted)'
         end
 
         OutboxRelay.logger.error(
-          event_name: "partition_claim_lost",
+          event_name: 'partition_claim_lost',
           consumer_group: consumer_group,
           topic: topic,
           partition_key: partition_key,
           consumer_instance_id: build_consumer_instance_id,
           current_claimer: current_claimer,
-          message: "Lost partition claim! Another worker took over. Stopping."
+          message: 'Lost partition claim! Another worker took over. Stopping.'
         )
       end
     end
