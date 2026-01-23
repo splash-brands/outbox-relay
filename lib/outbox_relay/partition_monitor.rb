@@ -38,9 +38,21 @@ module OutboxRelay
     # Returns Array of orphaned partition info
     # Orphaned = no active claim (claimed_by is nil or claimed_until expired)
     #
+    # IMPORTANT: Only returns partitions that are in the current configuration.
+    # This filters out stale records from removed consumer groups that may
+    # still exist in the database.
+    #
     # @return [Array<Hash>] List of orphaned partitions with metadata
     def orphaned_partitions
-      ConsumerOffset.orphaned.map do |offset|
+      # Build set of expected consumer_group values (with partition suffix)
+      expected_consumer_groups = expected_partitions.map do |p|
+        "#{p[:consumer_group]}_p#{p[:partition_key]}"
+      end.to_set
+
+      # Filter orphaned records to only include expected partitions
+      ConsumerOffset.orphaned.select do |offset|
+        expected_consumer_groups.include?(offset.consumer_group)
+      end.map do |offset|
         {
           consumer_group: base_consumer_group(offset.consumer_group),
           topic: offset.topic,
@@ -84,6 +96,40 @@ module OutboxRelay
         high_lag: health.select { |p| p[:lag] > threshold },
         timestamp: Time.current.iso8601
       }
+    end
+
+    # Returns ALL unclaimed partitions, including stale records from removed consumer groups.
+    # Use this for cleanup operations to identify records that should be deleted.
+    #
+    # Unlike `orphaned_partitions`, this method does NOT filter by configuration.
+    # Use with caution - these records may be from intentionally removed consumer groups.
+    #
+    # @return [Array<Hash>] List of all unclaimed partitions with metadata
+    def all_unclaimed_partitions
+      ConsumerOffset.orphaned.map do |offset|
+        {
+          consumer_group: base_consumer_group(offset.consumer_group),
+          full_consumer_group: offset.consumer_group,
+          topic: offset.topic,
+          partition_key: extract_partition_key(offset.consumer_group),
+          claimed_until: offset.claimed_until,
+          last_consumed_at: offset.last_consumed_at,
+          in_config: in_expected_partitions?(offset)
+        }
+      end
+    end
+
+    # Returns consumer groups that exist in DB but not in configuration.
+    # These are candidates for cleanup after removing consumer groups from config.
+    #
+    # @return [Array<String>] List of stale consumer group base names
+    def stale_consumer_groups
+      expected_groups = expected_partitions.map { |p| p[:consumer_group] }.uniq.to_set
+
+      ConsumerOffset.pluck(:consumer_group)
+                    .map { |cg| base_consumer_group(cg) }
+                    .uniq
+                    .reject { |cg| expected_groups.include?(cg) }
     end
 
     # Returns lag for a specific partition
@@ -166,6 +212,14 @@ module OutboxRelay
 
     def stale_timeout
       (@configuration&.stale_worker_timeout || Configuration::DEFAULT_STALE_WORKER_TIMEOUT).seconds
+    end
+
+    def in_expected_partitions?(offset)
+      @expected_consumer_groups_set ||= expected_partitions.map do |p|
+        "#{p[:consumer_group]}_p#{p[:partition_key]}"
+      end.to_set
+
+      @expected_consumer_groups_set.include?(offset.consumer_group)
     end
   end
 end
