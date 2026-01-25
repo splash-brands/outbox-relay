@@ -430,7 +430,10 @@ module OutboxRelay
           log_fork_terminated(pid, fork_info, status)
 
           # Generate unique key for this worker
-          worker_key = "#{worker_config.topic}-#{fork_info[:partition_key]}"
+          # IMPORTANT: Must include consumer_group to avoid collision when multiple
+          # consumer groups consume the same topic (e.g., shipstation_order_fulfillment
+          # and monday_order_lifecycle both consuming order_lifecycle topic)
+          worker_key = "#{worker_config.consumer_group}-#{worker_config.topic}-#{fork_info[:partition_key]}"
 
           # Restart the worker unless we're shutting down
           unless stopped?
