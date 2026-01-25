@@ -483,18 +483,8 @@ module OutboxRelay
     #   - Event already processed (offset check)
     #   - Lock held by another worker
     def can_process_event?(event, lock_key)
-      # Check if event was already processed (offset comparison)
-      # This is a defensive check - shouldn't happen often due to fetch_batch filtering
-      if event.sequence <= current_offset.last_consumed_sequence
-        @logger.debug(
-          event_name: 'event_already_processed',
-          event_id: event.event_id,
-          sequence: event.sequence,
-          current_offset: current_offset.last_consumed_sequence,
-          consumer_group: consumer_group
-        )
-        return false
-      end
+      # Skip if already processed by another worker (normal in multi-worker setup)
+      return false if event.sequence <= current_offset.last_consumed_sequence
 
       # Try to acquire session-level lock
       unless acquire_advisory_lock(lock_key)
