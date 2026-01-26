@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Orphaned partition alerts only when lag > 0** - Reduces alert noise by only emitting `partition_health.orphaned` events when there are actually pending events to process. Orphaned partitions with `lag=0` are normal (no events to process, worker released claim). This prevents excessive Sentry/monitoring alerts that can cause rate limiting.
+
+- **Orphaned partition re-check before alert** - Prevents false alerts during container failover by re-checking if a partition is still orphaned before emitting the alert. This eliminates race conditions where a new worker claims the partition between the health report query and alert emission.
+
 - **DLQ cache invalidation** - Immediately invalidate DLQ cache after adding event to prevent retry burn
 
 ## [0.8.0] - 2025-12-15

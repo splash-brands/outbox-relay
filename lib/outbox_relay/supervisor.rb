@@ -330,8 +330,16 @@ module OutboxRelay
       monitor = PartitionMonitor.new(configuration)
       report = monitor.health_report
 
-      # Emit events for orphaned partitions
-      report[:orphaned].each do |partition|
+      # Emit events for orphaned partitions WITH PENDING EVENTS ONLY
+      # Orphaned partitions with lag=0 are normal - no events to process, worker released claim.
+      # Only alert when lag > 0 (events waiting but no worker processing them).
+      #
+      # IMPORTANT: Re-check each partition before emitting to avoid race conditions.
+      # Between the initial health_report query and now, a worker may have claimed the partition.
+      # This prevents false alerts during container failover when new workers are claiming partitions.
+      orphaned_with_lag = report[:orphaned].select { |p| p[:lag].positive? }
+      confirmed_orphaned = orphaned_with_lag.select { |p| still_orphaned?(p) }
+      confirmed_orphaned.each do |partition|
         Instrumentation::PartitionHealth.orphaned(
           consumer_group: partition[:consumer_group],
           topic: partition[:topic],
@@ -365,14 +373,14 @@ module OutboxRelay
         )
       end
 
-      # Log summary if any issues found
-      if report[:orphaned].any? || report[:high_lag].any?
+      # Log summary if any actual issues found (confirmed orphaned with lag, or high lag)
+      if confirmed_orphaned.any? || report[:high_lag].any?
         OutboxRelay.logger.warn(
           event_name: 'partition_health_issues_detected',
           total_partitions: report[:total],
           active_partitions: report[:active],
           stale_partitions: report[:stale],
-          orphaned_count: report[:orphaned].size,
+          orphaned_count: confirmed_orphaned.size,
           high_lag_count: report[:high_lag].size
         )
       end
@@ -657,6 +665,36 @@ module OutboxRelay
 
     def supervised_worker_pids
       forks.keys
+    end
+
+    # Re-check if a partition is still orphaned before emitting an alert.
+    # This prevents race conditions during container failover when workers
+    # are claiming partitions between the health report query and alert emission.
+    #
+    # @param partition [Hash] Partition info from health_report[:orphaned]
+    # @return [Boolean] true if partition is still orphaned, false if now claimed
+    def still_orphaned?(partition)
+      consumer_group_with_partition = "#{partition[:consumer_group]}_p#{partition[:partition_key]}"
+
+      offset = ConsumerOffset.find_by(
+        consumer_group: consumer_group_with_partition,
+        topic: partition[:topic]
+      )
+
+      # If record doesn't exist or has no active claim, it's still orphaned
+      return true unless offset
+
+      !offset.claimed?
+    rescue StandardError => e
+      # On error, assume still orphaned to be safe (will emit alert)
+      OutboxRelay.logger.debug(
+        event_name: 'orphaned_recheck_failed',
+        consumer_group: partition[:consumer_group],
+        topic: partition[:topic],
+        partition_key: partition[:partition_key],
+        error: e.message
+      )
+      true
     end
 
     # Lifecycle callbacks
