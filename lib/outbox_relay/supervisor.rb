@@ -416,7 +416,9 @@ module OutboxRelay
         worker_config = backoff_info[:worker_config]
         partition_key = backoff_info[:partition_key]
 
-        OutboxRelay.logger.info(
+        # DEBUG: Normal operation in multi-container deployments - worker retrying after
+        # another container held the partition claim. Not a warning, expected behavior.
+        OutboxRelay.logger.debug(
           event_name: 'worker_restarting_after_backoff',
           worker_key: worker_key,
           partition_key: partition_key,
@@ -520,7 +522,9 @@ module OutboxRelay
         partition_key: partition_key
       }
 
-      OutboxRelay.logger.info(
+      # DEBUG: This is expected in multi-container deployments where workers compete
+      # for partitions. Not a warning - normal operation when another container holds the claim.
+      OutboxRelay.logger.debug(
         event_name: 'worker_restart_delayed_claim_unavailable',
         worker_key: worker_key,
         worker_name: worker_name,
@@ -547,7 +551,9 @@ module OutboxRelay
           uptime: Time.current - fork_info[:started_at]
         )
       elsif claim_unavailable_exit_status?(status)
-        OutboxRelay.logger.info(
+        # DEBUG: Expected in multi-container deployments - worker exited because
+        # partition was already claimed by another container. Not an error.
+        OutboxRelay.logger.debug(
           event_name: 'worker_terminated_claim_unavailable',
           supervisor_pid: ::Process.pid,
           worker_pid: pid,

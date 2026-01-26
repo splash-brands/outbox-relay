@@ -197,6 +197,11 @@ module OutboxRelay
       # These need to be explicitly included since their sequence is before last_consumed_sequence
       retry_ready_ids = fetch_retry_ready_event_ids
 
+      # Store retry IDs for use in process_event to identify DLQ retries
+      # This is needed because DLQ retry events have sequence <= offset,
+      # but should NOT be skipped by can_process_event? offset check
+      @current_batch_retry_ids = retry_ready_ids.to_set
+
       # Build query for normal events (after current offset) + retry-ready events
       # Using OR to combine: (sequence > offset AND not in DLQ) OR (ready for retry)
       query = OutboxRelay::OutboxEvent
@@ -480,11 +485,19 @@ module OutboxRelay
 
     # Phase 1: Check if event can be processed and acquire session lock
     # Returns false if:
-    #   - Event already processed (offset check)
+    #   - Event already processed (offset check) AND not a DLQ retry
     #   - Lock held by another worker
-    def can_process_event?(event, lock_key)
-      # Skip if already processed by another worker (normal in multi-worker setup)
-      return false if event.sequence <= current_offset.last_consumed_sequence
+    #
+    # @param event [OutboxEvent] The event to check
+    # @param lock_key [Integer] Advisory lock key for this event
+    # @param is_dlq_retry [Boolean] True if this event is being retried from DLQ
+    def can_process_event?(event, lock_key, is_dlq_retry: false)
+      # Skip offset check for DLQ retry events - they have sequence <= offset by definition
+      # (they were already processed and failed, so offset moved past them)
+      if !is_dlq_retry && (event.sequence <= current_offset.last_consumed_sequence)
+        # Skip if already processed by another worker (normal in multi-worker setup)
+        return false
+      end
 
       # Try to acquire session-level lock
       unless acquire_advisory_lock(lock_key)
@@ -555,8 +568,11 @@ module OutboxRelay
 
       lock_key = advisory_lock_key(event)
 
+      # Check if this event is a DLQ retry (sequence may be <= offset, but should be processed)
+      is_dlq_retry = @current_batch_retry_ids&.include?(event.id) || false
+
       # Phase 1: Check offset and acquire session lock
-      return false unless can_process_event?(event, lock_key)
+      return false unless can_process_event?(event, lock_key, is_dlq_retry: is_dlq_retry)
 
       begin
         # Phase 2: Process event OUTSIDE transaction
