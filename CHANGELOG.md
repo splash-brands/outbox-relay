@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-01-26
+
+### Changed
+
+- **Reduced log verbosity for multi-instance deployments** - Changed lifecycle events from INFO to DEBUG level to reduce log volume by ~85% in ECS environments with many instances:
+  - `worker_started` - Now DEBUG (was INFO). Worker starts are frequent when multiple instances compete for partitions.
+  - `heartbeat_started` / `heartbeat_stopped` - Now DEBUG (was INFO). Routine infrastructure noise.
+  - `partition_claimed` / `partition_claim_released` - Now DEBUG (was INFO). Expected behavior in distributed systems.
+  - Removed `topic_description` and `consumer_group_description` from `worker_started` payload to reduce log size.
+
+- **Operational visibility preserved** - Important events remain at actionable levels:
+  - `worker_stopped` - INFO (with total_processed, loop_count for metrics)
+  - `partition_claim_lost` - ERROR (critical: another worker took over)
+  - `heartbeat_*_failed` - ERROR (requires investigation)
+  - Use `rake outbox_relay:status` for operational visibility instead of logs.
+
+## [0.8.5] - 2026-01-25
+
 ### Added
 
 - **PartitionMonitor class** - Detects orphaned partitions and monitors partition health

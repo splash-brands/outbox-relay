@@ -68,8 +68,9 @@ RSpec.describe OutboxRelay::Processes::PartitionClaiming do
         expect(offset.consumer_group).to eq('test-group_p0')
       end
 
-      it 'logs claim success' do
-        expect(OutboxRelay.logger).to receive(:info).with(
+      it 'logs claim success at debug level' do
+        # DEBUG level: Successful claims are routine in multi-instance deployments
+        expect(OutboxRelay.logger).to receive(:debug).with(
           hash_including(event_name: 'partition_claimed')
         )
 
@@ -235,8 +236,9 @@ RSpec.describe OutboxRelay::Processes::PartitionClaiming do
         expect(worker.instance_variable_get(:@partition_claimed)).to be false
       end
 
-      it 'logs release' do
-        expect(OutboxRelay.logger).to receive(:info).with(
+      it 'logs release at debug level' do
+        # DEBUG level: Routine shutdown event, happens on every worker restart
+        expect(OutboxRelay.logger).to receive(:debug).with(
           hash_including(event_name: 'partition_claim_released')
         )
 

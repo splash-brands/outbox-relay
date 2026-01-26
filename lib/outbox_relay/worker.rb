@@ -63,8 +63,8 @@ module OutboxRelay
     before_shutdown :release_partition_claim
     before_shutdown :log_worker_stop
 
-    attr_reader :consumer_class_name, :consumer_group, :topic, :partition_key, :batch_size, :max_loops
-    attr_reader :supervisor_db_process
+    attr_reader :consumer_class_name, :consumer_group, :topic, :partition_key, :batch_size, :max_loops,
+                :supervisor_db_process
 
     # Set the supervisor's database process record
     # Called by supervisor before fork to pass its DB record to the worker
@@ -73,7 +73,8 @@ module OutboxRelay
       @supervisor_db_process = supervisor_process
     end
 
-    def initialize(consumer_class:, consumer_group:, topic:, partition_key:, polling_interval: 1.0, batch_size: 100, max_loops: 1000)
+    def initialize(consumer_class:, consumer_group:, topic:, partition_key:, polling_interval: 1.0, batch_size: 100,
+                   max_loops: 1000)
       @consumer_class_name = consumer_class
       @consumer_group = consumer_group
       @topic = topic
@@ -95,7 +96,7 @@ module OutboxRelay
         partition_key: partition_key,
         batch_size: batch_size,
         total_processed: @total_processed,
-        loop_count: @loop_count,
+        loop_count: @loop_count
       )
     end
 
@@ -107,7 +108,7 @@ module OutboxRelay
       # Wrap entire poll cycle in Rails executor for proper context management
       # This ensures database connections, code reloading, and other Rails
       # features work correctly in forked worker processes
-      wrap_in_app_executor(source: "outbox_relay.poll") do
+      wrap_in_app_executor(source: 'outbox_relay.poll') do
         consumer = instantiate_consumer
 
         # Process one batch
@@ -124,17 +125,17 @@ module OutboxRelay
         # Determine next poll delay based on work availability
         calculate_next_delay(consumer, count)
       end
-    rescue => e
+    rescue StandardError => e
       # Handle thread-level errors using AppExecutor pattern
       handle_thread_error(e)
 
       OutboxRelay.logger.error(
-        event_name: "worker_poll_error",
+        event_name: 'worker_poll_error',
         process_id: process_id,
         consumer_class: consumer_class_name,
         partition_key: partition_key,
         error: e.message,
-        backtrace: e.backtrace&.first(10)&.join("\n"),
+        backtrace: e.backtrace&.first(10)&.join("\n")
       )
 
       # Report to Sentry - worker poll errors are CRITICAL because:
@@ -215,14 +216,14 @@ module OutboxRelay
     #   - CPU usage: ~0.01% per worker
     #
     def calculate_next_delay(consumer, processed_count)
-      if processed_count > 0
+      if processed_count.positive?
         # We processed some events - check for backlog
         lag = consumer.lag
 
         if lag > batch_size
           # Significant backlog - poll again immediately
           0.01 # 10ms delay to prevent tight loop
-        elsif lag > 0
+        elsif lag.positive?
           # Some events pending - poll quickly
           0.1 # 100ms delay
         else
@@ -233,14 +234,14 @@ module OutboxRelay
         # No events processed - use normal polling interval
         polling_interval
       end
-    rescue => e
+    rescue StandardError => e
       OutboxRelay.logger.error(
-        event_name: "worker_delay_calculation_error",
+        event_name: 'worker_delay_calculation_error',
         process_id: process_id,
         processed_count: processed_count,
         error: e.message,
         error_class: e.class.name,
-        backtrace: e.backtrace&.first(5)&.join("\n"),
+        backtrace: e.backtrace&.first(5)&.join("\n")
       )
 
       OutboxRelay::Instrumentation::Worker.delay_calculation_error(
@@ -257,11 +258,11 @@ module OutboxRelay
       # but prevents exacerbating database problems during outages
       # DEBUG: The ERROR was already logged above, this just explains the fallback behavior
       OutboxRelay.logger.debug(
-        event_name: "using_conservative_delay_on_lag_failure",
+        event_name: 'using_conservative_delay_on_lag_failure',
         process_id: process_id,
         processed_count: processed_count,
         fallback_delay: polling_interval,
-        reason: "Cannot determine lag - using normal polling interval to avoid overwhelming database"
+        reason: 'Cannot determine lag - using normal polling interval to avoid overwhelming database'
       )
 
       polling_interval
@@ -269,19 +270,19 @@ module OutboxRelay
 
     def instantiate_consumer
       consumer_class_name.constantize.new(partition_key: partition_key)
-    rescue => e
+    rescue StandardError => e
       OutboxRelay.logger.error(
-        event_name: "consumer_instantiation_failed",
+        event_name: 'consumer_instantiation_failed',
         consumer_class: consumer_class_name,
         partition_key: partition_key,
-        error: e.message,
+        error: e.message
       )
       raise
     end
 
     def should_send_heartbeat?
       # Send heartbeat every 10 loops or every 10 seconds
-      @loop_count % 10 == 0 || (@last_heartbeat.nil? || Time.current - @last_heartbeat > 10)
+      (@loop_count % 10).zero? || (@last_heartbeat.nil? || Time.current - @last_heartbeat > 10)
     end
 
     def finished?
@@ -299,21 +300,21 @@ module OutboxRelay
       # Now safe to log since heartbeat has been stopped by super
       if supervised? && supervisor_went_away?
         OutboxRelay.logger.warn(
-          event_name: "worker_orphaned_shutting_down",
+          event_name: 'worker_orphaned_shutting_down',
           process_id: process_id,
           name: name,
           supervisor_pid: @supervisor_pid,
           current_ppid: ::Process.ppid,
           total_processed: @total_processed,
-          loop_count: @loop_count,
+          loop_count: @loop_count
         )
       else
         OutboxRelay.logger.info(
-          event_name: "worker_shutting_down",
+          event_name: 'worker_shutting_down',
           process_id: process_id,
           name: name,
           total_processed: @total_processed,
-          loop_count: @loop_count,
+          loop_count: @loop_count
         )
       end
     end
@@ -343,8 +344,13 @@ module OutboxRelay
     def print_startup_banner
       # Log structured data instead of ASCII banner
       # LogSubscriber already handles the visual presentation with start_process event
-      log_data = {
-        event_name: "worker_started",
+      #
+      # DEBUG level: Worker starts are frequent in multi-instance deployments (ECS).
+      # Each instance spawns workers for all partitions, but only claim holders run.
+      # With 55+ instances and 18 workers each, INFO level would flood logs.
+      # Use `rake outbox_relay:status` for operational visibility instead.
+      OutboxRelay.logger.debug(
+        event_name: 'worker_started',
         process_id: process_id,
         name: name,
         consumer_class: consumer_class_name,
@@ -353,33 +359,20 @@ module OutboxRelay
         partition_key: partition_key,
         polling_interval: polling_interval,
         batch_size: batch_size
-      }
-
-      # Add optional descriptions if available
-      if OutboxRelay.configuration.consumer_group_configs[consumer_group]
-        description = OutboxRelay.configuration.consumer_group_configs[consumer_group]["description"]
-        log_data[:consumer_group_description] = description if description.present?
-      end
-
-      if OutboxRelay.configuration.topic_descriptions[topic]
-        log_data[:topic_description] = OutboxRelay.configuration.topic_descriptions[topic]
-      end
-
-      OutboxRelay.logger.info(log_data)
+      )
     end
 
     def log_worker_stop
       OutboxRelay.logger.info(
-        event_name: "worker_stopped",
+        event_name: 'worker_stopped',
         process_id: process_id,
         name: name,
         consumer_class: consumer_class_name,
         topic: topic,
         partition_key: partition_key,
         total_processed: @total_processed,
-        loop_count: @loop_count,
+        loop_count: @loop_count
       )
     end
-
   end
 end

@@ -24,7 +24,7 @@ module OutboxRelay
       # Start automatic heartbeat after boot
       # Called automatically by runnable lifecycle
       def start_heartbeat
-        return unless registered?  # Only start if registration succeeded
+        return unless registered? # Only start if registration succeeded
 
         # Lazy initialize heartbeat state if not already set
         # This handles cases where initialize chain wasn't called
@@ -34,7 +34,7 @@ module OutboxRelay
 
         @heartbeat_task = Concurrent::TimerTask.new(
           execution_interval: @heartbeat_interval,
-          run_now: false  # Don't run immediately, first heartbeat after interval
+          run_now: false # Don't run immediately, first heartbeat after interval
         ) do
           # Timer callback - wrap in executor to manage database connections properly
           # Primary error handling in Registrable#heartbeat
@@ -54,15 +54,18 @@ module OutboxRelay
 
         @heartbeat_task.execute
 
-        OutboxRelay.logger.info(
-          event_name: "heartbeat_started",
+        # DEBUG level: Heartbeat lifecycle is routine infrastructure noise.
+        # Every worker logs this at startup - floods logs in multi-instance deployments.
+        # Heartbeat *failures* remain ERROR level for alerting.
+        OutboxRelay.logger.debug(
+          event_name: 'heartbeat_started',
           process_id: process_id,
           interval: @heartbeat_interval,
           max_failures: @max_heartbeat_failures
         )
-      rescue => e
+      rescue StandardError => e
         OutboxRelay.logger.error(
-          event_name: "heartbeat_start_failed",
+          event_name: 'heartbeat_start_failed',
           process_id: process_id,
           error: e.message,
           error_class: e.class.name,
@@ -92,7 +95,7 @@ module OutboxRelay
           # Force kill if it doesn't stop gracefully
           @heartbeat_task.kill
           OutboxRelay.logger.warn(
-            event_name: "heartbeat_force_killed",
+            event_name: 'heartbeat_force_killed',
             process_id: process_id,
             reason: "Task didn't stop within 5 seconds"
           )
@@ -100,13 +103,14 @@ module OutboxRelay
 
         @heartbeat_task = nil
 
-        OutboxRelay.logger.info(
-          event_name: "heartbeat_stopped",
+        # DEBUG level: Routine shutdown event, not actionable
+        OutboxRelay.logger.debug(
+          event_name: 'heartbeat_stopped',
           process_id: process_id
         )
-      rescue => e
+      rescue StandardError => e
         OutboxRelay.logger.error(
-          event_name: "heartbeat_stop_failed",
+          event_name: 'heartbeat_stop_failed',
           process_id: process_id,
           error: e.message,
           error_class: e.class.name
@@ -117,11 +121,11 @@ module OutboxRelay
 
       # Observer callback for heartbeat task errors
       # Called by Concurrent::TimerTask when task itself fails (not heartbeat())
-      def handle_heartbeat_task_error(time, result, exception)
+      def handle_heartbeat_task_error(_time, _result, exception)
         return unless exception
 
         OutboxRelay.logger.error(
-          event_name: "heartbeat_task_error",
+          event_name: 'heartbeat_task_error',
           process_id: process_id,
           error: exception.message,
           error_class: exception.class.name,

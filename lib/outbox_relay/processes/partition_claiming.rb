@@ -118,7 +118,9 @@ module OutboxRelay
         )
 
         if released
-          OutboxRelay.logger.info(
+          # DEBUG level: Routine shutdown event, happens on every worker restart.
+          # Not actionable - claim release is expected behavior.
+          OutboxRelay.logger.debug(
             event_name: 'partition_claim_released',
             consumer_group: consumer_group,
             topic: topic,
@@ -209,7 +211,10 @@ module OutboxRelay
       end
 
       def log_claim_success(offset)
-        OutboxRelay.logger.info(
+        # DEBUG level: Successful claims are routine in multi-instance deployments.
+        # Every worker attempts to claim on startup - only one succeeds per partition.
+        # Claim *failures* and *losses* remain at DEBUG/ERROR for diagnostics.
+        OutboxRelay.logger.debug(
           event_name: 'partition_claimed',
           consumer_group: consumer_group,
           topic: topic,
