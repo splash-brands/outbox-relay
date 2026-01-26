@@ -180,7 +180,9 @@ module OutboxRelay
       end
 
       def exit_gracefully_for_claim_failure
-        OutboxRelay.logger.info(
+        # DEBUG: This is expected behavior in multi-container deployments where multiple
+        # workers compete for the same partition. Not a warning - the system is working correctly.
+        OutboxRelay.logger.debug(
           event_name: 'worker_exiting_claim_unavailable',
           consumer_group: consumer_group,
           topic: topic,

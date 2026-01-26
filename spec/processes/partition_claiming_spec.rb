@@ -100,7 +100,8 @@ RSpec.describe OutboxRelay::Processes::PartitionClaiming do
         expect(OutboxRelay.logger).to receive(:debug).with(
           hash_including(event_name: 'partition_claim_failed')
         )
-        expect(OutboxRelay.logger).to receive(:info).with(
+        # DEBUG level: This is expected behavior in multi-container deployments
+        expect(OutboxRelay.logger).to receive(:debug).with(
           hash_including(event_name: 'worker_exiting_claim_unavailable')
         )
 
