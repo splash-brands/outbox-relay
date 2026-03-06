@@ -13,6 +13,7 @@ module OutboxRelay
     DEFAULT_HEALTH_CHECK_INTERVAL = 30.seconds
 
     after_boot :log_supervisor_start
+    after_boot :prune_dead_processes
     before_shutdown :log_supervisor_stop
 
     class << self
@@ -704,6 +705,24 @@ module OutboxRelay
     end
 
     # Lifecycle callbacks
+
+    def prune_dead_processes
+      pruned = OutboxRelay::Process.prune_dead_processes(timeout: 60)
+      return unless pruned.positive?
+
+      OutboxRelay.logger.info(
+        event_name: 'dead_processes_pruned',
+        process_id: process_id,
+        pruned_count: pruned
+      )
+    rescue StandardError => e
+      OutboxRelay.logger.error(
+        event_name: 'dead_processes_prune_failed',
+        process_id: process_id,
+        error: e.message,
+        error_class: e.class.name
+      )
+    end
 
     def log_supervisor_start
       OutboxRelay.logger.info(
