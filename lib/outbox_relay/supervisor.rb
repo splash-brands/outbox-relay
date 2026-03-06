@@ -13,7 +13,6 @@ module OutboxRelay
     DEFAULT_HEALTH_CHECK_INTERVAL = 30.seconds
 
     after_boot :log_supervisor_start
-    after_boot :prune_dead_processes
     before_shutdown :log_supervisor_stop
 
     class << self
@@ -74,6 +73,7 @@ module OutboxRelay
         run_callbacks(:boot) do
           sync_std_streams
           register
+          prune_dead_processes
           start_heartbeat # Start automatic heartbeat after registration
           register_signal_handlers
           set_procline
@@ -720,7 +720,8 @@ module OutboxRelay
         event_name: 'dead_processes_prune_failed',
         process_id: process_id,
         error: e.message,
-        error_class: e.class.name
+        error_class: e.class.name,
+        backtrace: e.backtrace&.first(10)&.join("\n")
       )
     end
 

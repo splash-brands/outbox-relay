@@ -226,8 +226,8 @@ RSpec.describe OutboxRelay::Process do
 
     it 'returns count of pruned processes' do
       3.times do |i|
-        p = described_class.register(kind: 'supervisor', name: "dead-#{i}", workers_count: 0, uptime: 0)
-        p.update_column(:last_heartbeat_at, 5.minutes.ago)
+        dead_process = described_class.register(kind: 'supervisor', name: "dead-#{i}", workers_count: 0, uptime: 0)
+        dead_process.update_column(:last_heartbeat_at, 5.minutes.ago)
       end
 
       expect(described_class.prune_dead_processes(timeout: 60)).to eq(3)
