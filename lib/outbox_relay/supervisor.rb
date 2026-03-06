@@ -73,6 +73,7 @@ module OutboxRelay
         run_callbacks(:boot) do
           sync_std_streams
           register
+          prune_dead_processes
           start_heartbeat # Start automatic heartbeat after registration
           register_signal_handlers
           set_procline
@@ -704,6 +705,25 @@ module OutboxRelay
     end
 
     # Lifecycle callbacks
+
+    def prune_dead_processes
+      pruned = OutboxRelay::Process.prune_dead_processes(timeout: 60)
+      return unless pruned.positive?
+
+      OutboxRelay.logger.info(
+        event_name: 'dead_processes_pruned',
+        process_id: process_id,
+        pruned_count: pruned
+      )
+    rescue StandardError => e
+      OutboxRelay.logger.error(
+        event_name: 'dead_processes_prune_failed',
+        process_id: process_id,
+        error: e.message,
+        error_class: e.class.name,
+        backtrace: e.backtrace&.first(10)&.join("\n")
+      )
+    end
 
     def log_supervisor_start
       OutboxRelay.logger.info(
