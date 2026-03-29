@@ -177,10 +177,13 @@ module OutboxRelay
     #
     # Use case: Dynamic delay calculation, monitoring dashboards
     def lag
-      # Get latest sequence for this specific partition
-      latest_sequence = OutboxRelay::OutboxEvent.where(topic: topic,
-                                                       partition_key: partition_key).maximum(:sequence) || 0
-      latest_sequence - current_offset.last_consumed_sequence
+      # Count actual events after the consumer's offset for this specific partition.
+      # Previously used max_sequence - last_consumed_sequence, but sequence numbers
+      # are global across all topics, so the gap overstates real backlog.
+      OutboxRelay::OutboxEvent
+        .where(topic: topic, partition_key: partition_key)
+        .where('sequence > ?', current_offset.last_consumed_sequence)
+        .count
     end
 
     private

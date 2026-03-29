@@ -156,7 +156,7 @@ RSpec.describe OutboxRelay::PartitionMonitor do
       health = monitor.partition_health
       partition_0 = health.find { |h| h[:partition_key].zero? }
 
-      expect(partition_0[:lag]).to eq(50) # 150 - 100
+      expect(partition_0[:lag]).to eq(1) # 1 event with sequence > 100
     end
   end
 
@@ -191,14 +191,16 @@ RSpec.describe OutboxRelay::PartitionMonitor do
         claimed_until: nil
       )
 
-      # Create high-lag event
-      OutboxRelay::OutboxEvent.create!(
-        topic: topic,
-        event_name: 'test.event',
-        payload: {},
-        partition_key: 2,
-        sequence: 200
-      )
+      # Create enough events on partition 2 to exceed lag threshold (default: 100)
+      101.times do |_i|
+        OutboxRelay::OutboxEvent.create!(
+          topic: topic,
+          event_name: 'test.event',
+          payload: {},
+          partition_key: 2,
+          sequence: OutboxRelay::OutboxEvent.next_sequence
+        )
+      end
     end
 
     it 'returns total partition count' do
@@ -266,7 +268,7 @@ RSpec.describe OutboxRelay::PartitionMonitor do
         partition_key: 0
       )
 
-      expect(lag).to eq(150) # 250 - 100
+      expect(lag).to eq(1) # 1 event with sequence > 100
     end
 
     it 'returns 0 for non-existent partition' do

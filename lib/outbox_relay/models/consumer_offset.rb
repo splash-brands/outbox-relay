@@ -149,19 +149,15 @@ module OutboxRelay
     end
 
     def lag
-      # IMPORTANT: Calculates GLOBAL lag across all partitions for this topic
-      # This may not accurately reflect lag for partition-specific consumers
+      # Count actual events after the consumer's offset across ALL partitions for this topic.
+      # Previously used max_sequence - last_consumed_sequence, but sequence numbers
+      # are global across all topics, so the gap overstates real backlog.
       #
-      # For accurate partition-specific lag, use OutboxConsumer#lag instead
-      # (lib/outbox_relay/models/outbox_consumer.rb:137-141), which filters by partition_key
-      #
-      # Example:
-      #   consumer = MyConsumer.new(partition_key: 0)
-      #   partition_lag = consumer.lag  # Lag for partition 0 only
-      #
-      # This method is primarily for monitoring overall topic health
-      latest_sequence = OutboxRelay::OutboxEvent.where(topic: topic).maximum(:sequence) || 0
-      latest_sequence - last_consumed_sequence
+      # For partition-specific lag, use OutboxConsumer#lag instead.
+      OutboxRelay::OutboxEvent
+        .where(topic: topic)
+        .where('sequence > ?', last_consumed_sequence)
+        .count
     end
 
     def active?
