@@ -189,12 +189,13 @@ module OutboxRelay
     def calculate_lag(offset)
       return 0 unless offset
 
-      # Get latest sequence for this topic and partition
-      latest_sequence = OutboxEvent
-                        .where(topic: offset.topic, partition_key: extract_partition_key(offset.consumer_group))
-                        .maximum(:sequence) || 0
-
-      [latest_sequence - (offset.last_consumed_sequence || 0), 0].max
+      # Count actual events after the consumer's offset for this topic and partition.
+      # Previously used max_sequence - last_consumed_sequence, but sequence numbers
+      # are global across all topics, so the gap wildly overstates real backlog.
+      OutboxEvent
+        .where(topic: offset.topic, partition_key: extract_partition_key(offset.consumer_group))
+        .where('sequence > ?', offset.last_consumed_sequence || 0)
+        .count
     end
 
     def extract_partition_key(consumer_group)

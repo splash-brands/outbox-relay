@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-03-29
+
+### Fixed
+
+- **Accurate lag calculation** - All lag metrics (`PartitionMonitor#calculate_lag`, `OutboxConsumer#lag`, `ConsumerOffset#lag`) now use `COUNT(*)` of events after the consumer's offset instead of `max_sequence - last_consumed_sequence`. The old sequence-gap formula wildly overstated lag because sequence numbers are global across all topics. A consumer filtering for rare event types could show 194k "lag" when actual pending events were 0.
+
 ## [0.8.6] - 2026-01-26
 
 ### Changed
