@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require "zlib"
+require 'zlib'
 
 module OutboxRelay
   # Service class for publishing events to the outbox with automatic partition calculation
@@ -37,7 +37,11 @@ module OutboxRelay
       # @param headers [Hash] Additional headers including event_name and partition_key
       # @option headers [String] :event_name The event type (e.g., "created", "updated")
       # @option headers [String] :partition_key String key for partition distribution
-      # @param expires_at [Time, nil] Optional expiration time for the event
+      # @param opts [Hash] Optional keyword arguments
+      # @option opts [Time, nil] :expires_at Event expiration time
+      #   - Not passed: falls back to OutboxRelay.default_event_ttl (if set)
+      #   - Explicit Time: used as-is
+      #   - Explicit nil: event never expires (opt-out from default TTL)
       #
       # @return [OutboxRelay::OutboxEvent] The created event
       #
@@ -53,30 +57,40 @@ module OutboxRelay
       #     }
       #   )
       #
-      # @example With expiration
+      # @example With explicit expiration
       #   OutboxPublisher.publish(
       #     topic: "temporary_events",
       #     payload: { session_id: "abc123" },
       #     headers: { event_name: "heartbeat" },
       #     expires_at: 5.minutes.from_now
       #   )
-      def publish(topic:, payload:, headers: {}, expires_at: nil)
+      #
+      # @example Opt out of default TTL (never expire)
+      #   OutboxPublisher.publish(
+      #     topic: "audit_log",
+      #     payload: { action: "user_deleted" },
+      #     headers: { event_name: "deleted" },
+      #     expires_at: nil
+      #   )
+      def publish(topic:, payload:, headers: {}, **opts)
         # Validate parameters first (ArgumentError bubbles up directly)
         validate_parameters!(topic: topic, payload: payload, headers: headers)
 
+        expires_at = resolve_expires_at(opts)
+
         # Extract and normalize headers
-        event_name = headers[:event_name] || headers["event_name"]
-        partition_key_string = headers[:partition_key] || headers["partition_key"]
+        event_name = headers[:event_name] || headers['event_name']
+        partition_key_string = headers[:partition_key] || headers['partition_key']
 
         # Calculate numeric partition key from string key using CRC32
         partition_key = if partition_key_string.present?
-          calculate_partition_key(partition_key_string, topic)
-        else
-          0 # Default partition
-        end
+                          calculate_partition_key(partition_key_string, topic)
+                        else
+                          0 # Default partition
+                        end
 
         # Remove event_name and partition_key from headers since they're stored as separate fields
-        filtered_headers = headers.except(:event_name, "event_name", :partition_key, "partition_key")
+        filtered_headers = headers.except(:event_name, 'event_name', :partition_key, 'partition_key')
 
         # Create the event
         OutboxRelay::OutboxEvent.create!(
@@ -121,7 +135,7 @@ module OutboxRelay
         partition = crc % partition_count
 
         OutboxRelay.logger&.debug(
-          event_name: "partition_calculated",
+          event_name: 'partition_calculated',
           topic: topic,
           partition_key_string: key,
           partition_key_numeric: partition,
@@ -151,15 +165,30 @@ module OutboxRelay
       #
       # @raise [ArgumentError] If parameters are invalid
       def validate_parameters!(topic:, payload:, headers:)
-        raise ArgumentError, "topic must be present" if topic.blank?
-        raise ArgumentError, "payload must be a Hash or Array" unless payload.is_a?(Hash) || payload.is_a?(Array)
-        raise ArgumentError, "headers must be a Hash" unless headers.is_a?(Hash)
+        raise ArgumentError, 'topic must be present' if topic.blank?
+        raise ArgumentError, 'payload must be a Hash or Array' unless payload.is_a?(Hash) || payload.is_a?(Array)
+        raise ArgumentError, 'headers must be a Hash' unless headers.is_a?(Hash)
 
         # Validate partition_key if provided
-        partition_key = headers[:partition_key] || headers["partition_key"]
-        if partition_key.present? && !partition_key.respond_to?(:to_s)
-          raise ArgumentError, "partition_key must be convertible to String"
-        end
+        partition_key = headers[:partition_key] || headers['partition_key']
+        return unless partition_key.present? && !partition_key.respond_to?(:to_s)
+
+        raise ArgumentError, 'partition_key must be convertible to String'
+      end
+
+      # Resolves effective expires_at for the event.
+      #
+      # Semantics (distinguishes "not passed" from "passed as nil"):
+      # - opts does not contain :expires_at → fall back to OutboxRelay.default_event_ttl
+      # - opts contains :expires_at (even nil) → use as-is (explicit opt-out when nil)
+      #
+      # @param opts [Hash] keyword arguments passed to publish
+      # @return [Time, nil]
+      def resolve_expires_at(opts)
+        return opts[:expires_at] if opts.key?(:expires_at)
+
+        ttl = OutboxRelay.default_event_ttl
+        ttl&.from_now
       end
     end
   end

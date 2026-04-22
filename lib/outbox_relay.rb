@@ -24,6 +24,18 @@ module OutboxRelay
   mattr_accessor :shutdown_timeout, default: 30.seconds
   mattr_accessor :silence_polling, default: true
 
+  # Retention configuration
+  # When set, OutboxPublisher applies expires_at = default_event_ttl.from_now
+  # unless the caller passes an explicit :expires_at (even nil).
+  mattr_accessor :default_event_ttl, default: nil
+  # When set, CleanupExpiredEventsJob deletes resolved/reprocessed/ignored
+  # DLQ entries older than this TTL.
+  mattr_accessor :dlq_resolved_ttl, default: nil
+  # Whether the CleanupExpiredEventsJob actually runs (default: disabled).
+  mattr_accessor :cleanup_enabled, default: false
+  # Max events/DLQ rows deleted per job invocation.
+  mattr_accessor :cleanup_batch_size, default: 10_000
+
   # Callbacks
   mattr_accessor :on_thread_error
 

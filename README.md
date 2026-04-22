@@ -1715,17 +1715,68 @@ end
 
 ### Event Expiration
 
+Events can carry an `expires_at` timestamp. The `CleanupExpiredEventsJob` periodically deletes expired events that have been processed by all consumer groups.
+
+#### Configure a global default TTL
+
 ```ruby
-# Publish with expiration
-OutboxRelay::OutboxEvent.create!(
+# config/initializers/outbox_relay.rb
+Rails.application.config.outbox_relay.default_event_ttl = 14.days
+Rails.application.config.outbox_relay.dlq_resolved_ttl  = 14.days
+Rails.application.config.outbox_relay.cleanup_enabled   = true
+```
+
+With `default_event_ttl` set, every `OutboxPublisher.publish(...)` call that does **not** pass `:expires_at` gets `expires_at = 14.days.from_now` automatically.
+
+#### Per-call control
+
+```ruby
+# Uses default TTL (14 days)
+OutboxPublisher.publish(topic: "orders", payload: { id: 1 }, headers: { event_name: "created" })
+
+# Explicit expiration overrides the default
+OutboxPublisher.publish(
   topic: "temporary_events",
-  event_name: "session_update",
   payload: data,
-  expires_at: 1.hour.from_now
+  headers: { event_name: "heartbeat" },
+  expires_at: 5.minutes.from_now
 )
 
-# Cleanup expired events (add to cron)
-OutboxRelay::OutboxEvent.where("expires_at < ?", Time.current).delete_all
+# Opt out of the default: event never expires
+OutboxPublisher.publish(
+  topic: "audit_log",
+  payload: { action: "user_deleted" },
+  headers: { event_name: "deleted" },
+  expires_at: nil
+)
+```
+
+#### Schedule the cleanup job
+
+With Sidekiq Enterprise periodic jobs:
+
+```ruby
+Sidekiq.configure_server do |config|
+  config.periodic do |mgr|
+    mgr.register("0 3 * * *", "OutboxRelay::Jobs::CleanupExpiredEventsJob")
+  end
+end
+```
+
+The job:
+
+- Deletes events where `expires_at < now` **and** the sequence has been consumed by every consumer group for that topic (safe against data loss).
+- Deletes `DeadLetterEvent` rows with terminal `resolution_status` (`resolved`, `reprocessed`, `ignored`) older than `dlq_resolved_ttl`. `unresolved` and `retrying` entries are **never** deleted automatically.
+- Emits `cleanup_completed.outbox_relay` via `ActiveSupport::Notifications` with payload `{ events_deleted:, dlq_deleted:, duration: }`.
+
+#### Monitoring
+
+```ruby
+ActiveSupport::Notifications.subscribe("cleanup_completed.outbox_relay") do |_, _, _, _, payload|
+  MyStatsd.gauge("outbox_relay.cleanup.events_deleted", payload[:events_deleted])
+  MyStatsd.gauge("outbox_relay.cleanup.dlq_deleted",    payload[:dlq_deleted])
+  MyStatsd.histogram("outbox_relay.cleanup.duration",   payload[:duration])
+end
 ```
 
 ### Multi-Tenant Events

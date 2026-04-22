@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-04-22
+
+### Added
+
+- **`OutboxRelay.default_event_ttl`** – optional module-level default TTL applied by `OutboxPublisher.publish` when the caller does not pass `:expires_at`. When set, every published event gets `expires_at = default_event_ttl.from_now`. Callers can opt out of the default by passing `expires_at: nil` explicitly (event never expires) or override with any `Time`.
+- **`OutboxRelay.dlq_resolved_ttl`** – optional module-level TTL for resolved DLQ entries. When set, `CleanupExpiredEventsJob` also deletes dead-letter rows with `resolution_status IN (resolved, reprocessed, ignored)` older than the TTL. Unresolved / retrying entries are preserved unconditionally.
+- **`OutboxRelay.cleanup_enabled` / `OutboxRelay.cleanup_batch_size`** as module-level `mattr_accessor`s so they can be configured via `Rails.application.config.outbox_relay.*` and propagated by the Rails engine. Previously these lived only on the (frozen) `OutboxRelay.configuration` object and could not be set from host apps in production.
+- **`cleanup_completed.outbox_relay` ActiveSupport::Notifications event** emitted by `CleanupExpiredEventsJob` on every run with payload `{ events_deleted:, dlq_deleted:, duration: }`. Host apps can subscribe to push metrics to their monitoring backend (Datadog, Prometheus, etc.) without the gem taking a dependency on any specific one.
+- `CleanupExpiredEventsJob#perform` now returns `{ events_deleted:, dlq_deleted:, duration: }`.
+
+### Changed
+
+- `OutboxPublisher.publish` signature: `expires_at: nil` → `**opts`. The publisher now distinguishes "key not passed" (applies `default_event_ttl`) from "explicit `nil`" (never expires). Backwards-compatible: all existing callers that pass `expires_at: <Time>` or omit it entirely behave identically when `default_event_ttl` is not configured.
+- `CleanupExpiredEventsJob`:
+  - Reads `cleanup_enabled` / `cleanup_batch_size` from the module-level accessors instead of the frozen configuration instance.
+  - Rewrote the SQL filter `sequence < ALL(SELECT COALESCE(MIN(...)))` to `sequence < (SELECT COALESCE(MIN(...)))`. Single-value subquery makes these equivalent and portable across PostgreSQL and SQLite (used in tests).
+
 ## [0.8.7] - 2026-03-29
 
 ### Fixed
