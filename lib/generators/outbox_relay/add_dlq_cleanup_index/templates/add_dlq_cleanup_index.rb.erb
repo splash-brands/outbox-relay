@@ -1,0 +1,19 @@
+# frozen_string_literal: true
+
+# Adds the partial index used by OutboxRelay::Jobs::CleanupExpiredEventsJob
+# to sweep resolved DLQ entries by `resolved_at`.
+#
+# Run with: rails generate outbox_relay:add_dlq_cleanup_index
+class AddDlqCleanupIndexToOutboxRelayDeadLetterEvents < ActiveRecord::Migration<%= migration_version %>
+  disable_ddl_transaction!
+
+  def change
+    add_index(
+      :outbox_relay_dead_letter_events,
+      :resolved_at,
+      name: "idx_dlq_resolved_at_cleanup",
+      where: "resolution_status IN ('resolved','reprocessed','ignored') AND resolved_at IS NOT NULL",
+      algorithm: :concurrently
+    )
+  end
+end

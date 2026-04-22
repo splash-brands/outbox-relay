@@ -154,6 +154,16 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
       where: "resolution_status = 'retrying'"
     )
 
+    # Partial index for CleanupExpiredEventsJob DLQ retention sweep.
+    # Covers: WHERE resolution_status IN ('resolved','reprocessed','ignored')
+    #         AND resolved_at IS NOT NULL AND resolved_at < ?
+    add_index(
+      :outbox_relay_dead_letter_events,
+      :resolved_at,
+      name: "idx_dlq_resolved_at_cleanup",
+      where: "resolution_status IN ('resolved','reprocessed','ignored') AND resolved_at IS NOT NULL"
+    )
+
     # ============================================================================
     # PROCESS REGISTRY TABLE
     # ============================================================================

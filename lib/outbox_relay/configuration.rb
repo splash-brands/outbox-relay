@@ -7,8 +7,6 @@ module OutboxRelay
     DEFAULT_POLLING_INTERVAL = 1.0 # seconds
     DEFAULT_BATCH_SIZE = 100
     DEFAULT_MAX_LOOPS = 1000 # prevent infinite loops
-    DEFAULT_CLEANUP_ENABLED = false
-    DEFAULT_CLEANUP_BATCH_SIZE = 10_000
 
     # Monitoring defaults
     DEFAULT_LAG_ALERT_THRESHOLD = 100
@@ -16,15 +14,13 @@ module OutboxRelay
     DEFAULT_STALE_WORKER_TIMEOUT = 60 # seconds
 
     attr_accessor :polling_interval, :batch_size, :max_loops, :workers_config, :topic_descriptions,
-                  :consumer_group_configs, :cleanup_enabled, :cleanup_batch_size
+                  :consumer_group_configs
     attr_reader :partitions, :monitoring_config
 
     def initialize(options = {})
       @polling_interval = options[:polling_interval] || DEFAULT_POLLING_INTERVAL
       @batch_size = options[:batch_size] || DEFAULT_BATCH_SIZE
       @max_loops = options[:max_loops] || DEFAULT_MAX_LOOPS
-      @cleanup_enabled = options[:cleanup_enabled] || DEFAULT_CLEANUP_ENABLED
-      @cleanup_batch_size = options[:cleanup_batch_size] || DEFAULT_CLEANUP_BATCH_SIZE
 
       # Load configuration from YAML
       yaml_config = load_from_yaml(options[:base_path])

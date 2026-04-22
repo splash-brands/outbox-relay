@@ -1715,17 +1715,81 @@ end
 
 ### Event Expiration
 
+Events can carry an `expires_at` timestamp. The `CleanupExpiredEventsJob` periodically deletes expired events that have been processed by all consumer groups.
+
+#### Configure a global default TTL
+
 ```ruby
-# Publish with expiration
-OutboxRelay::OutboxEvent.create!(
+# config/initializers/outbox_relay.rb
+Rails.application.config.outbox_relay.default_event_ttl = 14.days
+Rails.application.config.outbox_relay.dlq_resolved_ttl  = 14.days
+Rails.application.config.outbox_relay.cleanup_enabled   = true
+```
+
+With `default_event_ttl` set, every `OutboxPublisher.publish(...)` call that does **not** pass `:expires_at` gets `expires_at = 14.days.from_now` automatically.
+
+Both TTLs **must** be `ActiveSupport::Duration` instances (`14.days`, `6.hours`, etc.). Assigning a bare Integer (`14`) raises `OutboxRelay::ConfigurationError` on first use — the old behavior of silently meaning "14 seconds" is gone. If you're upgrading from the 0.8.x install generator and enabling DLQ retention, run the new index migration first:
+
+```bash
+rails generate outbox_relay:add_dlq_cleanup_index
+rails db:migrate
+```
+
+#### Per-call control
+
+```ruby
+# Uses default TTL (14 days)
+OutboxPublisher.publish(topic: "orders", payload: { id: 1 }, headers: { event_name: "created" })
+
+# Explicit expiration overrides the default
+OutboxPublisher.publish(
   topic: "temporary_events",
-  event_name: "session_update",
   payload: data,
-  expires_at: 1.hour.from_now
+  headers: { event_name: "heartbeat" },
+  expires_at: 5.minutes.from_now
 )
 
-# Cleanup expired events (add to cron)
-OutboxRelay::OutboxEvent.where("expires_at < ?", Time.current).delete_all
+# Opt out of the default: event never expires
+OutboxPublisher.publish(
+  topic: "audit_log",
+  payload: { action: "user_deleted" },
+  headers: { event_name: "deleted" },
+  expires_at: nil
+)
+```
+
+#### Schedule the cleanup job
+
+With Sidekiq Enterprise periodic jobs:
+
+```ruby
+Sidekiq.configure_server do |config|
+  config.periodic do |mgr|
+    mgr.register("0 3 * * *", "OutboxRelay::Jobs::CleanupExpiredEventsJob")
+  end
+end
+```
+
+The job:
+
+- Deletes events where `expires_at < now` **and** the sequence has been consumed by every consumer group for that topic (safe against data loss).
+- Deletes `DeadLetterEvent` rows with terminal `resolution_status` (`resolved`, `reprocessed`, `ignored`) whose `resolved_at` is older than `dlq_resolved_ttl`. TTL is measured from when the entry was marked resolved — entries still in `retrying` or `unresolved` are preserved indefinitely.
+- Emits `outbox_relay.cleanup.completed` via `ActiveSupport::Notifications` after every run — success, timeout, and failure alike — with payload `{ events_deleted:, dlq_deleted:, duration:, error_class:, timeout: }`. Phase-1 counts are preserved even if phase 2 fails.
+
+#### Monitoring
+
+```ruby
+ActiveSupport::Notifications.subscribe("outbox_relay.cleanup.completed") do |_, _, _, _, payload|
+  MyStatsd.gauge("outbox_relay.cleanup.events_deleted", payload[:events_deleted])
+  MyStatsd.gauge("outbox_relay.cleanup.dlq_deleted",    payload[:dlq_deleted])
+  MyStatsd.histogram("outbox_relay.cleanup.duration",   payload[:duration])
+
+  if payload[:timeout]
+    MyStatsd.increment("outbox_relay.cleanup.timeout")
+  elsif payload[:error_class]
+    MyStatsd.increment("outbox_relay.cleanup.error", tags: ["class:#{payload[:error_class]}"])
+  end
+end
 ```
 
 ### Multi-Tenant Events
