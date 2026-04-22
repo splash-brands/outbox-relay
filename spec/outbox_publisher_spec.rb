@@ -333,6 +333,64 @@ RSpec.describe OutboxRelay::OutboxPublisher do
         expect(event.expires_at).to be_nil
       end
     end
+
+    context 'with invalid OutboxRelay.default_event_ttl configured' do
+      around do |example|
+        original = OutboxRelay.default_event_ttl
+        example.run
+      ensure
+        OutboxRelay.default_event_ttl = original
+      end
+
+      it 'raises ConfigurationError when default_event_ttl is a bare Integer' do
+        OutboxRelay.default_event_ttl = 14 # forgot `.days` — silently meant 14 seconds under old code
+
+        expect do
+          described_class.publish(
+            topic: 'order_updates',
+            payload: { order_id: 123 },
+            headers: { event_name: 'created' }
+          )
+        end.to raise_error(OutboxRelay::ConfigurationError, /ActiveSupport::Duration/)
+      end
+
+      it 'raises ConfigurationError when default_event_ttl is a String' do
+        OutboxRelay.default_event_ttl = '14.days'
+
+        expect do
+          described_class.publish(
+            topic: 'order_updates',
+            payload: { order_id: 123 },
+            headers: { event_name: 'created' }
+          )
+        end.to raise_error(OutboxRelay::ConfigurationError, /ActiveSupport::Duration/)
+      end
+
+      it 'does not raise when default_event_ttl is nil (feature disabled)' do
+        OutboxRelay.default_event_ttl = nil
+
+        expect do
+          described_class.publish(
+            topic: 'order_updates',
+            payload: { order_id: 123 },
+            headers: { event_name: 'created' }
+          )
+        end.not_to raise_error
+      end
+    end
+
+    context 'with unknown keyword arguments' do
+      it 'raises ArgumentError on typos like expire_at:' do
+        expect do
+          described_class.publish(
+            topic: 'order_updates',
+            payload: { order_id: 123 },
+            headers: { event_name: 'created' },
+            expire_at: 1.hour.from_now
+          )
+        end.to raise_error(ArgumentError, /expire_at/)
+      end
+    end
   end
 
   describe '.calculate_partition_key' do

@@ -39,7 +39,7 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
     )
   end
 
-  def create_dlq(status:, created_at:, consumer_group: 'g', topic: 'orders')
+  def create_dlq(status:, resolved_at:, created_at: nil, consumer_group: 'g', topic: 'orders')
     OutboxRelay::DeadLetterEvent.create!(
       consumer_group: consumer_group,
       original_topic: topic,
@@ -49,24 +49,30 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       total_retries: 1,
       error_message: 'boom',
       resolution_status: status,
-      created_at: created_at,
-      updated_at: created_at
+      resolved_at: resolved_at,
+      created_at: created_at || resolved_at || Time.current,
+      updated_at: created_at || resolved_at || Time.current
     )
   end
 
   describe '.perform (class method)' do
-    it 'is a no-op when cleanup_enabled is false' do
+    it 'is a no-op when cleanup_enabled is false, leaving data untouched' do
       OutboxRelay.cleanup_enabled = false
-      expect_any_instance_of(described_class).not_to receive(:perform)
+      create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
 
-      described_class.perform
+      expect { described_class.perform }.not_to(change { OutboxRelay::OutboxEvent.count })
     end
 
-    it 'runs the job when cleanup_enabled is true' do
-      expect_any_instance_of(described_class).to receive(:perform).and_return({ events_deleted: 0, dlq_deleted: 0,
-                                                                                duration: 0 })
+    it 'runs real cleanup end-to-end and returns the stats hash' do
+      create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
 
-      described_class.perform
+      result = described_class.perform
+
+      expect(result).to include(events_deleted: 1, dlq_deleted: 0)
+      expect(result[:duration]).to be_a(Numeric)
+      expect(OutboxRelay::OutboxEvent.count).to eq(0)
     end
   end
 
@@ -138,10 +144,10 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
   describe '#perform — DLQ cleanup' do
     before { OutboxRelay.dlq_resolved_ttl = 14.days }
 
-    it 'deletes old resolved DLQ entries' do
-      create_dlq(status: 'resolved', created_at: 20.days.ago)
-      create_dlq(status: 'reprocessed', created_at: 20.days.ago)
-      create_dlq(status: 'ignored', created_at: 20.days.ago)
+    it 'deletes terminal DLQ entries whose resolved_at is older than TTL' do
+      create_dlq(status: 'resolved',    resolved_at: 20.days.ago)
+      create_dlq(status: 'reprocessed', resolved_at: 20.days.ago)
+      create_dlq(status: 'ignored',     resolved_at: 20.days.ago)
 
       result = described_class.new.perform
 
@@ -149,8 +155,18 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       expect(OutboxRelay::DeadLetterEvent.count).to eq(0)
     end
 
+    it 'measures TTL from resolved_at, not created_at' do
+      # Entry created 100 days ago but resolved yesterday → must be preserved.
+      create_dlq(status: 'resolved', created_at: 100.days.ago, resolved_at: 1.day.ago)
+
+      result = described_class.new.perform
+
+      expect(result[:dlq_deleted]).to eq(0)
+      expect(OutboxRelay::DeadLetterEvent.count).to eq(1)
+    end
+
     it 'does NOT delete resolved DLQ entries newer than TTL' do
-      create_dlq(status: 'resolved', created_at: 1.day.ago)
+      create_dlq(status: 'resolved', resolved_at: 1.day.ago)
 
       result = described_class.new.perform
 
@@ -159,8 +175,8 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
     end
 
     it 'does NOT delete unresolved or retrying DLQ entries regardless of age' do
-      create_dlq(status: 'unresolved', created_at: 100.days.ago)
-      create_dlq(status: 'retrying', created_at: 100.days.ago)
+      create_dlq(status: 'unresolved', resolved_at: nil, created_at: 100.days.ago)
+      create_dlq(status: 'retrying',   resolved_at: nil, created_at: 100.days.ago)
 
       result = described_class.new.perform
 
@@ -168,33 +184,149 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       expect(OutboxRelay::DeadLetterEvent.count).to eq(2)
     end
 
-    it 'skips DLQ cleanup entirely when dlq_resolved_ttl is nil' do
-      OutboxRelay.dlq_resolved_ttl = nil
-      create_dlq(status: 'resolved', created_at: 100.days.ago)
+    it 'preserves terminal entries with NULL resolved_at (never went through mark_as_* helpers)' do
+      create_dlq(status: 'resolved', resolved_at: nil, created_at: 100.days.ago)
 
       result = described_class.new.perform
 
       expect(result[:dlq_deleted]).to eq(0)
       expect(OutboxRelay::DeadLetterEvent.count).to eq(1)
     end
+
+    it 'skips DLQ cleanup entirely when dlq_resolved_ttl is nil' do
+      OutboxRelay.dlq_resolved_ttl = nil
+      create_dlq(status: 'resolved', resolved_at: 100.days.ago)
+
+      result = described_class.new.perform
+
+      expect(result[:dlq_deleted]).to eq(0)
+      expect(OutboxRelay::DeadLetterEvent.count).to eq(1)
+    end
+
+    it 'respects cleanup_batch_size for DLQ deletes' do
+      OutboxRelay.cleanup_batch_size = 2
+      3.times { create_dlq(status: 'resolved', resolved_at: 30.days.ago) }
+
+      result = described_class.new.perform
+
+      expect(result[:dlq_deleted]).to eq(2)
+      expect(OutboxRelay::DeadLetterEvent.count).to eq(1)
+    end
+
+    it 'uses strict < inequality on the resolved_at boundary' do
+      # Exactly at ttl.ago → must be preserved (not older than TTL).
+      create_dlq(status: 'resolved', resolved_at: 14.days.ago + 1.second)
+
+      result = described_class.new.perform
+
+      expect(result[:dlq_deleted]).to eq(0)
+      expect(OutboxRelay::DeadLetterEvent.count).to eq(1)
+    end
+
+    it 'raises ConfigurationError when dlq_resolved_ttl is not a Duration' do
+      OutboxRelay.dlq_resolved_ttl = 14 # forgot `.days`
+      create_dlq(status: 'resolved', resolved_at: 30.days.ago)
+
+      expect { described_class.new.perform }
+        .to raise_error(OutboxRelay::ConfigurationError, /ActiveSupport::Duration/)
+    end
   end
 
   describe '#perform — instrumentation' do
-    it 'emits cleanup_completed.outbox_relay with stats' do
+    # Subscribes to the cleanup event for the duration of the block. `captured`
+    # is populated as events arrive and remains accessible after the block,
+    # even if the block raises.
+    def with_cleanup_subscription
+      captured = []
+      subscription = ActiveSupport::Notifications.subscribe('outbox_relay.cleanup.completed') do |_, _, _, _, payload|
+        captured << payload
+      end
+      yield captured
+      captured
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscription) if subscription
+    end
+
+    it 'emits outbox_relay.cleanup.completed with success payload' do
       OutboxRelay.dlq_resolved_ttl = 14.days
       create_event(sequence: 1, expires_at: 1.hour.ago)
       set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
-      create_dlq(status: 'resolved', created_at: 30.days.ago)
+      create_dlq(status: 'resolved', resolved_at: 30.days.ago)
 
-      captured = nil
-      subscription = ActiveSupport::Notifications.subscribe('cleanup_completed.outbox_relay') do |_, _, _, _, payload|
-        captured = payload
+      payloads = with_cleanup_subscription { described_class.new.perform }
+
+      expect(payloads.size).to eq(1)
+      expect(payloads.first).to include(
+        events_deleted: 1,
+        dlq_deleted: 1,
+        error_class: nil,
+        timeout: false
+      )
+      expect(payloads.first[:duration]).to be_a(Numeric)
+    end
+
+    it 'emits notification even on timeout, with preserved phase-1 count and timeout: true' do
+      create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+      OutboxRelay.dlq_resolved_ttl = 14.days
+      create_dlq(status: 'resolved', resolved_at: 30.days.ago)
+
+      fake_timeout = Class.new(StandardError) do
+        def self.name
+          'PG::QueryCanceled'
+        end
+      end
+      stub_const('OutboxRelay::Jobs::CleanupExpiredEventsJob::PG_QUERY_CANCELED', fake_timeout)
+
+      allow_any_instance_of(described_class)
+        .to receive(:delete_resolved_dlq_entries).and_raise(fake_timeout, 'statement timeout')
+
+      result = nil
+      payloads = with_cleanup_subscription do
+        expect { result = described_class.new.perform }.not_to raise_error
       end
 
-      described_class.new.perform
+      expect(result).to include(events_deleted: 1, dlq_deleted: 0, timeout: true)
+      expect(payloads.size).to eq(1)
+      expect(payloads.first).to include(
+        events_deleted: 1,
+        dlq_deleted: 0,
+        timeout: true,
+        error_class: 'PG::QueryCanceled'
+      )
+    end
 
-      expect(captured).to include(events_deleted: 1, dlq_deleted: 1)
-      expect(captured[:duration]).to be_a(Numeric)
+    it 'emits notification and re-raises on unexpected errors' do
+      create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      allow_any_instance_of(described_class)
+        .to receive(:delete_expired_events).and_raise(StandardError, 'kaboom')
+      allow(OutboxRelay::Instrumentation::Models).to receive(:error)
+
+      payloads = with_cleanup_subscription do
+        expect { described_class.new.perform }.to raise_error(StandardError, 'kaboom')
+      end
+
+      expect(payloads.size).to eq(1)
+      expect(payloads.first).to include(
+        events_deleted: 0,
+        dlq_deleted: 0,
+        timeout: false,
+        error_class: 'StandardError'
+      )
+    end
+
+    it 'does not let a buggy notification subscriber mask the cleanup outcome' do
+      create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      subscription = ActiveSupport::Notifications.subscribe('outbox_relay.cleanup.completed') do
+        raise 'subscriber blew up'
+      end
+
+      expect { described_class.new.perform }.not_to raise_error
+      expect(OutboxRelay::OutboxEvent.count).to eq(0)
     ensure
       ActiveSupport::Notifications.unsubscribe(subscription) if subscription
     end

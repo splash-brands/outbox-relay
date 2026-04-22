@@ -11,18 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`OutboxRelay.default_event_ttl`** – optional module-level default TTL applied by `OutboxPublisher.publish` when the caller does not pass `:expires_at`. When set, every published event gets `expires_at = default_event_ttl.from_now`. Callers can opt out of the default by passing `expires_at: nil` explicitly (event never expires) or override with any `Time`.
-- **`OutboxRelay.dlq_resolved_ttl`** – optional module-level TTL for resolved DLQ entries. When set, `CleanupExpiredEventsJob` also deletes dead-letter rows with `resolution_status IN (resolved, reprocessed, ignored)` older than the TTL. Unresolved / retrying entries are preserved unconditionally.
+- **`OutboxRelay.default_event_ttl`** – optional module-level default TTL applied by `OutboxPublisher.publish` when the caller does not pass `:expires_at`. When set, every published event gets `expires_at = default_event_ttl.from_now`. Callers can opt out of the default by passing `expires_at: nil` explicitly (event never expires) or override with any `Time`. Must be an `ActiveSupport::Duration` — bare Integers are rejected with `OutboxRelay::ConfigurationError` (so `OutboxRelay.default_event_ttl = 14` is caught instead of silently meaning "14 seconds").
+- **`OutboxRelay.dlq_resolved_ttl`** – optional module-level TTL for resolved DLQ entries. When set, `CleanupExpiredEventsJob` also deletes dead-letter rows with `resolution_status IN (resolved, reprocessed, ignored)` whose `resolved_at` is older than the TTL. TTL is measured from `resolved_at` (populated by `mark_as_resolved!` / `mark_as_reprocessed!` / `mark_as_ignored!`), not `created_at` — a DLQ entry created months ago but only just resolved is preserved for the full retention window. Unresolved / retrying entries are preserved unconditionally. Same type validation as `default_event_ttl`.
 - **`OutboxRelay.cleanup_enabled` / `OutboxRelay.cleanup_batch_size`** as module-level `mattr_accessor`s so they can be configured via `Rails.application.config.outbox_relay.*` and propagated by the Rails engine. Previously these lived only on the (frozen) `OutboxRelay.configuration` object and could not be set from host apps in production.
-- **`cleanup_completed.outbox_relay` ActiveSupport::Notifications event** emitted by `CleanupExpiredEventsJob` on every run with payload `{ events_deleted:, dlq_deleted:, duration: }`. Host apps can subscribe to push metrics to their monitoring backend (Datadog, Prometheus, etc.) without the gem taking a dependency on any specific one.
-- `CleanupExpiredEventsJob#perform` now returns `{ events_deleted:, dlq_deleted:, duration: }`.
+- **`outbox_relay.cleanup.completed` ActiveSupport::Notifications event** emitted by `CleanupExpiredEventsJob` after every run — success, timeout, or failure — with payload `{ events_deleted:, dlq_deleted:, duration:, error_class:, timeout: }`. Follows the gem-wide `outbox_relay.<category>.<event>` naming so subscribers using the documented `/^outbox_relay\./` regex will see it. On failure, phase-1 deletion counts are preserved in the payload; `error_class` names the exception; `timeout: true` signals `PG::QueryCanceled` was swallowed.
+- `CleanupExpiredEventsJob#perform` now returns the same hash it emits. On timeout the hash additionally carries `timeout: true`; on re-raised errors the job raises after emitting the notification.
+- New generator `rails generate outbox_relay:add_dlq_cleanup_index` to add the partial index (`idx_dlq_resolved_at_cleanup`) that the DLQ retention sweep uses. Fresh installs get this index from the install generator.
 
 ### Changed
 
-- `OutboxPublisher.publish` signature: `expires_at: nil` → `**opts`. The publisher now distinguishes "key not passed" (applies `default_event_ttl`) from "explicit `nil`" (never expires). Backwards-compatible: all existing callers that pass `expires_at: <Time>` or omit it entirely behave identically when `default_event_ttl` is not configured.
+- `OutboxPublisher.publish` signature: `expires_at: nil` → `**opts`. The publisher now distinguishes "key not passed" (applies `default_event_ttl`) from "explicit `nil`" (never expires). Unknown keyword arguments are rejected with `ArgumentError` (so `expire_at:` typos still fail fast). Backwards-compatible for existing callers that pass `expires_at: <Time>` or omit it entirely.
+- `OutboxPublisher.publish` no longer wraps every `StandardError` in `PublishError`. Only `ActiveRecord::RecordInvalid` is reclassified (preserves the existing contract). `ActiveRecord::ConnectionNotEstablished`, PG driver errors, `OutboxRelay::ConfigurationError`, and programmer errors (`NoMethodError`, `NameError`) propagate as their original class, so callers can handle them distinctly.
 - `CleanupExpiredEventsJob`:
   - Reads `cleanup_enabled` / `cleanup_batch_size` from the module-level accessors instead of the frozen configuration instance.
   - Rewrote the SQL filter `sequence < ALL(SELECT COALESCE(MIN(...)))` to `sequence < (SELECT COALESCE(MIN(...)))`. Single-value subquery makes these equivalent and portable across PostgreSQL and SQLite (used in tests).
+  - DLQ retention now keys off `resolved_at` instead of `created_at` (see above).
+  - Instrumentation moved to an `ensure` block so the notification fires on every run. Notification-subscriber errors are isolated and no longer misclassify as cleanup failures.
+
+### Removed
+
+- `OutboxRelay::Configuration#cleanup_enabled` / `#cleanup_batch_size` (and their `DEFAULT_CLEANUP_*` constants). These previously lived on the frozen `OutboxRelay.configuration` instance and were **not** read by the cleanup job — setting them from host code was a silent no-op. Use the module-level `OutboxRelay.cleanup_enabled` / `OutboxRelay.cleanup_batch_size` instead (which also flow from `Rails.application.config.outbox_relay.*`).
 
 ## [0.8.7] - 2026-03-29
 

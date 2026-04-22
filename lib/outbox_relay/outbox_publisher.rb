@@ -73,26 +73,26 @@ module OutboxRelay
       #     expires_at: nil
       #   )
       def publish(topic:, payload:, headers: {}, **opts)
-        # Validate parameters first (ArgumentError bubbles up directly)
+        # Reject unknown keyword arguments loudly. Previously `expires_at:` was
+        # an explicit kwarg, so typos like `expire_at:` raised ArgumentError.
+        # With `**opts` we restore that guarantee.
+        opts.assert_valid_keys(:expires_at)
+
         validate_parameters!(topic: topic, payload: payload, headers: headers)
 
         expires_at = resolve_expires_at(opts)
 
-        # Extract and normalize headers
         event_name = headers[:event_name] || headers['event_name']
         partition_key_string = headers[:partition_key] || headers['partition_key']
 
-        # Calculate numeric partition key from string key using CRC32
         partition_key = if partition_key_string.present?
                           calculate_partition_key(partition_key_string, topic)
                         else
-                          0 # Default partition
+                          0
                         end
 
-        # Remove event_name and partition_key from headers since they're stored as separate fields
         filtered_headers = headers.except(:event_name, 'event_name', :partition_key, 'partition_key')
 
-        # Create the event
         OutboxRelay::OutboxEvent.create!(
           topic: topic,
           event_name: event_name,
@@ -101,13 +101,8 @@ module OutboxRelay
           partition_key: partition_key,
           expires_at: expires_at
         )
-      rescue ArgumentError
-        # Let ArgumentError bubble up directly (for parameter validation)
-        raise
       rescue ActiveRecord::RecordInvalid => e
         raise PublishError, "Failed to publish event: #{e.message}"
-      rescue StandardError => e
-        raise PublishError, "Unexpected error publishing event: #{e.message}"
       end
 
       private
@@ -184,11 +179,21 @@ module OutboxRelay
       #
       # @param opts [Hash] keyword arguments passed to publish
       # @return [Time, nil]
+      # @raise [OutboxRelay::ConfigurationError] if default_event_ttl is set to a non-Duration value
       def resolve_expires_at(opts)
         return opts[:expires_at] if opts.key?(:expires_at)
 
         ttl = OutboxRelay.default_event_ttl
-        ttl&.from_now
+        return nil if ttl.nil?
+
+        unless ttl.is_a?(ActiveSupport::Duration)
+          raise OutboxRelay::ConfigurationError,
+                "OutboxRelay.default_event_ttl must be an ActiveSupport::Duration " \
+                "(e.g. `14.days`); got #{ttl.class}: #{ttl.inspect}. " \
+                'Bare Integers would silently be interpreted as seconds.'
+        end
+
+        ttl.from_now
       end
     end
   end
