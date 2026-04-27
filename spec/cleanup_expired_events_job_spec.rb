@@ -141,6 +141,60 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
     end
   end
 
+  describe '#perform — DLQ FK protection' do
+    # Production has FK outbox_relay_dead_letter_events.outbox_relay_outbox_event_id
+    # → outbox_relay_outbox_events(id) with NO ACTION on delete. Tests run on
+    # SQLite without FK enforcement (see spec/support/database.rb), so these
+    # specs assert the LOGIC that prevents the FK violation, regardless of
+    # whether the DB enforces it.
+
+    it 'does NOT delete an expired+consumed event still referenced by a DLQ entry' do
+      event = create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+      OutboxRelay::DeadLetterEvent.create!(
+        outbox_relay_outbox_event_id: event.id,
+        consumer_group: 'g',
+        original_topic: 'orders',
+        original_sequence: 1,
+        original_event_id: SecureRandom.uuid,
+        original_payload: {},
+        total_retries: 1,
+        error_message: 'boom',
+        resolution_status: 'unresolved',
+        resolved_at: nil
+      )
+
+      result = described_class.new.perform
+
+      expect(result[:events_deleted]).to eq(0)
+      expect(OutboxRelay::OutboxEvent.count).to eq(1)
+    end
+
+    it 'deletes resolved DLQ first, then deletes its formerly-referenced event in the same run' do
+      OutboxRelay.dlq_resolved_ttl = 14.days
+      event = create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+      OutboxRelay::DeadLetterEvent.create!(
+        outbox_relay_outbox_event_id: event.id,
+        consumer_group: 'g',
+        original_topic: 'orders',
+        original_sequence: 1,
+        original_event_id: SecureRandom.uuid,
+        original_payload: {},
+        total_retries: 1,
+        error_message: 'boom',
+        resolution_status: 'resolved',
+        resolved_at: 30.days.ago
+      )
+
+      result = described_class.new.perform
+
+      expect(result).to include(events_deleted: 1, dlq_deleted: 1)
+      expect(OutboxRelay::OutboxEvent.count).to eq(0)
+      expect(OutboxRelay::DeadLetterEvent.count).to eq(0)
+    end
+  end
+
   describe '#perform — DLQ cleanup' do
     before { OutboxRelay.dlq_resolved_ttl = 14.days }
 
@@ -279,18 +333,18 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       stub_const('OutboxRelay::Jobs::CleanupExpiredEventsJob::PG_QUERY_CANCELED', fake_timeout)
 
       allow_any_instance_of(described_class)
-        .to receive(:delete_resolved_dlq_entries).and_raise(fake_timeout, 'statement timeout')
+        .to receive(:delete_expired_events).and_raise(fake_timeout, 'statement timeout')
 
       result = nil
       payloads = with_cleanup_subscription do
         expect { result = described_class.new.perform }.not_to raise_error
       end
 
-      expect(result).to include(events_deleted: 1, dlq_deleted: 0, timeout: true)
+      expect(result).to include(events_deleted: 0, dlq_deleted: 1, timeout: true)
       expect(payloads.size).to eq(1)
       expect(payloads.first).to include(
-        events_deleted: 1,
-        dlq_deleted: 0,
+        events_deleted: 0,
+        dlq_deleted: 1,
         timeout: true,
         error_class: 'PG::QueryCanceled'
       )

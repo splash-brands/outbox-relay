@@ -108,8 +108,10 @@ module OutboxRelay
         @timeout = false
         started_at = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
 
-        @events_deleted = delete_expired_events
+        # DLQ first: deleting resolved DLQ entries frees up FK references on
+        # outbox_events, making them eligible for cleanup in the same run.
         @dlq_deleted = delete_resolved_dlq_entries
+        @events_deleted = delete_expired_events
 
         build_result(duration_since(started_at))
       rescue ActiveRecord::ConnectionNotEstablished, PG_CONNECTION_BAD => e
@@ -141,6 +143,14 @@ module OutboxRelay
       # An event is deleted only if its sequence is strictly less than the minimum
       # last_consumed_sequence across all consumer groups for its topic. This
       # guarantees every consumer group has already processed it.
+      #
+      # Events still referenced by a row in outbox_relay_dead_letter_events are
+      # preserved: production has a FK on outbox_relay_outbox_event_id with no
+      # ON DELETE rule, so deleting a referenced event would fail with
+      # PG::ForeignKeyViolation. Resolved DLQ entries are dropped first by
+      # delete_resolved_dlq_entries, so once the DLQ TTL passes the event
+      # becomes eligible in the next run (or the same run, since DLQ cleanup
+      # runs first).
       def delete_expired_events
         # Subquery returns a single value (MIN), so `< (subquery)` is equivalent to
         # `< ALL(subquery)` and works across both PostgreSQL and SQLite (tests).
@@ -151,6 +161,12 @@ module OutboxRelay
               SELECT COALESCE(MIN(last_consumed_sequence), 0)
               FROM outbox_relay_consumer_offsets
               WHERE topic = outbox_relay_outbox_events.topic
+            )"
+          )
+          .where(
+            "NOT EXISTS (
+              SELECT 1 FROM outbox_relay_dead_letter_events
+              WHERE outbox_relay_dead_letter_events.outbox_relay_outbox_event_id = outbox_relay_outbox_events.id
             )"
           )
           .limit(OutboxRelay.cleanup_batch_size)
