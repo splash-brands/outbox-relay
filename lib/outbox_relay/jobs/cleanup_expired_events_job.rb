@@ -29,14 +29,23 @@ module OutboxRelay
     #
     # Enable cleanup in your OutboxRelay initializer:
     #
-    #   OutboxRelay.cleanup_enabled    = true       # Enable cleanup (default: false)
-    #   OutboxRelay.cleanup_batch_size = 10_000     # Batch per run (default: 10_000)
-    #   OutboxRelay.default_event_ttl  = 14.days    # Publisher default TTL (optional)
-    #   OutboxRelay.dlq_resolved_ttl   = 14.days    # Resolved DLQ TTL (optional)
+    #   OutboxRelay.cleanup_enabled     = true       # Enable cleanup (default: false)
+    #   OutboxRelay.cleanup_batch_size  = 10_000     # Rows per single DELETE chunk (default: 10_000)
+    #   OutboxRelay.cleanup_max_runtime = 30         # Seconds budget per run (default: 30)
+    #   OutboxRelay.default_event_ttl   = 14.days    # Publisher default TTL (optional)
+    #   OutboxRelay.dlq_resolved_ttl    = 14.days    # Resolved DLQ TTL (optional)
     #
     # In Rails these also flow through `Rails.application.config.outbox_relay.*`.
     # Both TTL values must be `ActiveSupport::Duration` instances — bare Integers
     # are rejected to prevent the "I meant 14.days but wrote 14 (seconds)" footgun.
+    # `cleanup_max_runtime` accepts either a bare Integer (seconds) or an
+    # `ActiveSupport::Duration`.
+    #
+    # The job runs each phase (DLQ first, then events) as a loop of
+    # `cleanup_batch_size`-sized DELETEs until either the qualifying rows are
+    # exhausted or `cleanup_max_runtime` elapses. The runtime budget is shared
+    # across both phases. Each phase is guaranteed at least one DELETE chunk
+    # regardless of remaining budget.
     #
     # ## Instrumentation
     #
@@ -44,7 +53,7 @@ module OutboxRelay
     # timeout, or failure:
     #
     #   ActiveSupport::Notifications.subscribe("outbox_relay.cleanup.completed") do |_, _, _, _, payload|
-    #     payload # => { events_deleted:, dlq_deleted:, duration:, error_class:, timeout: }
+    #     payload # => { events_deleted:, dlq_deleted:, duration:, iterations:, error_class:, timeout: }
     #   end
     #
     # `error_class` is nil on success, the exception class name on failure, or
@@ -61,7 +70,7 @@ module OutboxRelay
     #
     #   Sidekiq.configure_server do |config|
     #     config.periodic do |mgr|
-    #       mgr.register("0 3 * * *", "OutboxRelay::Jobs::CleanupExpiredEventsJob")
+    #       mgr.register("*/5 * * * *", "OutboxRelay::Jobs::CleanupExpiredEventsJob")
     #     end
     #   end
     #
