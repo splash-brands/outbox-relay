@@ -200,6 +200,27 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       expect { described_class.new.perform }
         .to raise_error(OutboxRelay::ConfigurationError, /cleanup_max_runtime/)
     end
+
+    it 'raises ConfigurationError when cleanup_max_runtime is negative' do
+      OutboxRelay.cleanup_max_runtime = -1
+      create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      expect { described_class.new.perform }
+        .to raise_error(OutboxRelay::ConfigurationError, /non-negative/)
+    end
+
+    it 'raises ConfigurationError when cleanup_batch_size is not a positive Integer' do
+      create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      [0, -1, '10', nil, 1.5].each do |bad|
+        OutboxRelay.cleanup_batch_size = bad
+        expect { described_class.new.perform }
+          .to raise_error(OutboxRelay::ConfigurationError, /cleanup_batch_size/),
+              "expected ConfigurationError for cleanup_batch_size = #{bad.inspect}"
+      end
+    end
   end
 
   describe '#perform — DLQ FK protection' do
@@ -358,13 +379,14 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
 
       job = described_class.new
-      # Sequence (refer to Task 5's test for the call mapping):
+      # monotonic_now call sequence (deadline = 0 + 30 = 30; values >= 30 trip the break):
       #   1: started_at
-      #   2: deadline base
-      #   3: DLQ iter 1 deadline check (under deadline, continue)
-      #   4: DLQ iter 2 deadline check (past deadline, break)
-      #   5: events iter 1 deadline check (past deadline, break — but iter 1 already ran)
-      #   6+: duration_since calls (build_result + ensure)
+      #   2: deadline base (returns 0 → deadline = 30)
+      #   3: DLQ iter 1 deadline check (0 < 30, continue)
+      #   4: DLQ iter 2 deadline check (100 >= 30, break)
+      #   5: events iter 1 deadline check (100 >= 30, break — but iter 1 already ran per min-one rule)
+      #   6: duration_since in build_result
+      #   7: duration_since in ensure
       allow(job).to receive(:monotonic_now).and_return(0.0, 0.0, 0.0, 100.0, 100.0, 100.0, 100.0)
 
       result = job.perform

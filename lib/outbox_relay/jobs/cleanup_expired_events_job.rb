@@ -159,22 +159,33 @@ module OutboxRelay
       # updating its own accumulators (deleted count AND iteration count) so
       # partial progress survives a mid-loop raise.
       def run_loop(deadline)
+        batch_size = cleanup_batch_size_value
         loop do
           deleted = yield
-          break if deleted < OutboxRelay.cleanup_batch_size
+          break if deleted < batch_size
           break if monotonic_now >= deadline
         end
       end
 
-      def cleanup_max_runtime_seconds
-        raw = OutboxRelay.cleanup_max_runtime
-        unless raw.is_a?(Numeric) || raw.is_a?(ActiveSupport::Duration)
+      def cleanup_batch_size_value
+        value = OutboxRelay.cleanup_batch_size
+        unless value.is_a?(Integer) && value.positive?
           raise OutboxRelay::ConfigurationError,
-                'OutboxRelay.cleanup_max_runtime must be a Numeric (seconds) ' \
-                "or an ActiveSupport::Duration; got #{raw.class}: #{raw.inspect}."
+                'OutboxRelay.cleanup_batch_size must be a positive Integer; ' \
+                "got #{value.class}: #{value.inspect}."
         end
 
-        raw.to_f
+        value
+      end
+
+      def cleanup_max_runtime_seconds
+        raw = OutboxRelay.cleanup_max_runtime
+        seconds = raw.to_f if raw.is_a?(Numeric) || raw.is_a?(ActiveSupport::Duration)
+        return seconds if seconds && seconds >= 0
+
+        raise OutboxRelay::ConfigurationError,
+              'OutboxRelay.cleanup_max_runtime must be a non-negative Numeric ' \
+              "(seconds) or an ActiveSupport::Duration; got #{raw.class}: #{raw.inspect}."
       end
 
       def delete_resolved_dlq_chunk_and_accumulate
