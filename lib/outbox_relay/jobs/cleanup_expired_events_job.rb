@@ -106,12 +106,12 @@ module OutboxRelay
         @dlq_deleted = 0
         @error_class = nil
         @timeout = false
-        started_at = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+        started_at = monotonic_now
 
         # DLQ first: deleting resolved DLQ entries frees up FK references on
         # outbox_events, making them eligible for cleanup in the same run.
-        @dlq_deleted = delete_resolved_dlq_entries
-        @events_deleted = delete_expired_events
+        @dlq_deleted = delete_resolved_dlq_chunk
+        @events_deleted = delete_expired_events_chunk
 
         build_result(duration_since(started_at))
       rescue ActiveRecord::ConnectionNotEstablished, PG_CONNECTION_BAD => e
@@ -151,7 +151,7 @@ module OutboxRelay
       # delete_resolved_dlq_entries, so once the DLQ TTL passes the event
       # becomes eligible in the next run (or the same run, since DLQ cleanup
       # runs first).
-      def delete_expired_events
+      def delete_expired_events_chunk
         # Subquery returns a single value (MIN), so `< (subquery)` is equivalent to
         # `< ALL(subquery)` and works across both PostgreSQL and SQLite (tests).
         OutboxRelay::OutboxEvent
@@ -182,7 +182,7 @@ module OutboxRelay
       # long it spent in `retrying` first.
       #
       # Returns 0 when dlq_resolved_ttl is not configured.
-      def delete_resolved_dlq_entries
+      def delete_resolved_dlq_chunk
         ttl = OutboxRelay.dlq_resolved_ttl
         return 0 if ttl.nil?
 
@@ -208,7 +208,11 @@ module OutboxRelay
       end
 
       def duration_since(started_at)
-        ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) - started_at
+        monotonic_now - started_at
+      end
+
+      def monotonic_now
+        ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
       end
 
       def log_completion(duration)

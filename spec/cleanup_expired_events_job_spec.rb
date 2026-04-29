@@ -333,7 +333,7 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       stub_const('OutboxRelay::Jobs::CleanupExpiredEventsJob::PG_QUERY_CANCELED', fake_timeout)
 
       allow_any_instance_of(described_class)
-        .to receive(:delete_expired_events).and_raise(fake_timeout, 'statement timeout')
+        .to receive(:delete_expired_events_chunk).and_raise(fake_timeout, 'statement timeout')
 
       result = nil
       payloads = with_cleanup_subscription do
@@ -355,7 +355,7 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
 
       allow_any_instance_of(described_class)
-        .to receive(:delete_expired_events).and_raise(StandardError, 'kaboom')
+        .to receive(:delete_expired_events_chunk).and_raise(StandardError, 'kaboom')
       allow(OutboxRelay::Instrumentation::Models).to receive(:error)
 
       payloads = with_cleanup_subscription do
