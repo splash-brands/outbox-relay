@@ -1766,7 +1766,7 @@ With Sidekiq Enterprise periodic jobs:
 ```ruby
 Sidekiq.configure_server do |config|
   config.periodic do |mgr|
-    mgr.register("0 3 * * *", "OutboxRelay::Jobs::CleanupExpiredEventsJob")
+    mgr.register("*/5 * * * *", "OutboxRelay::Jobs::CleanupExpiredEventsJob")
   end
 end
 ```
@@ -1775,7 +1775,8 @@ The job:
 
 - Deletes events where `expires_at < now` **and** the sequence has been consumed by every consumer group for that topic (safe against data loss).
 - Deletes `DeadLetterEvent` rows with terminal `resolution_status` (`resolved`, `reprocessed`, `ignored`) whose `resolved_at` is older than `dlq_resolved_ttl`. TTL is measured from when the entry was marked resolved — entries still in `retrying` or `unresolved` are preserved indefinitely.
-- Emits `outbox_relay.cleanup.completed` via `ActiveSupport::Notifications` after every run — success, timeout, and failure alike — with payload `{ events_deleted:, dlq_deleted:, duration:, error_class:, timeout: }`. Phase-1 counts are preserved even if phase 2 fails.
+- Runs each phase as a loop of `cleanup_batch_size`-sized DELETE chunks until either the qualifying rows are exhausted or the shared `cleanup_max_runtime` budget elapses. Each phase is guaranteed at least one chunk regardless of remaining budget.
+- Emits `outbox_relay.cleanup.completed` via `ActiveSupport::Notifications` after every run — success, timeout, and failure alike — with payload `{ events_deleted:, dlq_deleted:, duration:, iterations: { dlq:, events: }, error_class:, timeout: }`. Counts and iteration totals from completed chunks are preserved even when a later phase fails or times out.
 
 #### Monitoring
 

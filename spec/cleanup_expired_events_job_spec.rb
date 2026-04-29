@@ -153,8 +153,7 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       # monotonic_now calls in order:
       #   1: started_at (perform top)
       #   2: deadline base (deadline = monotonic_now + budget → 0.0 + 30 = 30)
-      #   (DLQ loop: dlq_resolved_ttl is nil → delete_resolved_dlq_chunk returns 0
-      #    immediately; 0 < batch_size=2 → breaks BEFORE the monotonic_now deadline check)
+      #   (DLQ phase is skipped entirely because dlq_resolved_ttl is nil)
       #   3: events iter 1 deadline check (0.0 < 30 → continue)
       #   4: events iter 2 deadline check (100.0 >= 30 → break)
       #   5: duration_since(started_at) in build_result
