@@ -8,14 +8,17 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
     original_enabled = OutboxRelay.cleanup_enabled
     original_batch = OutboxRelay.cleanup_batch_size
     original_dlq_ttl = OutboxRelay.dlq_resolved_ttl
+    original_max_runtime = OutboxRelay.cleanup_max_runtime
     OutboxRelay.cleanup_enabled = true
     OutboxRelay.cleanup_batch_size = 10_000
     OutboxRelay.dlq_resolved_ttl = nil
+    OutboxRelay.cleanup_max_runtime = 30
     example.run
   ensure
     OutboxRelay.cleanup_enabled = original_enabled
     OutboxRelay.cleanup_batch_size = original_batch
     OutboxRelay.dlq_resolved_ttl = original_dlq_ttl
+    OutboxRelay.cleanup_max_runtime = original_max_runtime
   end
 
   def create_event(sequence:, topic: 'orders', expires_at: nil)
@@ -164,6 +167,20 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       expect(result[:events_deleted]).to eq(4)
       expect(OutboxRelay::OutboxEvent.count).to eq(2)
     end
+
+    it 'always runs at least one chunk per phase even with zero runtime budget' do
+      OutboxRelay.cleanup_max_runtime = 0
+      OutboxRelay.cleanup_batch_size = 2
+      4.times { |i| create_event(sequence: i + 1, expires_at: 1.hour.ago) }
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      result = described_class.new.perform
+
+      # First chunk runs (deletes 2), then deadline check fails (now >= now+0), break.
+      # Second chunk does NOT run, leaving 2 events.
+      expect(result[:events_deleted]).to eq(2)
+      expect(OutboxRelay::OutboxEvent.count).to eq(2)
+    end
   end
 
   describe '#perform — DLQ FK protection' do
@@ -308,6 +325,33 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
 
       expect { described_class.new.perform }
         .to raise_error(OutboxRelay::ConfigurationError, /ActiveSupport::Duration/)
+    end
+
+    it 'still runs one events chunk even when DLQ phase consumes the entire budget' do
+      OutboxRelay.cleanup_batch_size = 2
+      # 6 DLQ rows + 4 event rows. We stub the clock to push past deadline after
+      # the 2nd DLQ chunk so the events phase enters with no remaining budget,
+      # but the min-one rule still runs one events chunk.
+      6.times { create_dlq(status: 'resolved', resolved_at: 30.days.ago) }
+      4.times { |i| create_event(sequence: i + 1, expires_at: 1.hour.ago) }
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      job = described_class.new
+      # Sequence (refer to Task 5's test for the call mapping):
+      #   1: started_at
+      #   2: deadline base
+      #   3: DLQ iter 1 deadline check (under deadline, continue)
+      #   4: DLQ iter 2 deadline check (past deadline, break)
+      #   5: events iter 1 deadline check (past deadline, break — but iter 1 already ran)
+      #   6+: duration_since calls (build_result + ensure)
+      allow(job).to receive(:monotonic_now).and_return(0.0, 0.0, 0.0, 100.0, 100.0, 100.0, 100.0)
+
+      result = job.perform
+
+      expect(result[:dlq_deleted]).to eq(4)      # 2 DLQ iterations × 2
+      expect(result[:events_deleted]).to eq(2)   # 1 events iteration × 2 (min-one)
+      expect(OutboxRelay::DeadLetterEvent.count).to eq(2)
+      expect(OutboxRelay::OutboxEvent.count).to eq(2)
     end
   end
 
