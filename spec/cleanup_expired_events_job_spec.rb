@@ -419,6 +419,39 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       )
     end
 
+    it 'preserves accumulated event counts when PG::QueryCanceled fires mid-loop' do
+      OutboxRelay.cleanup_batch_size = 2
+      4.times { |i| create_event(sequence: i + 1, expires_at: 1.hour.ago) }
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      fake_timeout = Class.new(StandardError) do
+        def self.name
+          'PG::QueryCanceled'
+        end
+      end
+      stub_const('OutboxRelay::Jobs::CleanupExpiredEventsJob::PG_QUERY_CANCELED', fake_timeout)
+
+      call_count = 0
+      allow_any_instance_of(described_class)
+        .to receive(:delete_expired_events_chunk).and_wrap_original do |orig, *args|
+          call_count += 1
+          raise fake_timeout, 'statement timeout' if call_count == 2
+
+          orig.call(*args)
+        end
+
+      result = nil
+      payloads = with_cleanup_subscription { result = described_class.new.perform }
+
+      # Iter 1 deleted 2 rows; iter 2 raised. Accumulated count = 2.
+      expect(result).to include(events_deleted: 2, timeout: true)
+      expect(payloads.first).to include(
+        events_deleted: 2,
+        timeout: true,
+        error_class: 'PG::QueryCanceled'
+      )
+    end
+
     it 'emits notification and re-raises on unexpected errors' do
       create_event(sequence: 1, expires_at: 1.hour.ago)
       set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
