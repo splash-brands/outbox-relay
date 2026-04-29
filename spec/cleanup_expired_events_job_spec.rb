@@ -140,6 +140,30 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       expect(result[:events_deleted]).to eq(3)
       expect(OutboxRelay::OutboxEvent.count).to eq(0)
     end
+
+    it 'exits the events loop when the deadline is hit even if rows remain' do
+      OutboxRelay.cleanup_batch_size = 2
+      6.times { |i| create_event(sequence: i + 1, expires_at: 1.hour.ago) }
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      job = described_class.new
+      # monotonic_now calls in order:
+      #   1: started_at (perform top)
+      #   2: deadline base (deadline = monotonic_now + budget → 0.0 + 30 = 30)
+      #   (DLQ loop: dlq_resolved_ttl is nil → delete_resolved_dlq_chunk returns 0
+      #    immediately; 0 < batch_size=2 → breaks BEFORE the monotonic_now deadline check)
+      #   3: events iter 1 deadline check (0.0 < 30 → continue)
+      #   4: events iter 2 deadline check (100.0 >= 30 → break)
+      #   5: duration_since(started_at) in build_result
+      #   6: duration_since(started_at) in ensure block
+      allow(job).to receive(:monotonic_now).and_return(0.0, 0.0, 0.0, 100.0, 100.0, 100.0)
+
+      result = job.perform
+
+      # 2 events iterations × batch_size 2 = 4 deleted (out of 6 qualifying).
+      expect(result[:events_deleted]).to eq(4)
+      expect(OutboxRelay::OutboxEvent.count).to eq(2)
+    end
   end
 
   describe '#perform — DLQ FK protection' do
