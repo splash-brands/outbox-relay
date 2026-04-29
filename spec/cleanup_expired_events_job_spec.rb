@@ -129,15 +129,16 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       expect(OutboxRelay::OutboxEvent.count).to eq(1)
     end
 
-    it 'respects cleanup_batch_size' do
+    it 'loops across multiple chunks until the qualifying set is exhausted' do
       OutboxRelay.cleanup_batch_size = 2
       3.times { |i| create_event(sequence: i + 1, expires_at: 1.hour.ago) }
       set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
 
       result = described_class.new.perform
 
-      expect(result[:events_deleted]).to eq(2)
-      expect(OutboxRelay::OutboxEvent.count).to eq(1)
+      # batch_size=2 + 3 rows → iter1 deletes 2, iter2 deletes 1 (<batch_size, exhausted, exit).
+      expect(result[:events_deleted]).to eq(3)
+      expect(OutboxRelay::OutboxEvent.count).to eq(0)
     end
   end
 

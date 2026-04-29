@@ -104,6 +104,8 @@ module OutboxRelay
       def perform
         @events_deleted = 0
         @dlq_deleted = 0
+        @events_iterations = 0
+        @dlq_iterations = 0
         @error_class = nil
         @timeout = false
         started_at = monotonic_now
@@ -111,7 +113,8 @@ module OutboxRelay
         # DLQ first: deleting resolved DLQ entries frees up FK references on
         # outbox_events, making them eligible for cleanup in the same run.
         @dlq_deleted = delete_resolved_dlq_chunk
-        @events_deleted = delete_expired_events_chunk
+        deadline = monotonic_now + cleanup_max_runtime_seconds
+        @events_iterations = run_loop(deadline) { delete_expired_events_chunk_and_accumulate }
 
         build_result(duration_since(started_at))
       rescue ActiveRecord::ConnectionNotEstablished, PG_CONNECTION_BAD => e
@@ -137,6 +140,33 @@ module OutboxRelay
       end
 
       private
+
+      # Run a deletion phase in chunks until either exhausted (chunk returned
+      # fewer rows than cleanup_batch_size) or the deadline is hit. Always runs
+      # at least one iteration so cleanup_max_runtime = 0 is not a no-op.
+      # The block must return the chunk row count and is responsible for
+      # updating its own accumulator (so partial counts survive a mid-loop
+      # raise). Returns the iteration count.
+      def run_loop(deadline)
+        iterations = 0
+        loop do
+          deleted = yield
+          iterations += 1
+          break if deleted < OutboxRelay.cleanup_batch_size
+          break if monotonic_now >= deadline
+        end
+        iterations
+      end
+
+      def cleanup_max_runtime_seconds
+        OutboxRelay.cleanup_max_runtime.to_f
+      end
+
+      def delete_expired_events_chunk_and_accumulate
+        deleted = delete_expired_events_chunk
+        @events_deleted += deleted
+        deleted
+      end
 
       # Delete expired events that have been fully consumed.
       #
