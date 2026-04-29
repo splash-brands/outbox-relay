@@ -121,9 +121,11 @@ module OutboxRelay
 
         # DLQ first: deleting resolved DLQ entries frees up FK references on
         # outbox_events, making them eligible for cleanup in the same run.
+        # Skipped entirely when dlq_resolved_ttl is unset so iterations[:dlq]
+        # accurately reflects "no DLQ work was done", not "one no-op pass".
         deadline = monotonic_now + cleanup_max_runtime_seconds
-        @dlq_iterations    = run_loop(deadline) { delete_resolved_dlq_chunk_and_accumulate }
-        @events_iterations = run_loop(deadline) { delete_expired_events_chunk_and_accumulate }
+        run_loop(deadline) { delete_resolved_dlq_chunk_and_accumulate } if OutboxRelay.dlq_resolved_ttl
+        run_loop(deadline) { delete_expired_events_chunk_and_accumulate }
 
         build_result(duration_since(started_at))
       rescue ActiveRecord::ConnectionNotEstablished, PG_CONNECTION_BAD => e
@@ -154,32 +156,38 @@ module OutboxRelay
       # fewer rows than cleanup_batch_size) or the deadline is hit. Always runs
       # at least one iteration so cleanup_max_runtime = 0 is not a no-op.
       # The block must return the chunk row count and is responsible for
-      # updating its own accumulator (so partial counts survive a mid-loop
-      # raise). Returns the iteration count.
+      # updating its own accumulators (deleted count AND iteration count) so
+      # partial progress survives a mid-loop raise.
       def run_loop(deadline)
-        iterations = 0
         loop do
           deleted = yield
-          iterations += 1
           break if deleted < OutboxRelay.cleanup_batch_size
           break if monotonic_now >= deadline
         end
-        iterations
       end
 
       def cleanup_max_runtime_seconds
-        OutboxRelay.cleanup_max_runtime.to_f
+        raw = OutboxRelay.cleanup_max_runtime
+        unless raw.is_a?(Numeric) || raw.is_a?(ActiveSupport::Duration)
+          raise OutboxRelay::ConfigurationError,
+                'OutboxRelay.cleanup_max_runtime must be a Numeric (seconds) ' \
+                "or an ActiveSupport::Duration; got #{raw.class}: #{raw.inspect}."
+        end
+
+        raw.to_f
       end
 
       def delete_resolved_dlq_chunk_and_accumulate
         deleted = delete_resolved_dlq_chunk
         @dlq_deleted += deleted
+        @dlq_iterations += 1
         deleted
       end
 
       def delete_expired_events_chunk_and_accumulate
         deleted = delete_expired_events_chunk
         @events_deleted += deleted
+        @events_iterations += 1
         deleted
       end
 
@@ -193,7 +201,7 @@ module OutboxRelay
       # preserved: production has a FK on outbox_relay_outbox_event_id with no
       # ON DELETE rule, so deleting a referenced event would fail with
       # PG::ForeignKeyViolation. Resolved DLQ entries are dropped first by
-      # delete_resolved_dlq_entries, so once the DLQ TTL passes the event
+      # delete_resolved_dlq_chunk, so once the DLQ TTL passes the event
       # becomes eligible in the next run (or the same run, since DLQ cleanup
       # runs first).
       def delete_expired_events_chunk
