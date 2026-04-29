@@ -258,14 +258,14 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       expect(OutboxRelay::DeadLetterEvent.count).to eq(1)
     end
 
-    it 'respects cleanup_batch_size for DLQ deletes' do
+    it 'loops DLQ deletes across multiple chunks until exhausted' do
       OutboxRelay.cleanup_batch_size = 2
       3.times { create_dlq(status: 'resolved', resolved_at: 30.days.ago) }
 
       result = described_class.new.perform
 
-      expect(result[:dlq_deleted]).to eq(2)
-      expect(OutboxRelay::DeadLetterEvent.count).to eq(1)
+      expect(result[:dlq_deleted]).to eq(3)
+      expect(OutboxRelay::DeadLetterEvent.count).to eq(0)
     end
 
     it 'uses strict < inequality on the resolved_at boundary' do

@@ -112,8 +112,8 @@ module OutboxRelay
 
         # DLQ first: deleting resolved DLQ entries frees up FK references on
         # outbox_events, making them eligible for cleanup in the same run.
-        @dlq_deleted = delete_resolved_dlq_chunk
         deadline = monotonic_now + cleanup_max_runtime_seconds
+        @dlq_iterations    = run_loop(deadline) { delete_resolved_dlq_chunk_and_accumulate }
         @events_iterations = run_loop(deadline) { delete_expired_events_chunk_and_accumulate }
 
         build_result(duration_since(started_at))
@@ -160,6 +160,12 @@ module OutboxRelay
 
       def cleanup_max_runtime_seconds
         OutboxRelay.cleanup_max_runtime.to_f
+      end
+
+      def delete_resolved_dlq_chunk_and_accumulate
+        deleted = delete_resolved_dlq_chunk
+        @dlq_deleted += deleted
+        deleted
       end
 
       def delete_expired_events_chunk_and_accumulate
