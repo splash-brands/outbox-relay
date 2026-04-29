@@ -237,7 +237,12 @@ module OutboxRelay
       end
 
       def build_result(duration)
-        result = { events_deleted: @events_deleted, dlq_deleted: @dlq_deleted, duration: duration }
+        result = {
+          events_deleted: @events_deleted,
+          dlq_deleted: @dlq_deleted,
+          duration: duration,
+          iterations: { dlq: @dlq_iterations, events: @events_iterations }
+        }
         result[:timeout] = true if @timeout
         result[:error_class] = @error_class if @error_class && !@timeout
         result
@@ -271,6 +276,7 @@ module OutboxRelay
           events_deleted: @events_deleted,
           dlq_deleted: @dlq_deleted,
           duration: duration,
+          iterations: { dlq: @dlq_iterations, events: @events_iterations },
           error_class: @error_class,
           timeout: @timeout
         }

@@ -440,6 +440,21 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       )
     end
 
+    it 'includes per-phase iteration counts in the notification payload' do
+      OutboxRelay.dlq_resolved_ttl = 14.days
+      OutboxRelay.cleanup_batch_size = 2
+      4.times { |i| create_event(sequence: i + 1, expires_at: 1.hour.ago) }
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+      3.times { create_dlq(status: 'resolved', resolved_at: 30.days.ago) }
+
+      payloads = with_cleanup_subscription { described_class.new.perform }
+
+      expect(payloads.size).to eq(1)
+      # DLQ: 3 rows / batch 2 → iter1=2 deleted, iter2=1 deleted (<batch, exhausted) → 2 iterations
+      # events: 4 rows / batch 2 → iter1=2, iter2=2, iter3=0 (<batch, exhausted) → 3 iterations
+      expect(payloads.first[:iterations]).to eq(dlq: 2, events: 3)
+    end
+
     it 'does not let a buggy notification subscriber mask the cleanup outcome' do
       create_event(sequence: 1, expires_at: 1.hour.ago)
       set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
