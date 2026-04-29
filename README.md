@@ -1721,9 +1721,10 @@ Events can carry an `expires_at` timestamp. The `CleanupExpiredEventsJob` period
 
 ```ruby
 # config/initializers/outbox_relay.rb
-Rails.application.config.outbox_relay.default_event_ttl = 14.days
-Rails.application.config.outbox_relay.dlq_resolved_ttl  = 14.days
-Rails.application.config.outbox_relay.cleanup_enabled   = true
+Rails.application.config.outbox_relay.default_event_ttl   = 14.days
+Rails.application.config.outbox_relay.dlq_resolved_ttl    = 14.days
+Rails.application.config.outbox_relay.cleanup_enabled     = true
+Rails.application.config.outbox_relay.cleanup_max_runtime = 30 # seconds per run
 ```
 
 With `default_event_ttl` set, every `OutboxPublisher.publish(...)` call that does **not** pass `:expires_at` gets `expires_at = 14.days.from_now` automatically.

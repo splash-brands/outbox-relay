@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-04-29
+
+### Changed
+
+- `CleanupExpiredEventsJob` now uses a time-budgeted inner loop. `cleanup_batch_size` is the size of a single DELETE chunk (default 10_000); total work per run is bounded by the new `cleanup_max_runtime` (default 30 seconds), shared across the DLQ and events phases. Recommend a `*/5 * * * *` schedule. The notification payload gains an `iterations: { dlq:, events: }` key.
+
 ## [0.9.0] - 2026-04-22
 
 ### Added
