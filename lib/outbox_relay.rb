@@ -33,8 +33,13 @@ module OutboxRelay
   mattr_accessor :dlq_resolved_ttl, default: nil
   # Whether the CleanupExpiredEventsJob actually runs (default: disabled).
   mattr_accessor :cleanup_enabled, default: false
-  # Max events/DLQ rows deleted per job invocation.
+  # Rows deleted per single DELETE chunk in the cleanup loop.
   mattr_accessor :cleanup_batch_size, default: 10_000
+  # Wall-clock budget (seconds) for one CleanupExpiredEventsJob invocation,
+  # shared across the DLQ phase and the events phase. Accepts Integer or
+  # ActiveSupport::Duration. Each phase is guaranteed at least one DELETE
+  # chunk regardless of remaining budget.
+  mattr_accessor :cleanup_max_runtime, default: 30
 
   # Callbacks
   mattr_accessor :on_thread_error

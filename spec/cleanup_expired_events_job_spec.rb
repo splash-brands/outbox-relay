@@ -8,14 +8,17 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
     original_enabled = OutboxRelay.cleanup_enabled
     original_batch = OutboxRelay.cleanup_batch_size
     original_dlq_ttl = OutboxRelay.dlq_resolved_ttl
+    original_max_runtime = OutboxRelay.cleanup_max_runtime
     OutboxRelay.cleanup_enabled = true
     OutboxRelay.cleanup_batch_size = 10_000
     OutboxRelay.dlq_resolved_ttl = nil
+    OutboxRelay.cleanup_max_runtime = 30
     example.run
   ensure
     OutboxRelay.cleanup_enabled = original_enabled
     OutboxRelay.cleanup_batch_size = original_batch
     OutboxRelay.dlq_resolved_ttl = original_dlq_ttl
+    OutboxRelay.cleanup_max_runtime = original_max_runtime
   end
 
   def create_event(sequence:, topic: 'orders', expires_at: nil)
@@ -129,15 +132,93 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       expect(OutboxRelay::OutboxEvent.count).to eq(1)
     end
 
-    it 'respects cleanup_batch_size' do
+    it 'loops across multiple chunks until the qualifying set is exhausted' do
       OutboxRelay.cleanup_batch_size = 2
       3.times { |i| create_event(sequence: i + 1, expires_at: 1.hour.ago) }
       set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
 
       result = described_class.new.perform
 
+      # batch_size=2 + 3 rows → iter1 deletes 2, iter2 deletes 1 (<batch_size, exhausted, exit).
+      expect(result[:events_deleted]).to eq(3)
+      expect(OutboxRelay::OutboxEvent.count).to eq(0)
+    end
+
+    it 'exits the events loop when the deadline is hit even if rows remain' do
+      OutboxRelay.cleanup_batch_size = 2
+      6.times { |i| create_event(sequence: i + 1, expires_at: 1.hour.ago) }
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      job = described_class.new
+      # monotonic_now calls in order:
+      #   1: started_at (perform top)
+      #   2: deadline base (deadline = monotonic_now + budget → 0.0 + 30 = 30)
+      #   (DLQ phase is skipped entirely because dlq_resolved_ttl is nil)
+      #   3: events iter 1 deadline check (0.0 < 30 → continue)
+      #   4: events iter 2 deadline check (100.0 >= 30 → break)
+      #   5: duration_since(started_at) in build_result
+      #   6: duration_since(started_at) in ensure block
+      allow(job).to receive(:monotonic_now).and_return(0.0, 0.0, 0.0, 100.0, 100.0, 100.0)
+
+      result = job.perform
+
+      # 2 events iterations × batch_size 2 = 4 deleted (out of 6 qualifying).
+      expect(result[:events_deleted]).to eq(4)
+      expect(OutboxRelay::OutboxEvent.count).to eq(2)
+    end
+
+    it 'always runs at least one chunk per phase even with zero runtime budget' do
+      OutboxRelay.cleanup_max_runtime = 0
+      OutboxRelay.cleanup_batch_size = 2
+      4.times { |i| create_event(sequence: i + 1, expires_at: 1.hour.ago) }
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      result = described_class.new.perform
+
+      # First chunk runs (deletes 2), then deadline check fails (now >= now+0), break.
+      # Second chunk does NOT run, leaving 2 events.
       expect(result[:events_deleted]).to eq(2)
-      expect(OutboxRelay::OutboxEvent.count).to eq(1)
+      expect(OutboxRelay::OutboxEvent.count).to eq(2)
+    end
+
+    it 'accepts ActiveSupport::Duration for cleanup_max_runtime' do
+      OutboxRelay.cleanup_max_runtime = 1.minute
+      create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      result = described_class.new.perform
+
+      expect(result[:events_deleted]).to eq(1)
+    end
+
+    it 'raises ConfigurationError when cleanup_max_runtime is not Numeric or Duration' do
+      OutboxRelay.cleanup_max_runtime = '30'
+      create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      expect { described_class.new.perform }
+        .to raise_error(OutboxRelay::ConfigurationError, /cleanup_max_runtime/)
+    end
+
+    it 'raises ConfigurationError when cleanup_max_runtime is negative' do
+      OutboxRelay.cleanup_max_runtime = -1
+      create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      expect { described_class.new.perform }
+        .to raise_error(OutboxRelay::ConfigurationError, /non-negative/)
+    end
+
+    it 'raises ConfigurationError when cleanup_batch_size is not a positive Integer' do
+      create_event(sequence: 1, expires_at: 1.hour.ago)
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      [0, -1, '10', nil, 1.5].each do |bad|
+        OutboxRelay.cleanup_batch_size = bad
+        expect { described_class.new.perform }
+          .to raise_error(OutboxRelay::ConfigurationError, /cleanup_batch_size/),
+              "expected ConfigurationError for cleanup_batch_size = #{bad.inspect}"
+      end
     end
   end
 
@@ -254,17 +335,19 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       result = described_class.new.perform
 
       expect(result[:dlq_deleted]).to eq(0)
+      # Phase is genuinely skipped, not run as a no-op chunk: iterations[:dlq] == 0.
+      expect(result[:iterations]).to eq(dlq: 0, events: 1)
       expect(OutboxRelay::DeadLetterEvent.count).to eq(1)
     end
 
-    it 'respects cleanup_batch_size for DLQ deletes' do
+    it 'loops DLQ deletes across multiple chunks until exhausted' do
       OutboxRelay.cleanup_batch_size = 2
       3.times { create_dlq(status: 'resolved', resolved_at: 30.days.ago) }
 
       result = described_class.new.perform
 
-      expect(result[:dlq_deleted]).to eq(2)
-      expect(OutboxRelay::DeadLetterEvent.count).to eq(1)
+      expect(result[:dlq_deleted]).to eq(3)
+      expect(OutboxRelay::DeadLetterEvent.count).to eq(0)
     end
 
     it 'uses strict < inequality on the resolved_at boundary' do
@@ -283,6 +366,57 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
 
       expect { described_class.new.perform }
         .to raise_error(OutboxRelay::ConfigurationError, /ActiveSupport::Duration/)
+    end
+
+    it 'still runs one events chunk even when DLQ phase consumes the entire budget' do
+      OutboxRelay.cleanup_batch_size = 2
+      # 6 DLQ rows + 4 event rows. We stub the clock to push past deadline after
+      # the 2nd DLQ chunk so the events phase enters with no remaining budget,
+      # but the min-one rule still runs one events chunk.
+      6.times { create_dlq(status: 'resolved', resolved_at: 30.days.ago) }
+      4.times { |i| create_event(sequence: i + 1, expires_at: 1.hour.ago) }
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      job = described_class.new
+      # monotonic_now call sequence (deadline = 0 + 30 = 30; values >= 30 trip the break):
+      #   1: started_at
+      #   2: deadline base (returns 0 → deadline = 30)
+      #   3: DLQ iter 1 deadline check (0 < 30, continue)
+      #   4: DLQ iter 2 deadline check (100 >= 30, break)
+      #   5: events iter 1 deadline check (100 >= 30, break — but iter 1 already ran per min-one rule)
+      #   6: duration_since in build_result
+      #   7: duration_since in ensure
+      allow(job).to receive(:monotonic_now).and_return(0.0, 0.0, 0.0, 100.0, 100.0, 100.0, 100.0)
+
+      result = job.perform
+
+      expect(result[:dlq_deleted]).to eq(4)      # 2 DLQ iterations × 2
+      expect(result[:events_deleted]).to eq(2)   # 1 events iteration × 2 (min-one)
+      expect(OutboxRelay::DeadLetterEvent.count).to eq(2)
+      expect(OutboxRelay::OutboxEvent.count).to eq(2)
+    end
+
+    it 'exits the DLQ loop when the deadline is hit even if rows remain' do
+      OutboxRelay.cleanup_batch_size = 2
+      6.times { create_dlq(status: 'resolved', resolved_at: 30.days.ago) }
+
+      job = described_class.new
+      # monotonic_now sequence:
+      #   1: started_at
+      #   2: deadline base (deadline = 30)
+      #   3: DLQ iter 1 deadline check (0 < 30, continue)
+      #   4: DLQ iter 2 deadline check (100 >= 30, break)
+      #   5: events iter 1 — chunk returns 0 (no qualifying events), exits on
+      #      exhaustion check before deadline check, so no monotonic_now call here
+      #   5: duration_since in build_result
+      #   6: duration_since in ensure
+      allow(job).to receive(:monotonic_now).and_return(0.0, 0.0, 0.0, 100.0, 100.0, 100.0)
+
+      result = job.perform
+
+      expect(result[:dlq_deleted]).to eq(4)      # 2 DLQ iterations × 2
+      expect(result[:iterations][:dlq]).to eq(2)
+      expect(OutboxRelay::DeadLetterEvent.count).to eq(2)
     end
   end
 
@@ -333,7 +467,7 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       stub_const('OutboxRelay::Jobs::CleanupExpiredEventsJob::PG_QUERY_CANCELED', fake_timeout)
 
       allow_any_instance_of(described_class)
-        .to receive(:delete_expired_events).and_raise(fake_timeout, 'statement timeout')
+        .to receive(:delete_expired_events_chunk).and_raise(fake_timeout, 'statement timeout')
 
       result = nil
       payloads = with_cleanup_subscription do
@@ -350,12 +484,83 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
       )
     end
 
+    it 'preserves accumulated event counts when PG::QueryCanceled fires mid-loop' do
+      OutboxRelay.cleanup_batch_size = 2
+      4.times { |i| create_event(sequence: i + 1, expires_at: 1.hour.ago) }
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+
+      fake_timeout = Class.new(StandardError) do
+        def self.name
+          'PG::QueryCanceled'
+        end
+      end
+      stub_const('OutboxRelay::Jobs::CleanupExpiredEventsJob::PG_QUERY_CANCELED', fake_timeout)
+
+      call_count = 0
+      allow_any_instance_of(described_class)
+        .to receive(:delete_expired_events_chunk).and_wrap_original do |orig, *args|
+          call_count += 1
+          raise fake_timeout, 'statement timeout' if call_count == 2
+
+          orig.call(*args)
+        end
+
+      result = nil
+      payloads = with_cleanup_subscription { result = described_class.new.perform }
+
+      # Iter 1 deleted 2 rows; iter 2 raised. Accumulated count = 2.
+      expect(result).to include(events_deleted: 2, timeout: true)
+      # Iteration counter must also reflect the completed iteration. The mid-loop
+      # raise happens before the wrapper increments @events_iterations, so it
+      # stays at the count from completed chunks (1 here).
+      expect(result[:iterations]).to eq(dlq: 0, events: 1)
+      expect(payloads.first).to include(
+        events_deleted: 2,
+        timeout: true,
+        error_class: 'PG::QueryCanceled'
+      )
+    end
+
+    it 'preserves accumulated DLQ counts when PG::QueryCanceled fires mid-DLQ-loop' do
+      OutboxRelay.dlq_resolved_ttl = 14.days
+      OutboxRelay.cleanup_batch_size = 2
+      4.times { create_dlq(status: 'resolved', resolved_at: 30.days.ago) }
+
+      fake_timeout = Class.new(StandardError) do
+        def self.name
+          'PG::QueryCanceled'
+        end
+      end
+      stub_const('OutboxRelay::Jobs::CleanupExpiredEventsJob::PG_QUERY_CANCELED', fake_timeout)
+
+      call_count = 0
+      allow_any_instance_of(described_class)
+        .to receive(:delete_resolved_dlq_chunk).and_wrap_original do |orig, *args|
+          call_count += 1
+          raise fake_timeout, 'statement timeout' if call_count == 2
+
+          orig.call(*args)
+        end
+
+      result = nil
+      payloads = with_cleanup_subscription { result = described_class.new.perform }
+
+      # Iter 1 deleted 2 rows; iter 2 raised before events phase even started.
+      expect(result).to include(dlq_deleted: 2, events_deleted: 0, timeout: true)
+      expect(result[:iterations]).to eq(dlq: 1, events: 0)
+      expect(payloads.first).to include(
+        dlq_deleted: 2,
+        timeout: true,
+        error_class: 'PG::QueryCanceled'
+      )
+    end
+
     it 'emits notification and re-raises on unexpected errors' do
       create_event(sequence: 1, expires_at: 1.hour.ago)
       set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
 
       allow_any_instance_of(described_class)
-        .to receive(:delete_expired_events).and_raise(StandardError, 'kaboom')
+        .to receive(:delete_expired_events_chunk).and_raise(StandardError, 'kaboom')
       allow(OutboxRelay::Instrumentation::Models).to receive(:error)
 
       payloads = with_cleanup_subscription do
@@ -369,6 +574,21 @@ RSpec.describe OutboxRelay::Jobs::CleanupExpiredEventsJob do
         timeout: false,
         error_class: 'StandardError'
       )
+    end
+
+    it 'includes per-phase iteration counts in the notification payload' do
+      OutboxRelay.dlq_resolved_ttl = 14.days
+      OutboxRelay.cleanup_batch_size = 2
+      4.times { |i| create_event(sequence: i + 1, expires_at: 1.hour.ago) }
+      set_consumer_offset(topic: 'orders', last_consumed_sequence: 100)
+      3.times { create_dlq(status: 'resolved', resolved_at: 30.days.ago) }
+
+      payloads = with_cleanup_subscription { described_class.new.perform }
+
+      expect(payloads.size).to eq(1)
+      # DLQ: 3 rows / batch 2 → iter1=2 deleted, iter2=1 deleted (<batch, exhausted) → 2 iterations
+      # events: 4 rows / batch 2 → iter1=2, iter2=2, iter3=0 (<batch, exhausted) → 3 iterations
+      expect(payloads.first[:iterations]).to eq(dlq: 2, events: 3)
     end
 
     it 'does not let a buggy notification subscriber mask the cleanup outcome' do

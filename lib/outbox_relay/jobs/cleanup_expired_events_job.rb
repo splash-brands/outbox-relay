@@ -29,14 +29,23 @@ module OutboxRelay
     #
     # Enable cleanup in your OutboxRelay initializer:
     #
-    #   OutboxRelay.cleanup_enabled    = true       # Enable cleanup (default: false)
-    #   OutboxRelay.cleanup_batch_size = 10_000     # Batch per run (default: 10_000)
-    #   OutboxRelay.default_event_ttl  = 14.days    # Publisher default TTL (optional)
-    #   OutboxRelay.dlq_resolved_ttl   = 14.days    # Resolved DLQ TTL (optional)
+    #   OutboxRelay.cleanup_enabled     = true       # Enable cleanup (default: false)
+    #   OutboxRelay.cleanup_batch_size  = 10_000     # Rows per single DELETE chunk (default: 10_000)
+    #   OutboxRelay.cleanup_max_runtime = 30         # Seconds budget per run (default: 30)
+    #   OutboxRelay.default_event_ttl   = 14.days    # Publisher default TTL (optional)
+    #   OutboxRelay.dlq_resolved_ttl    = 14.days    # Resolved DLQ TTL (optional)
     #
     # In Rails these also flow through `Rails.application.config.outbox_relay.*`.
     # Both TTL values must be `ActiveSupport::Duration` instances — bare Integers
     # are rejected to prevent the "I meant 14.days but wrote 14 (seconds)" footgun.
+    # `cleanup_max_runtime` accepts either a bare Integer (seconds) or an
+    # `ActiveSupport::Duration`.
+    #
+    # The job runs each phase (DLQ first, then events) as a loop of
+    # `cleanup_batch_size`-sized DELETEs until either the qualifying rows are
+    # exhausted or `cleanup_max_runtime` elapses. The runtime budget is shared
+    # across both phases. Each phase is guaranteed at least one DELETE chunk
+    # regardless of remaining budget.
     #
     # ## Instrumentation
     #
@@ -44,7 +53,7 @@ module OutboxRelay
     # timeout, or failure:
     #
     #   ActiveSupport::Notifications.subscribe("outbox_relay.cleanup.completed") do |_, _, _, _, payload|
-    #     payload # => { events_deleted:, dlq_deleted:, duration:, error_class:, timeout: }
+    #     payload # => { events_deleted:, dlq_deleted:, duration:, iterations:, error_class:, timeout: }
     #   end
     #
     # `error_class` is nil on success, the exception class name on failure, or
@@ -61,7 +70,7 @@ module OutboxRelay
     #
     #   Sidekiq.configure_server do |config|
     #     config.periodic do |mgr|
-    #       mgr.register("0 3 * * *", "OutboxRelay::Jobs::CleanupExpiredEventsJob")
+    #       mgr.register("*/5 * * * *", "OutboxRelay::Jobs::CleanupExpiredEventsJob")
     #     end
     #   end
     #
@@ -104,14 +113,19 @@ module OutboxRelay
       def perform
         @events_deleted = 0
         @dlq_deleted = 0
+        @events_iterations = 0
+        @dlq_iterations = 0
         @error_class = nil
         @timeout = false
-        started_at = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+        started_at = monotonic_now
 
         # DLQ first: deleting resolved DLQ entries frees up FK references on
         # outbox_events, making them eligible for cleanup in the same run.
-        @dlq_deleted = delete_resolved_dlq_entries
-        @events_deleted = delete_expired_events
+        # Skipped entirely when dlq_resolved_ttl is unset so iterations[:dlq]
+        # accurately reflects "no DLQ work was done", not "one no-op pass".
+        deadline = monotonic_now + cleanup_max_runtime_seconds
+        run_loop(deadline) { delete_resolved_dlq_chunk_and_accumulate } if OutboxRelay.dlq_resolved_ttl
+        run_loop(deadline) { delete_expired_events_chunk_and_accumulate }
 
         build_result(duration_since(started_at))
       rescue ActiveRecord::ConnectionNotEstablished, PG_CONNECTION_BAD => e
@@ -138,6 +152,56 @@ module OutboxRelay
 
       private
 
+      # Run a deletion phase in chunks until either exhausted (chunk returned
+      # fewer rows than cleanup_batch_size) or the deadline is hit. Always runs
+      # at least one iteration so cleanup_max_runtime = 0 is not a no-op.
+      # The block must return the chunk row count and is responsible for
+      # updating its own accumulators (deleted count AND iteration count) so
+      # partial progress survives a mid-loop raise.
+      def run_loop(deadline)
+        batch_size = cleanup_batch_size_value
+        loop do
+          deleted = yield
+          break if deleted < batch_size
+          break if monotonic_now >= deadline
+        end
+      end
+
+      def cleanup_batch_size_value
+        value = OutboxRelay.cleanup_batch_size
+        unless value.is_a?(Integer) && value.positive?
+          raise OutboxRelay::ConfigurationError,
+                'OutboxRelay.cleanup_batch_size must be a positive Integer; ' \
+                "got #{value.class}: #{value.inspect}."
+        end
+
+        value
+      end
+
+      def cleanup_max_runtime_seconds
+        raw = OutboxRelay.cleanup_max_runtime
+        seconds = raw.to_f if raw.is_a?(Numeric) || raw.is_a?(ActiveSupport::Duration)
+        return seconds if seconds && seconds >= 0
+
+        raise OutboxRelay::ConfigurationError,
+              'OutboxRelay.cleanup_max_runtime must be a non-negative Numeric ' \
+              "(seconds) or an ActiveSupport::Duration; got #{raw.class}: #{raw.inspect}."
+      end
+
+      def delete_resolved_dlq_chunk_and_accumulate
+        deleted = delete_resolved_dlq_chunk
+        @dlq_deleted += deleted
+        @dlq_iterations += 1
+        deleted
+      end
+
+      def delete_expired_events_chunk_and_accumulate
+        deleted = delete_expired_events_chunk
+        @events_deleted += deleted
+        @events_iterations += 1
+        deleted
+      end
+
       # Delete expired events that have been fully consumed.
       #
       # An event is deleted only if its sequence is strictly less than the minimum
@@ -148,10 +212,10 @@ module OutboxRelay
       # preserved: production has a FK on outbox_relay_outbox_event_id with no
       # ON DELETE rule, so deleting a referenced event would fail with
       # PG::ForeignKeyViolation. Resolved DLQ entries are dropped first by
-      # delete_resolved_dlq_entries, so once the DLQ TTL passes the event
+      # delete_resolved_dlq_chunk, so once the DLQ TTL passes the event
       # becomes eligible in the next run (or the same run, since DLQ cleanup
       # runs first).
-      def delete_expired_events
+      def delete_expired_events_chunk
         # Subquery returns a single value (MIN), so `< (subquery)` is equivalent to
         # `< ALL(subquery)` and works across both PostgreSQL and SQLite (tests).
         OutboxRelay::OutboxEvent
@@ -182,7 +246,7 @@ module OutboxRelay
       # long it spent in `retrying` first.
       #
       # Returns 0 when dlq_resolved_ttl is not configured.
-      def delete_resolved_dlq_entries
+      def delete_resolved_dlq_chunk
         ttl = OutboxRelay.dlq_resolved_ttl
         return 0 if ttl.nil?
 
@@ -201,14 +265,23 @@ module OutboxRelay
       end
 
       def build_result(duration)
-        result = { events_deleted: @events_deleted, dlq_deleted: @dlq_deleted, duration: duration }
+        result = {
+          events_deleted: @events_deleted,
+          dlq_deleted: @dlq_deleted,
+          duration: duration,
+          iterations: { dlq: @dlq_iterations, events: @events_iterations }
+        }
         result[:timeout] = true if @timeout
         result[:error_class] = @error_class if @error_class && !@timeout
         result
       end
 
       def duration_since(started_at)
-        ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) - started_at
+        monotonic_now - started_at
+      end
+
+      def monotonic_now
+        ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
       end
 
       def log_completion(duration)
@@ -231,6 +304,7 @@ module OutboxRelay
           events_deleted: @events_deleted,
           dlq_deleted: @dlq_deleted,
           duration: duration,
+          iterations: { dlq: @dlq_iterations, events: @events_iterations },
           error_class: @error_class,
           timeout: @timeout
         }
