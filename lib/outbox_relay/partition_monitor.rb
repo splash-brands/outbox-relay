@@ -193,12 +193,15 @@ module OutboxRelay
       # Previously used max_sequence - last_consumed_sequence, but sequence numbers
       # are global across all topics, so the gap wildly overstates real backlog.
       #
-      # Apply the consumer's event_filter when configured — otherwise lag for
-      # filtered consumers on high-volume topics counts events the consumer
-      # correctly skips, producing phantom-lag alerts.
+      # Mirror the predicates that OutboxConsumer#fetch_batch applies, so lag counts
+      # only events the consumer would actually pick up:
+      #   * event_filter — filtered consumers correctly skip non-matching event_names
+      #   * not_expired — expired events are abandoned by the system (cleanup deletes
+      #     them within minutes); they are not pending work.
       query = OutboxEvent
               .where(topic: offset.topic, partition_key: extract_partition_key(offset.consumer_group))
               .where('sequence > ?', offset.last_consumed_sequence || 0)
+              .not_expired
 
       filter = event_filter_for(offset)
       query = query.where(event_name: filter) if filter.present?

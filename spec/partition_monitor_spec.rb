@@ -335,11 +335,31 @@ RSpec.describe OutboxRelay::PartitionMonitor do
 
     it 'falls back to total count when consumer cannot be resolved' do
       allow(worker_config).to receive(:consumer_class).and_return('NonExistent::Consumer')
+      logger = instance_double(Logger, warn: nil)
+      allow(OutboxRelay).to receive(:logger).and_return(logger)
       fresh_monitor = described_class.new(configuration)
 
       lag = fresh_monitor.partition_lag(consumer_group: consumer_group, topic: topic, partition_key: 0)
 
       expect(lag).to eq(4)
+      expect(logger).to have_received(:warn).with(
+        hash_including(
+          event_name: 'partition_monitor_event_filter_lookup_failed',
+          consumer_group: consumer_group,
+          topic: topic
+        )
+      )
+    end
+
+    it 'excludes expired events from lag (consumer skips them via not_expired)' do
+      OutboxRelay::OutboxEvent.create!(
+        topic: topic, partition_key: 0, sequence: 205,
+        event_name: 'wanted.event', payload: {}, expires_at: 1.hour.ago
+      )
+
+      lag = monitor.partition_lag(consumer_group: consumer_group, topic: topic, partition_key: 0)
+
+      expect(lag).to eq(1)
     end
   end
 end

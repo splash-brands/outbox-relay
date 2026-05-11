@@ -11,7 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `PartitionMonitor#calculate_lag` now applies the consumer's `event_filter` to the count. Filtered consumers on high-volume topics previously reported phantom lag — every event the consumer correctly skips via filter was still counted as backlog, easily triggering `high_lag` alerts even with a healthy, current consumer. The filter is resolved by instantiating the configured `consumer_class` (lookup is memoized per `(consumer_group, topic)`); when the class cannot be resolved the lag falls back to the unfiltered count and a `partition_monitor_event_filter_lookup_failed` log entry is emitted. Complements 0.8.7's switch to `COUNT(*)` semantics.
+- `PartitionMonitor#calculate_lag` now mirrors the predicates that `OutboxConsumer#fetch_batch` applies, so lag counts only events the consumer would actually pick up:
+  - **`event_filter`** — filtered consumers on high-volume topics previously reported phantom lag, because every event the consumer correctly skips via filter was still counted as backlog (easily triggering `high_lag` alerts on a healthy, current consumer). The filter is resolved by instantiating the configured `consumer_class` (lookup is memoized per `(consumer_group, topic)`); when the class cannot be resolved the lag falls back to the unfiltered count and a `partition_monitor_event_filter_lookup_failed` log entry is emitted.
+  - **`not_expired`** — expired events are abandoned by the system (`CleanupExpiredEventsJob` deletes them within minutes) and are skipped by `fetch_batch`; counting them as lag produced transient phantom spikes between expiry and cleanup.
+
+  Complements 0.8.7's switch to `COUNT(*)` semantics.
 
 ## [0.9.2] - 2026-04-29
 
