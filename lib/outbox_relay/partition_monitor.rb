@@ -192,10 +192,49 @@ module OutboxRelay
       # Count actual events after the consumer's offset for this topic and partition.
       # Previously used max_sequence - last_consumed_sequence, but sequence numbers
       # are global across all topics, so the gap wildly overstates real backlog.
-      OutboxEvent
-        .where(topic: offset.topic, partition_key: extract_partition_key(offset.consumer_group))
-        .where('sequence > ?', offset.last_consumed_sequence || 0)
-        .count
+      #
+      # Apply the consumer's event_filter when configured — otherwise lag for
+      # filtered consumers on high-volume topics counts events the consumer
+      # correctly skips, producing phantom-lag alerts.
+      query = OutboxEvent
+              .where(topic: offset.topic, partition_key: extract_partition_key(offset.consumer_group))
+              .where('sequence > ?', offset.last_consumed_sequence || 0)
+
+      filter = event_filter_for(offset)
+      query = query.where(event_name: filter) if filter.present?
+
+      query.count
+    end
+
+    # Resolves the consumer's event_filter via the worker config so that
+    # calculate_lag mirrors the SQL the consumer itself runs.
+    # Memoized per (consumer_group, topic) — cache is per-monitor-instance.
+    def event_filter_for(offset)
+      @event_filter_cache ||= {}
+      base = base_consumer_group(offset.consumer_group)
+      cache_key = [base, offset.topic]
+
+      return @event_filter_cache[cache_key] if @event_filter_cache.key?(cache_key)
+
+      @event_filter_cache[cache_key] = compute_event_filter(base, offset.topic)
+    end
+
+    def compute_event_filter(consumer_group_base, topic)
+      worker = @configuration&.workers&.find do |w|
+        w.consumer_group == consumer_group_base && w.topic == topic
+      end
+      return nil unless worker&.consumer_class
+
+      filter = worker.consumer_class.constantize.new(partition_key: 0).event_filter
+      filter.presence
+    rescue StandardError => e
+      OutboxRelay.logger&.warn(
+        event_name: 'partition_monitor_event_filter_lookup_failed',
+        consumer_group: consumer_group_base,
+        topic: topic,
+        error: e.message
+      )
+      nil
     end
 
     def extract_partition_key(consumer_group)
