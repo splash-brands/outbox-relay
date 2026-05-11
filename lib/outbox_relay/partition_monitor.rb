@@ -216,16 +216,17 @@ module OutboxRelay
 
       return @event_filter_cache[cache_key] if @event_filter_cache.key?(cache_key)
 
-      @event_filter_cache[cache_key] = compute_event_filter(base, offset.topic)
+      partition_key = extract_partition_key(offset.consumer_group)
+      @event_filter_cache[cache_key] = compute_event_filter(base, offset.topic, partition_key)
     end
 
-    def compute_event_filter(consumer_group_base, topic)
+    def compute_event_filter(consumer_group_base, topic, partition_key)
       worker = @configuration&.workers&.find do |w|
         w.consumer_group == consumer_group_base && w.topic == topic
       end
       return nil unless worker&.consumer_class
 
-      filter = worker.consumer_class.constantize.new(partition_key: 0).event_filter
+      filter = worker.consumer_class.constantize.new(partition_key: partition_key).event_filter
       filter.presence
     rescue StandardError => e
       OutboxRelay.logger&.warn(
