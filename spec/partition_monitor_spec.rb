@@ -11,7 +11,8 @@ RSpec.describe OutboxRelay::PartitionMonitor do
       OutboxRelay::Configuration::WorkerConfig,
       consumer_group: consumer_group,
       topic: topic,
-      partitions: [0, 1, 2, 3]
+      partitions: [0, 1, 2, 3],
+      consumer_class: nil
     )
   end
 
@@ -279,6 +280,86 @@ RSpec.describe OutboxRelay::PartitionMonitor do
       )
 
       expect(lag).to eq(0)
+    end
+  end
+
+  describe 'lag with event_filter' do
+    # Pure subclass — initializer has no side effects, safe to instantiate from monitor.
+    class FilteredTestConsumer < OutboxRelay::OutboxConsumer
+      HANDLED_EVENTS = ['wanted.event'].freeze
+
+      def initialize(partition_key: 0)
+        super(
+          consumer_group: 'test-group',
+          topic: 'test-topic',
+          partition_key: partition_key,
+          event_filter: HANDLED_EVENTS
+        )
+      end
+    end
+
+    let(:worker_config) do
+      instance_double(
+        OutboxRelay::Configuration::WorkerConfig,
+        consumer_group: consumer_group,
+        topic: topic,
+        partitions: [0],
+        consumer_class: 'FilteredTestConsumer'
+      )
+    end
+
+    before do
+      OutboxRelay::ConsumerOffset.create!(
+        consumer_group: "#{consumer_group}_p0",
+        topic: topic,
+        last_consumed_sequence: 100
+      )
+
+      OutboxRelay::OutboxEvent.create!(
+        topic: topic, partition_key: 0, sequence: 200,
+        event_name: 'wanted.event', payload: {}
+      )
+      3.times do |i|
+        OutboxRelay::OutboxEvent.create!(
+          topic: topic, partition_key: 0, sequence: 201 + i,
+          event_name: 'other.event', payload: {}
+        )
+      end
+    end
+
+    it 'counts only events matching the consumer event_filter' do
+      lag = monitor.partition_lag(consumer_group: consumer_group, topic: topic, partition_key: 0)
+
+      expect(lag).to eq(1)
+    end
+
+    it 'falls back to total count when consumer cannot be resolved' do
+      allow(worker_config).to receive(:consumer_class).and_return('NonExistent::Consumer')
+      logger = instance_double(Logger, warn: nil)
+      allow(OutboxRelay).to receive(:logger).and_return(logger)
+      fresh_monitor = described_class.new(configuration)
+
+      lag = fresh_monitor.partition_lag(consumer_group: consumer_group, topic: topic, partition_key: 0)
+
+      expect(lag).to eq(4)
+      expect(logger).to have_received(:warn).with(
+        hash_including(
+          event_name: 'partition_monitor_event_filter_lookup_failed',
+          consumer_group: consumer_group,
+          topic: topic
+        )
+      )
+    end
+
+    it 'excludes expired events from lag (consumer skips them via not_expired)' do
+      OutboxRelay::OutboxEvent.create!(
+        topic: topic, partition_key: 0, sequence: 205,
+        event_name: 'wanted.event', payload: {}, expires_at: 1.hour.ago
+      )
+
+      lag = monitor.partition_lag(consumer_group: consumer_group, topic: topic, partition_key: 0)
+
+      expect(lag).to eq(1)
     end
   end
 end
