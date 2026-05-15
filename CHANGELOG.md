@@ -15,10 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`rake outbox_relay:stale_consumers`** — read-only diagnostic that lists stale offsets grouped by consumer_group, shows which topics have their cleanup blocked and at what sequence, and exits 1 when any are found so CI / monitoring can detect drift.
 - **`rake outbox_relay:prune_stale_consumers[idle_days]`** — manual cleanup that deletes stale offsets older than `idle_days` (required, no default — operator must explicitly choose grace window). Bounded by the same safety filters as `stale_consumer_offsets` (not-in-config, idle, not actively claimed). Emits `outbox_relay.stale_offsets.pruned` notification following the existing `outbox_relay.<category>.<event>` convention so dashboards subscribed to `/^outbox_relay\./` pick it up alongside cleanup events.
 
-### Why this is a minor bump
-
-`CleanupExpiredEventsJob` deletes events where `sequence < MIN(last_consumed_sequence)` per topic. A frozen offset from a renamed/decommissioned consumer_group pins that MIN forever, so expired events in the affected topic accumulate indefinitely — observed in production where ~1M expired events for a single high-volume CDC topic were retained because two old consumer_groups had been renamed in `outbox_consumers.yml` without removing their `consumer_offsets` rows. Adds a new public API surface (`PartitionMonitor#stale_consumer_offsets`) plus two new rake tasks and a new notification event; no breaking changes to existing methods.
-
 ## [0.9.3] - 2026-05-11
 
 ### Fixed
