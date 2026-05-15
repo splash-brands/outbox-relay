@@ -7,15 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-15
+
 ### Added
 
 - **`PartitionMonitor#stale_consumer_offsets`** — returns `ConsumerOffset` rows whose base `consumer_group` is no longer present in `config/outbox_consumers.yml`. Supplements `#stale_consumer_groups` (which returns just the names) with per-partition diagnostic data (offset id, topic, partition_key, last_consumed_sequence, last_consumed_at, heartbeat_at, claim state) suitable for ops review or automated pruning. Accepts `idle_for:` (skip offsets whose heartbeat is newer than the cutoff, with NULL heartbeats always eligible) and `exclude_claimed:` (default true — never report rows held by an active partition claim).
 - **`rake outbox_relay:stale_consumers`** — read-only diagnostic that lists stale offsets grouped by consumer_group, shows which topics have their cleanup blocked and at what sequence, and exits 1 when any are found so CI / monitoring can detect drift.
 - **`rake outbox_relay:prune_stale_consumers[idle_days]`** — manual cleanup that deletes stale offsets older than `idle_days` (required, no default — operator must explicitly choose grace window). Bounded by the same safety filters as `stale_consumer_offsets` (not-in-config, idle, not actively claimed). Emits `outbox_relay.stale_offsets.pruned` notification following the existing `outbox_relay.<category>.<event>` convention so dashboards subscribed to `/^outbox_relay\./` pick it up alongside cleanup events.
 
-### Why
+### Why this is a minor bump
 
-`CleanupExpiredEventsJob` deletes events where `sequence < MIN(last_consumed_sequence)` per topic. A frozen offset from a renamed/decommissioned consumer_group pins that MIN forever, so expired events in the affected topic accumulate indefinitely — observed in production where ~1M expired events for a single high-volume CDC topic were retained because two old consumer_groups had been renamed in `outbox_consumers.yml` without removing their `consumer_offsets` rows.
+`CleanupExpiredEventsJob` deletes events where `sequence < MIN(last_consumed_sequence)` per topic. A frozen offset from a renamed/decommissioned consumer_group pins that MIN forever, so expired events in the affected topic accumulate indefinitely — observed in production where ~1M expired events for a single high-volume CDC topic were retained because two old consumer_groups had been renamed in `outbox_consumers.yml` without removing their `consumer_offsets` rows. Adds a new public API surface (`PartitionMonitor#stale_consumer_offsets`) plus two new rake tasks and a new notification event; no breaking changes to existing methods.
+
+## [0.9.3] - 2026-05-11
+
+### Fixed
+
+- `PartitionMonitor#calculate_lag` now mirrors the predicates that `OutboxConsumer#fetch_batch` applies, so lag counts only events the consumer would actually pick up:
+  - **`event_filter`** — filtered consumers on high-volume topics previously reported phantom lag, because every event the consumer correctly skips via filter was still counted as backlog (easily triggering `high_lag` alerts on a healthy, current consumer). The filter is resolved by instantiating the configured `consumer_class` (lookup is memoized per `(consumer_group, topic)`); when the class cannot be resolved the lag falls back to the unfiltered count and a `partition_monitor_event_filter_lookup_failed` log entry is emitted.
+  - **`not_expired`** — expired events are abandoned by the system (`CleanupExpiredEventsJob` deletes them within minutes) and are skipped by `fetch_batch`; counting them as lag produced transient phantom spikes between expiry and cleanup.
+
+  Complements 0.8.7's switch to `COUNT(*)` semantics.
 
 ## [0.9.2] - 2026-04-29
 

@@ -246,10 +246,53 @@ module OutboxRelay
       # Count actual events after the consumer's offset for this topic and partition.
       # Previously used max_sequence - last_consumed_sequence, but sequence numbers
       # are global across all topics, so the gap wildly overstates real backlog.
-      OutboxEvent
-        .where(topic: offset.topic, partition_key: extract_partition_key(offset.consumer_group))
-        .where('sequence > ?', offset.last_consumed_sequence || 0)
-        .count
+      #
+      # Mirror the predicates that OutboxConsumer#fetch_batch applies, so lag counts
+      # only events the consumer would actually pick up:
+      #   * event_filter — filtered consumers correctly skip non-matching event_names
+      #   * not_expired — expired events are abandoned by the system (cleanup deletes
+      #     them within minutes); they are not pending work.
+      query = OutboxEvent
+              .where(topic: offset.topic, partition_key: extract_partition_key(offset.consumer_group))
+              .where('sequence > ?', offset.last_consumed_sequence || 0)
+              .not_expired
+
+      filter = event_filter_for(offset)
+      query = query.where(event_name: filter) if filter.present?
+
+      query.count
+    end
+
+    # Resolves the consumer's event_filter via the worker config so that
+    # calculate_lag mirrors the SQL the consumer itself runs.
+    # Memoized per (consumer_group, topic) — cache is per-monitor-instance.
+    def event_filter_for(offset)
+      @event_filter_cache ||= {}
+      base = base_consumer_group(offset.consumer_group)
+      cache_key = [base, offset.topic]
+
+      return @event_filter_cache[cache_key] if @event_filter_cache.key?(cache_key)
+
+      partition_key = extract_partition_key(offset.consumer_group)
+      @event_filter_cache[cache_key] = compute_event_filter(base, offset.topic, partition_key)
+    end
+
+    def compute_event_filter(consumer_group_base, topic, partition_key)
+      worker = @configuration&.workers&.find do |w|
+        w.consumer_group == consumer_group_base && w.topic == topic
+      end
+      return nil unless worker&.consumer_class
+
+      filter = worker.consumer_class.constantize.new(partition_key: partition_key).event_filter
+      filter.presence
+    rescue StandardError => e
+      OutboxRelay.logger&.warn(
+        event_name: 'partition_monitor_event_filter_lookup_failed',
+        consumer_group: consumer_group_base,
+        topic: topic,
+        error: e.message
+      )
+      nil
     end
 
     def extract_partition_key(consumer_group)
