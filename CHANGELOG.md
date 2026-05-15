@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-05-15
+
+### Added
+
+- **`PartitionMonitor#stale_consumer_offsets`** — returns `ConsumerOffset` rows whose base `consumer_group` is no longer present in `config/outbox_consumers.yml`. Supplements `#stale_consumer_groups` (which returns just the names) with per-partition diagnostic data (offset id, topic, partition_key, last_consumed_sequence, last_consumed_at, heartbeat_at, claim state) suitable for ops review or automated pruning. Accepts `idle_for:` (skip offsets whose heartbeat is newer than the cutoff, with NULL heartbeats always eligible) and `exclude_claimed:` (default true — never report rows held by an active partition claim).
+- **`rake outbox_relay:stale_consumers`** — read-only diagnostic that lists stale offsets grouped by consumer_group, shows which topics have their cleanup blocked and at what sequence, and exits 1 when any are found so CI / monitoring can detect drift.
+- **`rake outbox_relay:prune_stale_consumers[idle_days]`** — manual cleanup that deletes stale offsets older than `idle_days` (required, no default — operator must explicitly choose grace window). Bounded by the same safety filters as `stale_consumer_offsets` (not-in-config, idle, not actively claimed). Emits `outbox_relay.stale_offsets.pruned` notification following the existing `outbox_relay.<category>.<event>` convention so dashboards subscribed to `/^outbox_relay\./` pick it up alongside cleanup events.
+
 ## [0.9.3] - 2026-05-11
 
 ### Fixed

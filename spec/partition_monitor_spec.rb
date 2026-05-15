@@ -283,6 +283,103 @@ RSpec.describe OutboxRelay::PartitionMonitor do
     end
   end
 
+  describe '#stale_consumer_offsets' do
+    before do
+      # In-config: should never appear in stale list
+      OutboxRelay::ConsumerOffset.create!(
+        consumer_group: "#{consumer_group}_p0",
+        topic: topic,
+        last_consumed_sequence: 100,
+        heartbeat_at: 1.minute.ago
+      )
+
+      # Stale: consumer_group is NOT in configuration, idle for days
+      OutboxRelay::ConsumerOffset.create!(
+        consumer_group: 'retired_group_p0',
+        topic: topic,
+        last_consumed_sequence: 50,
+        heartbeat_at: 30.days.ago,
+        last_consumed_at: 30.days.ago
+      )
+      OutboxRelay::ConsumerOffset.create!(
+        consumer_group: 'retired_group_p1',
+        topic: topic,
+        last_consumed_sequence: 51,
+        heartbeat_at: nil,
+        last_consumed_at: 30.days.ago
+      )
+
+      # Stale but recently active: heartbeat is fresh
+      OutboxRelay::ConsumerOffset.create!(
+        consumer_group: 'just_removed_group_p0',
+        topic: topic,
+        last_consumed_sequence: 60,
+        heartbeat_at: 30.seconds.ago
+      )
+
+      # Stale but still claimed (worker draining)
+      OutboxRelay::ConsumerOffset.create!(
+        consumer_group: 'draining_group_p0',
+        topic: topic,
+        last_consumed_sequence: 70,
+        heartbeat_at: 30.days.ago,
+        claimed_by: 'worker-x',
+        claimed_until: 1.minute.from_now
+      )
+    end
+
+    it 'returns offsets whose base consumer_group is not in configuration' do
+      results = monitor.stale_consumer_offsets
+
+      groups = results.map { |r| r[:consumer_group] }.uniq
+      expect(groups).to contain_exactly('retired_group', 'just_removed_group')
+      # `draining_group` excluded because claimed; in-config group excluded by name.
+    end
+
+    it 'includes diagnostic metadata for each stale offset' do
+      results = monitor.stale_consumer_offsets
+
+      retired_p0 = results.find { |r| r[:full_consumer_group] == 'retired_group_p0' }
+      expect(retired_p0).to include(
+        consumer_group: 'retired_group',
+        topic: topic,
+        partition_key: 0,
+        last_consumed_sequence: 50
+      )
+      expect(retired_p0[:id]).to be_a(Integer)
+      expect(retired_p0[:last_consumed_at]).to be_present
+      expect(retired_p0[:heartbeat_at]).to be_present
+    end
+
+    context 'with :idle_for filter' do
+      it 'excludes offsets whose heartbeat is newer than the cutoff' do
+        results = monitor.stale_consumer_offsets(idle_for: 7.days)
+
+        groups = results.map { |r| r[:consumer_group] }.uniq
+        expect(groups).to contain_exactly('retired_group')
+        # `just_removed_group` heartbeat (30s ago) is inside the 7-day window.
+      end
+
+      it 'still includes offsets with NULL heartbeat regardless of cutoff' do
+        # NULL heartbeat means "never alive in current schema" — always eligible
+        # so a forever-idle offset can be pruned.
+        results = monitor.stale_consumer_offsets(idle_for: 7.days)
+
+        full_groups = results.map { |r| r[:full_consumer_group] }
+        expect(full_groups).to include('retired_group_p1') # heartbeat_at is nil
+      end
+    end
+
+    context 'with exclude_claimed: false' do
+      it 'includes claimed stale offsets' do
+        results = monitor.stale_consumer_offsets(exclude_claimed: false)
+
+        full_groups = results.map { |r| r[:full_consumer_group] }
+        expect(full_groups).to include('draining_group_p0')
+      end
+    end
+  end
+
   describe 'lag with event_filter' do
     # Pure subclass — initializer has no side effects, safe to instantiate from monitor.
     class FilteredTestConsumer < OutboxRelay::OutboxConsumer
