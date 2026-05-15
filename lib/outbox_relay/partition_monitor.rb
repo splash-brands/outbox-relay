@@ -132,6 +132,60 @@ module OutboxRelay
                     .reject { |cg| expected_groups.include?(cg) }
     end
 
+    # Returns ConsumerOffset records whose base consumer_group is no longer in the
+    # configuration. These rows block CleanupExpiredEventsJob because the cleanup
+    # query requires `sequence < MIN(last_consumed_sequence) per topic` — a frozen
+    # offset from a removed consumer group keeps the MIN pinned forever, so expired
+    # events in that topic accumulate indefinitely.
+    #
+    # Typical sources of stale offsets:
+    #   * A consumer_group was renamed in outbox_consumers.yml; old offsets remain.
+    #   * A consumer_group was decommissioned (commented out / deleted from yml).
+    #   * A consumer_group was migrated to a different topic.
+    #
+    # ## Safety filters
+    #
+    # @param idle_for [ActiveSupport::Duration, nil] Optional minimum idle window.
+    #   When set, only returns offsets whose heartbeat_at is NULL or older than
+    #   `idle_for.ago`. Protects against pruning offsets for a consumer that was
+    #   just removed from config but whose workers are still draining in production.
+    # @param exclude_claimed [Boolean] When true (default), skip rows with an active
+    #   partition claim. A claim means a worker is currently running for this offset
+    #   — treat it as live until the claim expires.
+    #
+    # @return [Array<Hash>] Stale offsets with metadata suitable for ops review or
+    #   automated pruning. Each hash includes the offset id (so callers can delete
+    #   without re-resolving by composite key) plus the diagnostic fields shown by
+    #   `outbox_relay:stale_consumers`.
+    def stale_consumer_offsets(idle_for: nil, exclude_claimed: true)
+      expected_groups = expected_partitions.map { |p| p[:consumer_group] }.uniq.to_set
+
+      scope = ConsumerOffset.all
+      scope = scope.unclaimed if exclude_claimed
+      if idle_for
+        cutoff = idle_for.ago
+        scope = scope.where('heartbeat_at IS NULL OR heartbeat_at < ?', cutoff)
+      end
+
+      scope.map do |offset|
+        base = base_consumer_group(offset.consumer_group)
+        next if expected_groups.include?(base)
+
+        {
+          id: offset.id,
+          consumer_group: base,
+          full_consumer_group: offset.consumer_group,
+          topic: offset.topic,
+          partition_key: extract_partition_key(offset.consumer_group),
+          last_consumed_sequence: offset.last_consumed_sequence,
+          last_consumed_at: offset.last_consumed_at,
+          heartbeat_at: offset.heartbeat_at,
+          claimed_by: offset.claimed_by,
+          claimed_until: offset.claimed_until
+        }
+      end.compact
+    end
+
     # Returns lag for a specific partition
     #
     # @param consumer_group [String] Base consumer group name (without _pN suffix)
