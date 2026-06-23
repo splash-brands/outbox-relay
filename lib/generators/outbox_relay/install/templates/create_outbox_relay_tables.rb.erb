@@ -20,6 +20,12 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
 
       # Ordering & partitioning
       t.bigint(:sequence, null: false)
+      # commit_seq: per-(topic, partition_key) ordering token assigned at the
+      # COMMIT edge by the constraint trigger below (SB-2140). Consumers fetch and
+      # track offsets by commit_seq so a lower-`sequence` row that commits late can
+      # never be skipped. Nullable: it is NULL during INSERT and set by the
+      # DEFERRED trigger at commit (a NOT NULL column would reject the INSERT).
+      t.bigint(:commit_seq)
       t.integer(:partition_key, null: false, default: 0)
 
       # Expiration (optional TTL)
@@ -35,10 +41,98 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
     add_index(:outbox_relay_outbox_events, :event_id, unique: true)
     add_index(:outbox_relay_outbox_events, :expires_at, where: "expires_at IS NOT NULL")
 
+    # Consumer fetch + per-partition uniqueness for commit_seq (SB-2140).
+    # Serves: WHERE topic=? AND partition_key=? AND commit_seq > ? ORDER BY commit_seq.
+    # Partial so the in-flight NULL (pre-commit) values don't participate.
+    add_index(:outbox_relay_outbox_events, [:topic, :partition_key, :commit_seq],
+              unique: true, where: "commit_seq IS NOT NULL",
+              name: "idx_outbox_commit_seq_fetch")
+
     # Sequence generator for globally ordered events
     safety_assured do
       execute(<<~SQL)
         CREATE SEQUENCE IF NOT EXISTS outbox_relay_outbox_events_sequence START 1;
+      SQL
+    end
+
+    # ============================================================================
+    # COMMIT-ORDERED SEQUENCE (SB-2140)
+    # ============================================================================
+    # Per-(topic, partition) sequencer + a DEFERRABLE INITIALLY DEFERRED constraint
+    # trigger that assigns commit_seq at the COMMIT edge. The per-partition
+    # sequencer row lock (released only at commit) forces, per partition:
+    #   commit_seq order == commit order == visibility order
+    # so consumers reading `WHERE commit_seq > offset ORDER BY commit_seq` never
+    # skip a row. The DEFERRED edge means long transactions hold the lock only for
+    # milliseconds at commit, not for the whole transaction.
+    #
+    # NOTE: triggers do NOT fire under session_replication_role = 'replica'
+    # (logical replication / DMS). An app-written outbox is unaffected.
+
+    create_table(:outbox_relay_partition_seq, id: false) do |t|
+      t.string(:topic, null: false)
+      t.integer(:partition_id, null: false)
+      t.bigint(:next_seq, null: false, default: 0)
+    end
+
+    safety_assured do
+      execute(<<~SQL)
+        ALTER TABLE outbox_relay_partition_seq
+          ADD CONSTRAINT outbox_relay_partition_seq_pkey PRIMARY KEY (topic, partition_id);
+      SQL
+
+      execute(<<~SQL)
+        CREATE OR REPLACE FUNCTION outbox_relay_assign_commit_seq()
+        RETURNS trigger LANGUAGE plpgsql AS $fn$
+        DECLARE
+          part RECORD;
+          base bigint;
+        BEGIN
+          FOR part IN
+            SELECT topic, partition_key, count(*) AS n
+            FROM inserted
+            GROUP BY topic, partition_key
+            ORDER BY topic COLLATE "C", partition_key
+          LOOP
+            LOOP
+              UPDATE outbox_relay_partition_seq
+                 SET next_seq = next_seq + part.n
+               WHERE topic = part.topic AND partition_id = part.partition_key
+               RETURNING next_seq INTO base;
+              EXIT WHEN FOUND;
+              BEGIN
+                INSERT INTO outbox_relay_partition_seq (topic, partition_id, next_seq)
+                VALUES (part.topic, part.partition_key,
+                        (SELECT last_value FROM outbox_relay_outbox_events_sequence) + part.n)
+                RETURNING next_seq INTO base;
+                EXIT;
+              EXCEPTION WHEN unique_violation THEN
+              END;
+            END LOOP;
+
+            WITH ordered AS (
+              SELECT i.id, row_number() OVER (ORDER BY i.sequence) AS rn
+              FROM inserted i
+              WHERE i.topic = part.topic AND i.partition_key = part.partition_key
+            )
+            UPDATE outbox_relay_outbox_events e
+               SET commit_seq = base - part.n + ordered.rn
+              FROM ordered
+             WHERE e.id = ordered.id;
+          END LOOP;
+
+          RETURN NULL;
+        END;
+        $fn$;
+      SQL
+
+      execute(<<~SQL)
+        CREATE CONSTRAINT TRIGGER outbox_relay_commit_seq_trg
+          AFTER INSERT ON outbox_relay_outbox_events
+          DEFERRABLE INITIALLY DEFERRED
+          REFERENCING NEW TABLE AS inserted
+          FOR EACH STATEMENT
+          EXECUTE FUNCTION outbox_relay_assign_commit_seq();
       SQL
     end
 
