@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Generated migrations now wrap their raw `execute` / data backfill in
   `safety_assured { ... }` so they pass under **strong_migrations** in consuming
   apps without manual patching.
+- **`add_commit_seq` is now safe on large tables.** Dropped the
+  `LOCK TABLE ... SHARE ROW EXCLUSIVE` + full-table `SELECT DISTINCT` pre-seed
+  (which blocked writes for the duration of a multi-GB scan) — the trigger already
+  lazily seeds each partition from the global sequence high-water on first insert,
+  so the pre-seed was redundant. The historical backfill now batches by **primary
+  key range** instead of `WHERE commit_seq IS NULL LIMIT n` (which re-scanned the
+  growing filled prefix every batch — O(n²)). Verified end-to-end on PostgreSQL 16.
+  Note: `CREATE TRIGGER` still briefly locks the table, so run the migration in a
+  quiet window or with a short `lock_timeout` if long bulk-import transactions may
+  be in flight.
 - Added a **Postgres integration spec** (`spec/pg/commit_seq_trigger_spec.rb`) plus
   a `spec_pg` CI job that runs the real DDL against PostgreSQL and asserts
   assignment, the lost-event race, and deadlock-freedom — closing the CI gap that
