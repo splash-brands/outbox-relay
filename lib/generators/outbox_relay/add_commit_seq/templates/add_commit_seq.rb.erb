@@ -18,6 +18,12 @@
 # * A DEFERRABLE INITIALLY DEFERRED, per-ROW, AFTER INSERT constraint trigger that
 #   assigns commit_seq at the COMMIT edge.
 #
+# This migration is SCHEMA-ONLY and fast — it does NOT backfill existing rows.
+# After it runs, new inserts get commit_seq via the trigger; backfill the
+# historical rows out of band with `rake outbox_relay:backfill_commit_seq`
+# (throttleable, resumable). The backfill must finish before the Stage 2 consumer
+# flip.
+#
 # ## Trigger shape (why per-row + advisory lock)
 #
 # PostgreSQL only allows DEFERRABLE on a CONSTRAINT TRIGGER, and a CONSTRAINT
@@ -47,29 +53,42 @@
 class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migration_version %>
   disable_ddl_transaction!
 
-  BACKFILL_BATCH_SIZE = 10_000
-
   def up
     create_partition_seq_table
     unless column_exists?(:outbox_relay_outbox_events, :commit_seq)
       add_column :outbox_relay_outbox_events, :commit_seq, :bigint
     end
 
-    # Seed existing partitions and install the trigger atomically under a brief
-    # write-blocking lock (reads are unaffected). Guarantees no INSERT slips
-    # through between seeding and trigger creation. The lock is held only for fast
-    # DDL — the heavy backfill of historical rows runs afterwards, unlocked.
-    transaction do
-      safety_assured do
-        execute "LOCK TABLE outbox_relay_outbox_events IN SHARE ROW EXCLUSIVE MODE"
-        execute seed_existing_partitions_sql
-        execute create_function_sql
-        execute create_trigger_sql
-      end
+    # Install the trigger. CREATE TRIGGER takes its own brief lock atomically, so
+    # an INSERT is either fully before it (commit_seq NULL → caught by the backfill
+    # below) or fully after (trigger fires) — no half state, no explicit table lock
+    # needed. We do NOT pre-seed existing partitions: the trigger lazily seeds each
+    # partition's sequencer row from the global sequence high-water on its first
+    # insert (same result), which avoids a full-table scan under a write-blocking
+    # lock on a large table.
+    #
+    # CAUTION on very busy tables / long-running transactions: CREATE TRIGGER must
+    # briefly acquire SHARE ROW EXCLUSIVE on the table. If a long transaction (e.g.
+    # a bulk import) is in flight it will wait behind it, and new writes queue
+    # behind the waiting DDL. Run during a quiet window, or set a short lock_timeout
+    # and retry, so a stuck acquisition doesn't stall publishers.
+    safety_assured do
+      execute create_function_sql
+      execute create_trigger_sql
     end
 
-    backfill_historical_rows
     add_commit_seq_index
+
+    # NOTE: historical rows are NOT backfilled here. From now on new inserts get a
+    # commit_seq via the trigger; existing rows stay NULL until you run the
+    # throttleable, resumable backfill task OUT of band:
+    #
+    #   bundle exec rake outbox_relay:backfill_commit_seq
+    #
+    # Keeping a 1M+ row rewrite out of the migration avoids a long, unmonitorable,
+    # un-resumable deploy step. The backfill MUST complete (zero committed NULL
+    # commit_seq) before the Stage 2 consumer flip — Stage 1 consumers still read
+    # `sequence`, so NULLs are harmless until then.
   end
 
   def down
@@ -97,42 +116,6 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
         ALTER TABLE outbox_relay_partition_seq
           ADD CONSTRAINT outbox_relay_partition_seq_pkey PRIMARY KEY (topic, partition_id)
       SQL
-    end
-  end
-
-  # Seed every existing (topic, partition_key) sequencer row from the GLOBAL
-  # sequence high-water — NOT the per-partition max. Offsets are global `sequence`
-  # values; seeding from the global max guarantees every post-cutover commit_seq
-  # exceeds every existing consumer offset, so the consumer flip needs no
-  # offset-row migration. ON CONFLICT DO NOTHING keeps re-runs idempotent.
-  def seed_existing_partitions_sql
-    <<~SQL
-      INSERT INTO outbox_relay_partition_seq (topic, partition_id, next_seq)
-      SELECT d.topic, d.partition_key,
-             (SELECT last_value FROM outbox_relay_outbox_events_sequence)
-      FROM (SELECT DISTINCT topic, partition_key FROM outbox_relay_outbox_events) d
-      ON CONFLICT (topic, partition_id) DO NOTHING
-    SQL
-  end
-
-  # Historical rows: commit_seq = sequence. The global sequence ascends, so this
-  # is per-partition monotonic and globally unique → satisfies the partial unique
-  # index. Only touches still-NULL rows (post-trigger inserts already have a
-  # commit_seq), so it never races the live trigger. Batched to bound lock time.
-  def backfill_historical_rows
-    loop do
-      affected = safety_assured do
-        exec_update(<<~SQL)
-          UPDATE outbox_relay_outbox_events
-             SET commit_seq = sequence
-           WHERE id IN (
-             SELECT id FROM outbox_relay_outbox_events
-              WHERE commit_seq IS NULL
-              LIMIT #{BACKFILL_BATCH_SIZE}
-           )
-        SQL
-      end
-      break if affected.zero?
     end
   end
 
