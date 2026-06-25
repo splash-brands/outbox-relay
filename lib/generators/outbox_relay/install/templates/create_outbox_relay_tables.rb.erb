@@ -58,13 +58,19 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
     # ============================================================================
     # COMMIT-ORDERED SEQUENCE (SB-2140)
     # ============================================================================
-    # Per-(topic, partition) sequencer + a DEFERRABLE INITIALLY DEFERRED constraint
-    # trigger that assigns commit_seq at the COMMIT edge. The per-partition
-    # sequencer row lock (released only at commit) forces, per partition:
-    #   commit_seq order == commit order == visibility order
-    # so consumers reading `WHERE commit_seq > offset ORDER BY commit_seq` never
-    # skip a row. The DEFERRED edge means long transactions hold the lock only for
+    # Per-(topic, partition) sequencer + a DEFERRABLE INITIALLY DEFERRED, per-ROW
+    # constraint trigger that assigns commit_seq at the COMMIT edge so that, per
+    # (topic, partition): commit_seq order == commit order == visibility order.
+    # Consumers reading `WHERE commit_seq > offset ORDER BY commit_seq` never skip
+    # a row. The DEFERRED edge means long transactions hold their locks only for
     # milliseconds at commit, not for the whole transaction.
+    #
+    # Must be per-ROW with no transition table: PostgreSQL only allows DEFERRABLE
+    # on a CONSTRAINT TRIGGER, which must be FOR EACH ROW and may not use
+    # REFERENCING ... TABLE. A per-TOPIC advisory xact lock (two-int form, a
+    # distinct space from the consumer's bigint advisory locks) serializes
+    # commit-edge assignment per topic, making multi-partition transactions
+    # deadlock-free while different topics proceed in parallel.
     #
     # NOTE: triggers do NOT fire under session_replication_role = 'replica'
     # (logical replication / DMS). An app-written outbox is unaffected.
@@ -85,42 +91,31 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
         CREATE OR REPLACE FUNCTION outbox_relay_assign_commit_seq()
         RETURNS trigger LANGUAGE plpgsql AS $fn$
         DECLARE
-          part RECORD;
           base bigint;
         BEGIN
-          FOR part IN
-            SELECT topic, partition_key, count(*) AS n
-            FROM inserted
-            GROUP BY topic, partition_key
-            ORDER BY topic COLLATE "C", partition_key
-          LOOP
-            LOOP
-              UPDATE outbox_relay_partition_seq
-                 SET next_seq = next_seq + part.n
-               WHERE topic = part.topic AND partition_id = part.partition_key
-               RETURNING next_seq INTO base;
-              EXIT WHEN FOUND;
-              BEGIN
-                INSERT INTO outbox_relay_partition_seq (topic, partition_id, next_seq)
-                VALUES (part.topic, part.partition_key,
-                        (SELECT last_value FROM outbox_relay_outbox_events_sequence) + part.n)
-                RETURNING next_seq INTO base;
-                EXIT;
-              EXCEPTION WHEN unique_violation THEN
-              END;
-            END LOOP;
+          IF NEW.commit_seq IS NOT NULL THEN
+            RETURN NULL;
+          END IF;
 
-            WITH ordered AS (
-              SELECT i.id, row_number() OVER (ORDER BY i.sequence) AS rn
-              FROM inserted i
-              WHERE i.topic = part.topic AND i.partition_key = part.partition_key
-            )
-            UPDATE outbox_relay_outbox_events e
-               SET commit_seq = base - part.n + ordered.rn
-              FROM ordered
-             WHERE e.id = ordered.id;
+          PERFORM pg_advisory_xact_lock(hashtext('outbox_relay_commit_seq'), hashtext(NEW.topic));
+
+          LOOP
+            UPDATE outbox_relay_partition_seq
+               SET next_seq = next_seq + 1
+             WHERE topic = NEW.topic AND partition_id = NEW.partition_key
+             RETURNING next_seq INTO base;
+            EXIT WHEN FOUND;
+            BEGIN
+              INSERT INTO outbox_relay_partition_seq (topic, partition_id, next_seq)
+              VALUES (NEW.topic, NEW.partition_key,
+                      (SELECT last_value FROM outbox_relay_outbox_events_sequence) + 1)
+              RETURNING next_seq INTO base;
+              EXIT;
+            EXCEPTION WHEN unique_violation THEN
+            END;
           END LOOP;
 
+          UPDATE outbox_relay_outbox_events SET commit_seq = base WHERE id = NEW.id;
           RETURN NULL;
         END;
         $fn$;
@@ -130,8 +125,7 @@ class <%= migration_class_name %> < ActiveRecord::Migration[<%= ActiveRecord::Mi
         CREATE CONSTRAINT TRIGGER outbox_relay_commit_seq_trg
           AFTER INSERT ON outbox_relay_outbox_events
           DEFERRABLE INITIALLY DEFERRED
-          REFERENCING NEW TABLE AS inserted
-          FOR EACH STATEMENT
+          FOR EACH ROW
           EXECUTE FUNCTION outbox_relay_assign_commit_seq();
       SQL
     end
