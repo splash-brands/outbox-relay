@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-25
+
 ### Added — SB-2140 Stage 1 (write-only; consumers still read `sequence`)
 
 This release installs the commit-ordered sequence machinery but **does not change
