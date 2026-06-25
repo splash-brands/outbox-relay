@@ -14,6 +14,10 @@ ActiveRecord::Base.logger = Logger.new(nil) if ENV["VERBOSE_TESTS"] != "true"
 ActiveRecord::Schema.define do
   create_table :outbox_relay_outbox_events, force: true do |t|
     t.integer :sequence, null: false
+    # commit_seq: COMMIT-edge ordering token. In production a PostgreSQL DEFERRABLE
+    # constraint trigger assigns it; SQLite has no triggers, so the test harness
+    # simulates per-(topic, partition_key) assignment below (mirrors next_sequence).
+    t.integer :commit_seq
     t.string :topic, null: false
     t.string :event_id, null: false
     t.string :event_name
@@ -28,6 +32,7 @@ ActiveRecord::Schema.define do
     t.index :event_name
     t.index :partition_key
     t.index [:topic, :partition_key]
+    t.index [:topic, :partition_key, :commit_seq], unique: true, name: "idx_outbox_commit_seq_fetch"
     t.index :created_at
   end
 
@@ -114,10 +119,25 @@ module OutboxRelay
     # Override event_id default for SQLite (no gen_random_uuid())
     before_validation :set_event_id, on: :create
 
+    # Simulate the production commit_seq trigger. SQLite has no triggers and is
+    # single-threaded in tests, so there is no commit-order race to model — we
+    # only need commit_seq populated so the consumer/offset/lag/cleanup logic that
+    # now keys off commit_seq is exercised. Default commit_seq = sequence (both are
+    # monotonic and globally unique), which matches the production backfill of
+    # historical rows and lets specs reason in a single ordering value. Specs that
+    # need commit_seq to DIVERGE from sequence (to prove the consumer follows
+    # commit_seq) pass commit_seq: explicitly. before_create so it runs after
+    # next_sequence has assigned sequence.
+    before_create :assign_commit_seq_for_tests
+
     private
 
     def set_event_id
       self.event_id ||= SecureRandom.uuid
+    end
+
+    def assign_commit_seq_for_tests
+      self.commit_seq = sequence if commit_seq.nil?
     end
   end
 

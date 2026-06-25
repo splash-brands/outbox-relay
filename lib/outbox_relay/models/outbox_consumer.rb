@@ -182,7 +182,7 @@ module OutboxRelay
       # are global across all topics, so the gap overstates real backlog.
       OutboxRelay::OutboxEvent
         .where(topic: topic, partition_key: partition_key)
-        .where('sequence > ?', current_offset.last_consumed_sequence)
+        .where('commit_seq > ?', current_offset.last_consumed_sequence)
         .count
     end
 
@@ -206,18 +206,23 @@ module OutboxRelay
       @current_batch_retry_ids = retry_ready_ids.to_set
 
       # Build query for normal events (after current offset) + retry-ready events
-      # Using OR to combine: (sequence > offset AND not in DLQ) OR (ready for retry)
+      # Using OR to combine: (commit_seq > offset AND not in DLQ) OR (ready for retry)
+      #
+      # Ordering/cursor is commit_seq (assigned at the COMMIT edge), NOT sequence
+      # (assigned at INSERT). This closes the long-transaction race where a
+      # lower-sequence row that commits late lands below the high-water offset and
+      # is silently skipped. See SB-2140.
       query = OutboxRelay::OutboxEvent
               .where(topic: topic)
               .where(partition_key: partition_key)
               .where(
-                '(sequence > :offset AND id NOT IN (:dlq_ids)) OR id IN (:retry_ids)',
+                '(commit_seq > :offset AND id NOT IN (:dlq_ids)) OR id IN (:retry_ids)',
                 offset: offset.last_consumed_sequence,
                 dlq_ids: dlq_event_ids.presence || [0], # [0] for empty array to avoid SQL syntax error
                 retry_ids: retry_ready_ids.presence || [0]
               )
               .not_expired
-              .by_sequence
+              .by_commit_seq
               .limit(batch_size)
 
       # Apply event filtering (matches Karafka's MarkingEventTypeFilter)
@@ -495,9 +500,9 @@ module OutboxRelay
     # @param lock_key [Integer] Advisory lock key for this event
     # @param is_dlq_retry [Boolean] True if this event is being retried from DLQ
     def can_process_event?(event, lock_key, is_dlq_retry: false)
-      # Skip offset check for DLQ retry events - they have sequence <= offset by definition
+      # Skip offset check for DLQ retry events - they have commit_seq <= offset by definition
       # (they were already processed and failed, so offset moved past them)
-      if !is_dlq_retry && (event.sequence <= current_offset.last_consumed_sequence)
+      if !is_dlq_retry && (event.commit_seq <= current_offset.last_consumed_sequence)
         # Skip if already processed by another worker (normal in multi-worker setup)
         return false
       end
@@ -517,11 +522,12 @@ module OutboxRelay
       # Defensive check: verify event wasn't processed while we were working
       # This shouldn't happen due to advisory lock, but provides extra safety
       current_seq = current_offset.reload.last_consumed_sequence
-      if event.sequence <= current_seq
+      if event.commit_seq <= current_seq
         @logger.warn(
           event_name: 'offset_already_advanced',
           event_id: event.event_id,
           sequence: event.sequence,
+          commit_seq: event.commit_seq,
           current_offset: current_seq,
           consumer_group: consumer_group,
           message: 'Offset already advanced past this event - skipping update'
@@ -681,7 +687,7 @@ module OutboxRelay
 
     def update_offset(event)
       current_offset.update_offset!(
-        sequence: event.sequence,
+        commit_seq: event.commit_seq,
         event_id: event.event_id
       )
     end

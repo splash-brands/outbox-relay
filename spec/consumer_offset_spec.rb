@@ -137,7 +137,7 @@ RSpec.describe OutboxRelay::ConsumerOffset do
     context 'when sequence is greater than current' do
       it 'updates the offset and returns true' do
         result = offset.update_offset!(
-          sequence: 150,
+          commit_seq: 150,
           event_id: 'event-150'
         )
 
@@ -152,7 +152,7 @@ RSpec.describe OutboxRelay::ConsumerOffset do
     context 'when sequence is equal to current (Kafka-style out-of-order)' do
       it 'skips update and returns false' do
         result = offset.update_offset!(
-          sequence: 100,
+          commit_seq: 100,
           event_id: 'event-100'
         )
 
@@ -164,10 +164,10 @@ RSpec.describe OutboxRelay::ConsumerOffset do
     context 'when sequence is less than current (out-of-order completion)' do
       it 'skips update and returns false' do
         # Simulate: Worker B completed seq=150 first, Worker A completes seq=120 later
-        offset.update_offset!(sequence: 150, event_id: 'event-150')
+        offset.update_offset!(commit_seq: 150, event_id: 'event-150')
 
         result = offset.update_offset!(
-          sequence: 120,
+          commit_seq: 120,
           event_id: 'event-120'
         )
 
@@ -188,7 +188,7 @@ RSpec.describe OutboxRelay::ConsumerOffset do
 
         # Worker B completes first with seq=150
         worker_b_result = offset.update_offset!(
-          sequence: 150,
+          commit_seq: 150,
           event_id: 'event-150'
         )
         expect(worker_b_result).to be true
@@ -196,7 +196,7 @@ RSpec.describe OutboxRelay::ConsumerOffset do
 
         # Worker A completes later with seq=120 (stale offset)
         worker_a_result = offset.update_offset!(
-          sequence: 120,
+          commit_seq: 120,
           event_id: 'event-120'
         )
         expect(worker_a_result).to be false
@@ -213,17 +213,17 @@ RSpec.describe OutboxRelay::ConsumerOffset do
         # They complete in reverse order: 130, 120, 110
 
         # Worker C completes first with seq=130
-        result_c = offset.update_offset!(sequence: 130, event_id: 'event-130')
+        result_c = offset.update_offset!(commit_seq: 130, event_id: 'event-130')
         expect(result_c).to be true
         expect(offset.reload.last_consumed_sequence).to eq(130)
 
         # Worker B completes with seq=120 (stale)
-        result_b = offset.update_offset!(sequence: 120, event_id: 'event-120')
+        result_b = offset.update_offset!(commit_seq: 120, event_id: 'event-120')
         expect(result_b).to be false
         expect(offset.reload.last_consumed_sequence).to eq(130)
 
         # Worker A completes with seq=110 (stale)
-        result_a = offset.update_offset!(sequence: 110, event_id: 'event-110')
+        result_a = offset.update_offset!(commit_seq: 110, event_id: 'event-110')
         expect(result_a).to be false
         expect(offset.reload.last_consumed_sequence).to eq(130)
       end
@@ -243,17 +243,17 @@ RSpec.describe OutboxRelay::ConsumerOffset do
         # With proper locking (with_lock + reload), conditional update works correctly
 
         # Worker A tries to update to 110
-        result_a = offset.update_offset!(sequence: 110, event_id: 'event-110')
+        result_a = offset.update_offset!(commit_seq: 110, event_id: 'event-110')
         expect(result_a).to be true
         expect(offset.reload.last_consumed_sequence).to eq(110)
 
         # Worker B tries to update to 105 (stale, should be skipped)
-        result_b = offset.update_offset!(sequence: 105, event_id: 'event-105')
+        result_b = offset.update_offset!(commit_seq: 105, event_id: 'event-105')
         expect(result_b).to be false
         expect(offset.reload.last_consumed_sequence).to eq(110) # Unchanged
 
         # Worker C updates to 115 (fresh, should succeed)
-        result_c = offset.update_offset!(sequence: 115, event_id: 'event-115')
+        result_c = offset.update_offset!(commit_seq: 115, event_id: 'event-115')
         expect(result_c).to be true
         expect(offset.reload.last_consumed_sequence).to eq(115)
       end
@@ -270,7 +270,7 @@ RSpec.describe OutboxRelay::ConsumerOffset do
         expect(offset.changed?).to be true
 
         # Should NOT raise "Locking a record with unpersisted changes is not supported"
-        result = offset.update_offset!(sequence: 150, event_id: 'event-150')
+        result = offset.update_offset!(commit_seq: 150, event_id: 'event-150')
 
         expect(result).to be true
         expect(offset.reload.last_consumed_sequence).to eq(150)
@@ -278,14 +278,14 @@ RSpec.describe OutboxRelay::ConsumerOffset do
 
       it 'handles multiple consecutive update_offset! calls without reload' do
         # Simulate consumer loop processing events without manual reloads
-        result1 = offset.update_offset!(sequence: 110, event_id: 'event-110')
+        result1 = offset.update_offset!(commit_seq: 110, event_id: 'event-110')
         expect(result1).to be true
 
         # Don't reload - keep using the same object
-        result2 = offset.update_offset!(sequence: 120, event_id: 'event-120')
+        result2 = offset.update_offset!(commit_seq: 120, event_id: 'event-120')
         expect(result2).to be true
 
-        result3 = offset.update_offset!(sequence: 130, event_id: 'event-130')
+        result3 = offset.update_offset!(commit_seq: 130, event_id: 'event-130')
         expect(result3).to be true
 
         expect(offset.reload.last_consumed_sequence).to eq(130)
