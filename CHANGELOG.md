@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-25
+
+### Changed — SB-2140 Stage 2 (consumer cursor flip to `commit_seq`)
+
+Completes the fix: consumers now fetch, order, track offsets, and compute lag by
+`commit_seq` instead of `sequence`. **Requires Stage 1 / 0.10.0 (the `commit_seq`
+column + trigger) to be migrated first** — deploy ordering matters: the migration
+must finish before this consumer code starts, or the queries hit a missing/NULL
+column.
+
+- Consumer fetch/ordering, the offset guard, `ConsumerOffset#update_offset!`
+  (keyword renamed `sequence:` → `commit_seq:`), the `:latest` auto-offset-reset
+  seed, all three lag queries (`OutboxConsumer#lag`, `ConsumerOffset#lag`,
+  `PartitionMonitor#calculate_lag`), and `CleanupExpiredEventsJob`'s consumed-gate
+  subquery now key off `commit_seq`. `sequence` is retained unchanged (still
+  unique, still used for the advisory-lock key and intra-transaction ordering).
+- The stored offset column stays `last_consumed_sequence` (it now holds a
+  `commit_seq` value) — **no offset-row migration**: historical rows have
+  `commit_seq == sequence` and new `commit_seq` values continue above the global
+  sequence high-water, so any pre-cutover offset remains a valid threshold.
+- Rollback is one-way-safe: redeploying 0.10.0 (read by `sequence`) shortly after
+  cutover is clean; after the consumer has advanced far on new `commit_seq` events,
+  a rollback may re-deliver (at-least-once; consumers are idempotent).
+
 ## [0.10.0] - 2026-06-25
 
 ### Added — SB-2140 Stage 1 (write-only; consumers still read `sequence`)

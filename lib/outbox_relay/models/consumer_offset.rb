@@ -68,13 +68,21 @@ module OutboxRelay
                                         when :earliest
                                           0
                                         else # :latest (default)
-                                          OutboxRelay::OutboxEvent.where(topic: topic).maximum(:sequence) || 0
+                                          # Seed from commit_seq (the consumer cursor), not sequence. See SB-2140.
+                                          OutboxRelay::OutboxEvent.where(topic: topic).maximum(:commit_seq) || 0
                                         end
       end
     end
 
     # Instance methods
-    def update_offset!(sequence:, event_id:)
+    #
+    # NOTE (SB-2140): the cursor is now the event's `commit_seq` (assigned at the
+    # COMMIT edge), not `sequence` (assigned at INSERT). The stored column is still
+    # named `last_consumed_sequence` to avoid an offset-row migration — historical
+    # rows have commit_seq == sequence and new commit_seq values continue above the
+    # global sequence high-water, so any pre-cutover offset value remains a valid
+    # commit_seq threshold.
+    def update_offset!(commit_seq:, event_id:)
       # Kafka-style conditional offset update to handle out-of-order completion
       # in concurrent worker environments.
       #
@@ -126,7 +134,7 @@ module OutboxRelay
         lock!
 
         # Check if this is a stale offset (event processed out-of-order)
-        if sequence <= last_consumed_sequence
+        if commit_seq <= last_consumed_sequence
           # This is expected in concurrent processing - not an error!
           # Worker completed processing but another worker already advanced offset
           return false
@@ -134,7 +142,7 @@ module OutboxRelay
 
         # Offset is fresh - update it
         update!(
-          last_consumed_sequence: sequence,
+          last_consumed_sequence: commit_seq,
           last_consumed_event_id: event_id,
           last_consumed_at: Time.current,
           heartbeat_at: Time.current
@@ -156,7 +164,7 @@ module OutboxRelay
       # For partition-specific lag, use OutboxConsumer#lag instead.
       OutboxRelay::OutboxEvent
         .where(topic: topic)
-        .where('sequence > ?', last_consumed_sequence)
+        .where('commit_seq > ?', last_consumed_sequence)
         .count
     end
 

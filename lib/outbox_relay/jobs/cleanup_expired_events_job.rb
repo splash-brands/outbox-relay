@@ -204,9 +204,10 @@ module OutboxRelay
 
       # Delete expired events that have been fully consumed.
       #
-      # An event is deleted only if its sequence is strictly less than the minimum
-      # last_consumed_sequence across all consumer groups for its topic. This
-      # guarantees every consumer group has already processed it.
+      # An event is deleted only if its commit_seq is strictly less than the minimum
+      # last_consumed_sequence across all consumer groups for its topic. Offsets now
+      # track commit_seq (SB-2140), so the gate must compare commit_seq, not
+      # sequence. This guarantees every consumer group has already processed it.
       #
       # Events still referenced by a row in outbox_relay_dead_letter_events are
       # preserved: production has a FK on outbox_relay_outbox_event_id with no
@@ -221,7 +222,7 @@ module OutboxRelay
         OutboxRelay::OutboxEvent
           .where('expires_at IS NOT NULL AND expires_at < ?', Time.current)
           .where(
-            "sequence < (
+            "commit_seq < (
               SELECT COALESCE(MIN(last_consumed_sequence), 0)
               FROM outbox_relay_consumer_offsets
               WHERE topic = outbox_relay_outbox_events.topic

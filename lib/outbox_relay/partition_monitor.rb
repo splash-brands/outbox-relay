@@ -254,7 +254,7 @@ module OutboxRelay
       #     them within minutes); they are not pending work.
       query = OutboxEvent
               .where(topic: offset.topic, partition_key: extract_partition_key(offset.consumer_group))
-              .where('sequence > ?', offset.last_consumed_sequence || 0)
+              .where('commit_seq > ?', offset.last_consumed_sequence || 0)
               .not_expired
 
       filter = event_filter_for(offset)

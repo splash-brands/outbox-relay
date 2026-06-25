@@ -15,8 +15,10 @@ module OutboxRelay
   # Advisory locks prevent duplicate processing within the same consumer group.
   # ============================================================================
 
-  # Make critical fields immutable after creation to prevent accidental modification
-  attr_readonly :sequence, :topic, :event_id, :event_name, :partition_key
+  # Make critical fields immutable after creation to prevent accidental modification.
+  # commit_seq is assigned by the database trigger at the COMMIT edge (SB-2140) and
+  # must never be written from Ruby; marking it readonly guards against that.
+  attr_readonly :sequence, :commit_seq, :topic, :event_id, :event_name, :partition_key
 
   # PostgreSQL handles jsonb natively - no need for serialize
   # payload and headers are jsonb columns in the database
@@ -36,6 +38,8 @@ module OutboxRelay
   scope :for_event_name, ->(event_name) { where(event_name: event_name) }
   scope :not_expired, -> { where("expires_at IS NULL OR expires_at > ?", Time.current) }
   scope :by_sequence, -> { order(:sequence) }
+  # Consumer ordering scope (SB-2140): commit_seq is the COMMIT-edge cursor.
+  scope :by_commit_seq, -> { order(:commit_seq) }
 
   # Associations
   # One event can have multiple DLQ entries (one per consumer group that failed)
