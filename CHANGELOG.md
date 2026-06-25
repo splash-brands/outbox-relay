@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-06-25
+
+### Fixed
+
+- **`add_commit_seq` / `harden_commit_seq` migrations failed on PostgreSQL with
+  `syntax error at or near "REFERENCING"` (SB-2140).** 0.10.0 generated a
+  `CONSTRAINT TRIGGER ... REFERENCING NEW TABLE ... FOR EACH STATEMENT`, but
+  PostgreSQL forbids transition tables and `FOR EACH STATEMENT` on a constraint
+  trigger (constraint triggers are `FOR EACH ROW` only). The gem's CI runs on
+  SQLite, so the trigger was never executed and the bug shipped. Rewritten as a
+  **per-row** `DEFERRABLE INITIALLY DEFERRED` constraint trigger operating on
+  `NEW` (assigns via `UPDATE ... WHERE id = NEW.id`).
+- The per-row trigger takes a **per-topic advisory transaction lock**
+  (`pg_advisory_xact_lock`, two-int form — a distinct lock space from the
+  consumer's bigint advisory locks) so commit-edge assignment serializes per topic
+  and concurrent multi-partition transactions (the drainer workload) are
+  **deadlock-free**. The commit-edge ordering guarantee is preserved: per
+  `(topic, partition)`, `commit_seq` order == commit order == visibility order.
+- Generated migrations now wrap their raw `execute` / data backfill in
+  `safety_assured { ... }` so they pass under **strong_migrations** in consuming
+  apps without manual patching.
+- Added a **Postgres integration spec** (`spec/pg/commit_seq_trigger_spec.rb`) plus
+  a `spec_pg` CI job that runs the real DDL against PostgreSQL and asserts
+  assignment, the lost-event race, and deadlock-freedom — closing the CI gap that
+  let the syntax error ship. Runs locally when `OUTBOX_PG_URL` is set.
+
+Upgrading from 0.10.0: re-bump the gem and regenerate the migration
+(`rails generate outbox_relay:add_commit_seq`); the regenerated file replaces the
+broken one. If you have not run the 0.10.0 migration, nothing else is needed.
+
 ## [0.10.0] - 2026-06-25
 
 ### Added — SB-2140 Stage 1 (write-only; consumers still read `sequence`)

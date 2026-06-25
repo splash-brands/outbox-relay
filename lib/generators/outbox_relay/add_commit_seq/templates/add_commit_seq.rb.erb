@@ -14,23 +14,32 @@
 #
 # * outbox_relay_partition_seq — a transactional per-(topic, partition) sequencer.
 # * outbox_relay_outbox_events.commit_seq — the new ordering token (nullable here;
-#   set NOT NULL in a later hardening migration once backfilled + verified).
-# * A DEFERRABLE INITIALLY DEFERRED, statement-level, AFTER INSERT constraint
-#   trigger that assigns commit_seq at the COMMIT edge. The per-partition
-#   sequencer row lock (released only at commit) forces, per (topic, partition):
-#       commit_seq order == commit order == visibility order
-#   so a consumer reading `WHERE commit_seq > offset ORDER BY commit_seq` can
-#   never skip a row. The DEFERRED edge means a long bulk-import transaction holds
-#   the sequencer lock for milliseconds at the very end, not for the whole import.
+#   the optional harden_commit_seq migration adds a fail-loud assert trigger).
+# * A DEFERRABLE INITIALLY DEFERRED, per-ROW, AFTER INSERT constraint trigger that
+#   assigns commit_seq at the COMMIT edge.
 #
-# Consumers still read by `sequence` after this migration — flipping them to
-# `commit_seq` is a separate gem release.
+# ## Trigger shape (why per-row + advisory lock)
+#
+# PostgreSQL only allows DEFERRABLE on a CONSTRAINT TRIGGER, and a CONSTRAINT
+# TRIGGER must be FOR EACH ROW and may NOT use REFERENCING ... TABLE (transition
+# tables) — so the statement-level form is impossible. We therefore use a per-row
+# deferred trigger.
+#
+# A bare per-row trigger that only locks its own partition's sequencer row would
+# DEADLOCK: deferred triggers fire at commit in row-insertion order, each holds a
+# partition row lock until commit, and two concurrent multi-partition transactions
+# on the same topic (the drainer workload) acquire those locks in different orders.
+# To stay deadlock-free we take a per-TOPIC advisory xact lock at the top of the
+# trigger (two-int form — a separate lock space from the consumer's bigint advisory
+# locks). All of a transaction's rows for a topic share that one re-entrant lock,
+# so commit-edge assignment serializes per topic (deadlock-free), while different
+# topics proceed in parallel. First-to-commit takes the lock first, so per
+# (topic, partition): commit_seq order == commit order == visibility order.
 #
 # ## Caveats
 #
-# * Triggers do NOT fire when `session_replication_role = 'replica'` (logical
-#   replication / DMS / blue-green apply). For an app-written outbox this is fine;
-#   any non-app insert path would leave commit_seq NULL.
+# * Triggers do NOT fire under `session_replication_role = 'replica'` (logical
+#   replication / DMS / blue-green apply). For an app-written outbox this is fine.
 # * A bug in the trigger fails publishes at COMMIT (fail-closed; at-least-once
 #   preserved). Verify on staging before production.
 #
@@ -42,18 +51,21 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
 
   def up
     create_partition_seq_table
-    add_column :outbox_relay_outbox_events, :commit_seq, :bigint unless column_exists?(:outbox_relay_outbox_events, :commit_seq)
+    unless column_exists?(:outbox_relay_outbox_events, :commit_seq)
+      add_column :outbox_relay_outbox_events, :commit_seq, :bigint
+    end
 
     # Seed existing partitions and install the trigger atomically under a brief
-    # write-blocking lock (reads are unaffected). This guarantees no INSERT can
-    # slip through between seeding and trigger creation: every post-lock insert
-    # sees the trigger AND a seeded sequencer. The lock is held only for fast DDL
-    # — the heavy backfill of historical rows runs afterwards, unlocked.
+    # write-blocking lock (reads are unaffected). Guarantees no INSERT slips
+    # through between seeding and trigger creation. The lock is held only for fast
+    # DDL — the heavy backfill of historical rows runs afterwards, unlocked.
     transaction do
-      execute "LOCK TABLE outbox_relay_outbox_events IN SHARE ROW EXCLUSIVE MODE"
-      seed_existing_partitions
-      execute create_function_sql
-      execute create_trigger_sql
+      safety_assured do
+        execute "LOCK TABLE outbox_relay_outbox_events IN SHARE ROW EXCLUSIVE MODE"
+        execute seed_existing_partitions_sql
+        execute create_function_sql
+        execute create_trigger_sql
+      end
     end
 
     backfill_historical_rows
@@ -61,8 +73,10 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
   end
 
   def down
-    execute "DROP TRIGGER IF EXISTS outbox_relay_commit_seq_trg ON outbox_relay_outbox_events"
-    execute "DROP FUNCTION IF EXISTS outbox_relay_assign_commit_seq()"
+    safety_assured do
+      execute "DROP TRIGGER IF EXISTS outbox_relay_commit_seq_trg ON outbox_relay_outbox_events"
+      execute "DROP FUNCTION IF EXISTS outbox_relay_assign_commit_seq()"
+    end
     remove_index :outbox_relay_outbox_events, name: "idx_outbox_commit_seq_fetch", if_exists: true
     remove_column :outbox_relay_outbox_events, :commit_seq, if_exists: true
     drop_table :outbox_relay_partition_seq, if_exists: true
@@ -78,10 +92,12 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
       t.integer :partition_id, null: false
       t.bigint  :next_seq,     null: false, default: 0
     end
-    execute <<~SQL
-      ALTER TABLE outbox_relay_partition_seq
-        ADD CONSTRAINT outbox_relay_partition_seq_pkey PRIMARY KEY (topic, partition_id)
-    SQL
+    safety_assured do
+      execute <<~SQL
+        ALTER TABLE outbox_relay_partition_seq
+          ADD CONSTRAINT outbox_relay_partition_seq_pkey PRIMARY KEY (topic, partition_id)
+      SQL
+    end
   end
 
   # Seed every existing (topic, partition_key) sequencer row from the GLOBAL
@@ -89,8 +105,8 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
   # values; seeding from the global max guarantees every post-cutover commit_seq
   # exceeds every existing consumer offset, so the consumer flip needs no
   # offset-row migration. ON CONFLICT DO NOTHING keeps re-runs idempotent.
-  def seed_existing_partitions
-    execute <<~SQL
+  def seed_existing_partitions_sql
+    <<~SQL
       INSERT INTO outbox_relay_partition_seq (topic, partition_id, next_seq)
       SELECT d.topic, d.partition_key,
              (SELECT last_value FROM outbox_relay_outbox_events_sequence)
@@ -105,15 +121,17 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
   # commit_seq), so it never races the live trigger. Batched to bound lock time.
   def backfill_historical_rows
     loop do
-      affected = exec_update(<<~SQL)
-        UPDATE outbox_relay_outbox_events
-           SET commit_seq = sequence
-         WHERE id IN (
-           SELECT id FROM outbox_relay_outbox_events
-            WHERE commit_seq IS NULL
-            LIMIT #{BACKFILL_BATCH_SIZE}
-         )
-      SQL
+      affected = safety_assured do
+        exec_update(<<~SQL)
+          UPDATE outbox_relay_outbox_events
+             SET commit_seq = sequence
+           WHERE id IN (
+             SELECT id FROM outbox_relay_outbox_events
+              WHERE commit_seq IS NULL
+              LIMIT #{BACKFILL_BATCH_SIZE}
+           )
+        SQL
+      end
       break if affected.zero?
     end
   end
@@ -122,10 +140,8 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
     return if index_exists?(:outbox_relay_outbox_events, %i[topic partition_key commit_seq],
                             name: "idx_outbox_commit_seq_fetch")
 
-    # Partial (commit_seq IS NOT NULL) so NULLs during/after backfill are allowed
-    # and so it stays valid before the NOT NULL hardening migration. Serves the
-    # consumer fetch `WHERE topic=? AND partition_key=? AND commit_seq > ? ORDER BY commit_seq`
-    # and proves no per-partition duplicates.
+    # Partial (commit_seq IS NOT NULL) so NULLs during/after backfill are allowed.
+    # Serves the consumer fetch and proves no per-partition duplicates.
     add_index :outbox_relay_outbox_events, %i[topic partition_key commit_seq],
               unique: true,
               where: "commit_seq IS NOT NULL",
@@ -138,53 +154,42 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
       CREATE OR REPLACE FUNCTION outbox_relay_assign_commit_seq()
       RETURNS trigger LANGUAGE plpgsql AS $fn$
       DECLARE
-        part RECORD;
         base bigint;
       BEGIN
-        -- `inserted` is the per-statement transition table: EXACTLY the rows this
-        -- statement inserted in THIS transaction. No global "commit_seq IS NULL"
-        -- scan, so it cannot relabel another transaction's rows.
-        FOR part IN
-          SELECT topic, partition_key, count(*) AS n
-          FROM inserted
-          GROUP BY topic, partition_key
-          ORDER BY topic COLLATE "C", partition_key   -- canonical, collation-stable lock order (deadlock-free)
-        LOOP
-          -- Lock-or-create the sequencer row. UPDATE first (the steady-state hot
-          -- path); on a brand-new (topic, partition) seed it from the GLOBAL
-          -- sequence high-water, which always exceeds every existing commit_seq,
-          -- so a never-seen partition's first event still lands above any offset.
-          LOOP
-            UPDATE outbox_relay_partition_seq
-               SET next_seq = next_seq + part.n
-             WHERE topic = part.topic AND partition_id = part.partition_key
-             RETURNING next_seq INTO base;
-            EXIT WHEN FOUND;
-            BEGIN
-              INSERT INTO outbox_relay_partition_seq (topic, partition_id, next_seq)
-              VALUES (part.topic, part.partition_key,
-                      (SELECT last_value FROM outbox_relay_outbox_events_sequence) + part.n)
-              RETURNING next_seq INTO base;
-              EXIT;
-            EXCEPTION WHEN unique_violation THEN
-              -- A concurrent transaction created the row first; retry the UPDATE.
-            END;
-          END LOOP;
+        -- Defensive: never overwrite an explicitly-set value (Ruby never sets it;
+        -- the backfill uses UPDATE, which does not fire this INSERT trigger).
+        IF NEW.commit_seq IS NOT NULL THEN
+          RETURN NULL;
+        END IF;
 
-          -- Assign commit_seq to this statement's rows for the partition, in
-          -- insertion order (sequence). base is the new high-water (old + n), so
-          -- the block is [base - n + 1 .. base].
-          WITH ordered AS (
-            SELECT i.id, row_number() OVER (ORDER BY i.sequence) AS rn
-            FROM inserted i
-            WHERE i.topic = part.topic AND i.partition_key = part.partition_key
-          )
-          UPDATE outbox_relay_outbox_events e
-             SET commit_seq = base - part.n + ordered.rn
-            FROM ordered
-           WHERE e.id = ordered.id;
+        -- Serialize commit-edge assignment per topic so that, per (topic,
+        -- partition): commit_seq order == commit order == visibility order.
+        -- Two-int advisory form is a distinct lock space from the consumer's
+        -- bigint advisory locks, so they never collide. Per-topic (not
+        -- per-partition) makes multi-partition transactions deadlock-free.
+        PERFORM pg_advisory_xact_lock(hashtext('outbox_relay_commit_seq'), hashtext(NEW.topic));
+
+        -- Lock-or-create this partition's sequencer row. A brand-new partition is
+        -- seeded from the GLOBAL sequence high-water, which exceeds every existing
+        -- commit_seq, so its first event still lands above any consumer offset.
+        LOOP
+          UPDATE outbox_relay_partition_seq
+             SET next_seq = next_seq + 1
+           WHERE topic = NEW.topic AND partition_id = NEW.partition_key
+           RETURNING next_seq INTO base;
+          EXIT WHEN FOUND;
+          BEGIN
+            INSERT INTO outbox_relay_partition_seq (topic, partition_id, next_seq)
+            VALUES (NEW.topic, NEW.partition_key,
+                    (SELECT last_value FROM outbox_relay_outbox_events_sequence) + 1)
+            RETURNING next_seq INTO base;
+            EXIT;
+          EXCEPTION WHEN unique_violation THEN
+            -- A concurrent transaction created the row first; retry the UPDATE.
+          END;
         END LOOP;
 
+        UPDATE outbox_relay_outbox_events SET commit_seq = base WHERE id = NEW.id;
         RETURN NULL;
       END;
       $fn$;
@@ -196,8 +201,7 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
       CREATE CONSTRAINT TRIGGER outbox_relay_commit_seq_trg
         AFTER INSERT ON outbox_relay_outbox_events
         DEFERRABLE INITIALLY DEFERRED
-        REFERENCING NEW TABLE AS inserted
-        FOR EACH STATEMENT
+        FOR EACH ROW
         EXECUTE FUNCTION outbox_relay_assign_commit_seq();
     SQL
   end

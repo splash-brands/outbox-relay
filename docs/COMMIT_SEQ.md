@@ -27,14 +27,13 @@ INSERT), per `(topic, partition_key)`:
 
 - `outbox_relay_partition_seq(topic, partition_id, next_seq)` — a transactional
   per-partition sequencer.
-- A `DEFERRABLE INITIALLY DEFERRED`, statement-level, `AFTER INSERT` constraint
-  trigger (`outbox_relay_commit_seq_trg`) using a `REFERENCING NEW TABLE`
-  transition table. At commit it locks the partition's sequencer row, bumps it by
-  the row count, and assigns `commit_seq` to the statement's rows in `sequence`
-  order.
+- A `DEFERRABLE INITIALLY DEFERRED`, **per-row**, `AFTER INSERT` constraint trigger
+  (`outbox_relay_commit_seq_trg`). At the commit edge each row takes a per-topic
+  advisory lock, bumps its partition's sequencer row, and writes `commit_seq` via
+  `UPDATE ... WHERE id = NEW.id`.
 
-The guarantee: a PostgreSQL row lock is released only at commit, so the partition
-sequencer serializes the **commit edge**. Therefore, per partition:
+The guarantee: the per-topic lock is released only at commit, so it serializes the
+**commit edge** per topic. Therefore, per `(topic, partition)`:
 
 ```
 commit_seq assignment order == commit order == visibility order
@@ -45,21 +44,54 @@ ORDER BY commit_seq` can never see `commit_seq = K` without every `commit_seq < 
 in that partition already being visible. No skip.
 
 `sequence` is kept unchanged — still unique, still used for the advisory-lock key
-and as the intra-transaction tiebreaker (`row_number() OVER (ORDER BY sequence)`).
+and as the intra-transaction tiebreaker (rows fire in insertion = `sequence` order).
 
-### Why DEFERRED matters
+### Why per-row, not statement-level with a transition table
 
-The sequencer lock is taken inside the trigger at the commit edge, **not** when
-`publish()` runs. A 10-minute bulk-import transaction holds the lock for
-milliseconds at its very end, not for the whole import. This is what makes the
-fix indifferent to transaction size and avoids serializing a topic's throughput.
+The deferral is essential: it moves the lock to the COMMIT edge so a long
+bulk-import transaction holds it for milliseconds at the very end, not for the
+whole transaction. But **only a `CONSTRAINT TRIGGER` can be `DEFERRABLE`**, and a
+constraint trigger **must be `FOR EACH ROW`** and **may not use `REFERENCING ...
+TABLE`** (transition tables). PostgreSQL rejects the statement-level form with
+`syntax error at or near "REFERENCING"`. So the trigger is per-row, operating on
+`NEW` (an `AFTER` trigger can't mutate `NEW` in place, hence the
+`UPDATE ... WHERE id = NEW.id`).
 
-### Why per-partition (not a single global sequencer)
+Trade-off vs a hypothetical statement-level trigger: a multi-row insert fires the
+trigger N times instead of once. Correctness over micro-perf; the per-row work is
+a tiny indexed upsert + one-row update.
 
-The serialization is per partition, so unrelated partitions commit concurrently.
-Multi-partition transactions (e.g. the ChangeRelay drainer's 500-event batch)
-acquire sequencer rows in a canonical order (`ORDER BY topic COLLATE "C",
-partition_id`) so they can never deadlock.
+### Deadlock-freedom: the per-topic advisory lock
+
+A bare per-row trigger that only locked its own partition's sequencer row would
+**deadlock**: deferred triggers fire at commit in row-insertion order, each holds
+its partition row lock until commit, and two concurrent multi-partition
+transactions on the same topic (exactly the ChangeRelay drainer workload) acquire
+those locks in different orders. To prevent this, each row first takes a per-topic
+advisory **transaction** lock:
+
+```sql
+PERFORM pg_advisory_xact_lock(hashtext('outbox_relay_commit_seq'), hashtext(NEW.topic));
+```
+
+All of a transaction's rows for one topic share this single re-entrant lock, so
+commit-edge assignment serializes **per topic** (deadlock-free), while different
+topics proceed in parallel. The two-int advisory form is a distinct lock space
+from the consumer's one-arg bigint `pg_try_advisory_lock`, so they never collide.
+
+Residual caveat: a single transaction that publishes to **multiple topics** in an
+order that differs across concurrent transactions could still deadlock on the
+topic advisory locks (PostgreSQL detects it and aborts one; the producer retries).
+Not expected for the per-topic drainer workload; revisit (canonical topic-lock
+ordering) only if it shows up.
+
+### Why not a `NOT NULL` column for hardening
+
+`commit_seq` is NULL during INSERT and only set by the deferred trigger at commit.
+A column `NOT NULL` constraint is checked at insert time and would reject every
+row. The fail-loud safety net (`harden_commit_seq`) is instead a second per-row
+deferred assert trigger (named to fire after the assignment trigger) that
+re-reads the row and raises at commit if `commit_seq` was left unassigned.
 
 ### Why not a `NOT NULL` column for hardening
 
@@ -97,20 +129,28 @@ same `last_consumed_sequence` column to store `commit_seq` — no data migration
 - No cross-partition ordering guarantee — correct for a partitioned log. Do not
   build a cross-partition consumer on `commit_seq`.
 
-## Manual verification (Postgres/Aurora — not in CI)
+## Verification
 
-CI runs on in-memory SQLite (no triggers); it covers the Ruby layer with a
-simulated `commit_seq`. Verify the trigger itself against a real instance:
+The Ruby consumer layer is covered on SQLite with a simulated `commit_seq`. The
+trigger itself is PostgreSQL-only, so it is covered by a **Postgres integration
+spec** (`spec/pg/commit_seq_trigger_spec.rb`) that runs the real generated DDL and
+asserts assignment + commit-edge ordering + deadlock-freedom. CI runs it against a
+Postgres service (`spec_pg` job); locally it runs when `OUTBOX_PG_URL` is set and
+is skipped otherwise. This closes the gap that let the original
+`CONSTRAINT TRIGGER ... REFERENCING ... FOR EACH STATEMENT` syntax error reach a
+release.
 
-1. **Lost-event race.** Open Txn A: `INSERT` one event (low `sequence`), keep
-   open. Open Txn B: `INSERT` one event same partition (higher `sequence`),
-   `COMMIT`. Poll as a consumer (advance offset past B). Now `COMMIT` A. Confirm A
-   is still fetched (its `commit_seq` > B's). Pre-fix, A was skipped.
-2. **Multi-partition batch.** `INSERT` 500 rows across all partitions in one
-   statement; confirm correct per-partition `commit_seq` and no deadlock when two
-   such transactions commit concurrently.
-3. **Long transaction.** Confirm a long-open transaction does not hold the
-   sequencer row lock until its commit edge (`pg_locks` inspection).
-4. **`REFERENCING NEW TABLE` on a `CONSTRAINT TRIGGER`** is accepted on the target
-   Aurora PG version. Fallback: a per-row deferred trigger filtered by
-   `commit_seq IS NULL AND xmin = pg_current_xact_id()::xid`.
+What the PG spec checks:
+
+1. **DDL applies** — the generated function + `CONSTRAINT TRIGGER ... FOR EACH ROW`
+   create cleanly (no syntax error).
+2. **Assignment** — committed rows get monotonic per-partition `commit_seq`.
+3. **Lost-event race** — Txn A inserts (low `sequence`) and stays open; Txn B
+   inserts the same partition (higher `sequence`) and commits; A then commits. A
+   gets the higher `commit_seq` (commit order), and `WHERE commit_seq > offset`
+   never skips it.
+4. **Deadlock-freedom** — concurrent multi-partition transactions on one topic
+   commit without deadlocking.
+
+On real Aurora, additionally sanity-check with `pg_locks` that a long-open
+transaction does not hold its locks until the commit edge.

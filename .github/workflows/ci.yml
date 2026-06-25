@@ -19,10 +19,10 @@ jobs:
         ruby-version: ['3.2', '3.3']
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Ruby ${{ matrix.ruby-version }}
-        uses: ruby/setup-ruby@v1
+        uses: ruby/setup-ruby@9eb537ca036ebaed86729dcb9309076e4c5c3b74 # v1
         with:
           ruby-version: ${{ matrix.ruby-version }}
           bundler-cache: true
@@ -30,14 +30,52 @@ jobs:
       - name: Run tests
         run: bundle exec rspec --format documentation
 
+  spec_pg:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: outbox_relay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Install the optional :pg bundler group and point specs at the service.
+      BUNDLE_WITH: pg
+      OUTBOX_PG_URL: postgres://postgres:postgres@localhost:5432/outbox_relay_test
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install libpq (pg native build)
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@9eb537ca036ebaed86729dcb9309076e4c5c3b74 # v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Run PostgreSQL trigger integration specs
+        run: bundle exec rspec spec/pg --format documentation
+
   lint:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Ruby
-        uses: ruby/setup-ruby@v1
+        uses: ruby/setup-ruby@9eb537ca036ebaed86729dcb9309076e4c5c3b74 # v1
         with:
           ruby-version: '3.3'
           bundler-cache: true
