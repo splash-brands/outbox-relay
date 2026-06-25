@@ -55,17 +55,22 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
       add_column :outbox_relay_outbox_events, :commit_seq, :bigint
     end
 
-    # Seed existing partitions and install the trigger atomically under a brief
-    # write-blocking lock (reads are unaffected). Guarantees no INSERT slips
-    # through between seeding and trigger creation. The lock is held only for fast
-    # DDL — the heavy backfill of historical rows runs afterwards, unlocked.
-    transaction do
-      safety_assured do
-        execute "LOCK TABLE outbox_relay_outbox_events IN SHARE ROW EXCLUSIVE MODE"
-        execute seed_existing_partitions_sql
-        execute create_function_sql
-        execute create_trigger_sql
-      end
+    # Install the trigger. CREATE TRIGGER takes its own brief lock atomically, so
+    # an INSERT is either fully before it (commit_seq NULL → caught by the backfill
+    # below) or fully after (trigger fires) — no half state, no explicit table lock
+    # needed. We do NOT pre-seed existing partitions: the trigger lazily seeds each
+    # partition's sequencer row from the global sequence high-water on its first
+    # insert (same result), which avoids a full-table scan under a write-blocking
+    # lock on a large table.
+    #
+    # CAUTION on very busy tables / long-running transactions: CREATE TRIGGER must
+    # briefly acquire SHARE ROW EXCLUSIVE on the table. If a long transaction (e.g.
+    # a bulk import) is in flight it will wait behind it, and new writes queue
+    # behind the waiting DDL. Run during a quiet window, or set a short lock_timeout
+    # and retry, so a stuck acquisition doesn't stall publishers.
+    safety_assured do
+      execute create_function_sql
+      execute create_trigger_sql
     end
 
     backfill_historical_rows
@@ -100,39 +105,36 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
     end
   end
 
-  # Seed every existing (topic, partition_key) sequencer row from the GLOBAL
-  # sequence high-water — NOT the per-partition max. Offsets are global `sequence`
-  # values; seeding from the global max guarantees every post-cutover commit_seq
-  # exceeds every existing consumer offset, so the consumer flip needs no
-  # offset-row migration. ON CONFLICT DO NOTHING keeps re-runs idempotent.
-  def seed_existing_partitions_sql
-    <<~SQL
-      INSERT INTO outbox_relay_partition_seq (topic, partition_id, next_seq)
-      SELECT d.topic, d.partition_key,
-             (SELECT last_value FROM outbox_relay_outbox_events_sequence)
-      FROM (SELECT DISTINCT topic, partition_key FROM outbox_relay_outbox_events) d
-      ON CONFLICT (topic, partition_id) DO NOTHING
-    SQL
-  end
-
   # Historical rows: commit_seq = sequence. The global sequence ascends, so this
   # is per-partition monotonic and globally unique → satisfies the partial unique
-  # index. Only touches still-NULL rows (post-trigger inserts already have a
-  # commit_seq), so it never races the live trigger. Batched to bound lock time.
+  # index, and stays below the trigger's lazily-seeded new values (which start at
+  # the global high-water), so there is no collision and no race with the live
+  # trigger.
+  #
+  # Batched by PRIMARY KEY range (NOT `WHERE commit_seq IS NULL LIMIT n`): the
+  # IS-NULL form re-scans the growing already-filled prefix every batch — O(n^2)
+  # on a large table. Range batching uses the PK index, stays O(n), and each batch
+  # is its own short autocommit statement (disable_ddl_transaction!). New rows
+  # inserted during the backfill get ids beyond max_id and already have a
+  # commit_seq, so they are never touched (the IS NULL guard double-protects).
   def backfill_historical_rows
-    loop do
-      affected = safety_assured do
-        exec_update(<<~SQL)
+    bounds = safety_assured do
+      exec_query("SELECT MIN(id) AS lo, MAX(id) AS hi FROM outbox_relay_outbox_events WHERE commit_seq IS NULL").first
+    end
+    return if bounds.nil? || bounds["lo"].nil?
+
+    lo = bounds["lo"].to_i
+    max_id = bounds["hi"].to_i
+    while lo <= max_id
+      hi = lo + BACKFILL_BATCH_SIZE - 1
+      safety_assured do
+        execute(<<~SQL)
           UPDATE outbox_relay_outbox_events
              SET commit_seq = sequence
-           WHERE id IN (
-             SELECT id FROM outbox_relay_outbox_events
-              WHERE commit_seq IS NULL
-              LIMIT #{BACKFILL_BATCH_SIZE}
-           )
+           WHERE id BETWEEN #{lo} AND #{hi} AND commit_seq IS NULL
         SQL
       end
-      break if affected.zero?
+      lo = hi + 1
     end
   end
 
