@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-25
+
+### Added — SB-2140 Stage 1 (write-only; consumers still read `sequence`)
+
+This release installs the commit-ordered sequence machinery but **does not change
+consumer behavior** — consumers still fetch and track offsets by `sequence`. It is
+the intermediate step of a staged rollout for the long-transaction offset-skipping
+bug; the consumer cursor flip to `commit_seq` ships in a follow-up release.
+
+Background on the bug: the consumer cursor keys off `sequence`, assigned by
+`nextval` at INSERT (inside the producer transaction) but only visible at COMMIT.
+Under concurrency, assignment order ≠ commit order, so a lower-`sequence` row that
+commits *after* a higher one on the same partition lands below the already-advanced
+high-water offset and is **silently never delivered**. The fix is a second ordering
+token, `commit_seq`, assigned at the COMMIT edge — populated here, consumed later.
+
+- **`commit_seq` — a commit-ordered sequence per `(topic, partition_key)`.**
+  Assigned at the COMMIT edge by a `DEFERRABLE INITIALLY DEFERRED`, statement-level
+  PostgreSQL constraint trigger that serializes on a per-partition sequencer row
+  (`outbox_relay_partition_seq`). Because the sequencer row lock is released only
+  at commit, `commit_seq` order == commit order == visibility order per partition.
+  The DEFERRED edge means a long bulk-import transaction holds the sequencer lock
+  only for milliseconds at commit, not for the whole transaction. The column is
+  written but **not yet read** by any consumer code in this release.
+- **`rails generate outbox_relay:add_commit_seq`** — adds the `commit_seq` column,
+  the `outbox_relay_partition_seq` sequencer, the assignment trigger, the partial
+  unique index `idx_outbox_commit_seq_fetch`, seeds existing partitions from the
+  global sequence high-water, and backfills historical rows with
+  `commit_seq = sequence`. Fresh installs get all of this from the install generator.
+- **`rails generate outbox_relay:harden_commit_seq`** (optional, run last) — adds a
+  second deferred assert trigger that fails loud at COMMIT if any inserted row was
+  left with a NULL `commit_seq` (i.e. the assignment trigger was dropped/disabled).
+  A plain `NOT NULL` column does not work here — `commit_seq` is NULL during INSERT
+  and only set at commit — so the assert trigger is the correct mechanism. Run only
+  after verifying production has no committed NULL `commit_seq` rows.
+
+Caveat: triggers do not fire under `session_replication_role = 'replica'` (logical
+replication / DMS / blue-green apply). An app-written outbox is unaffected. See
+`docs/COMMIT_SEQ.md` for the full design, rollout, and manual Postgres verification
+runbook.
+
 ## [0.9.4] - 2026-05-15
 
 ### Added

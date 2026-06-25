@@ -1,0 +1,51 @@
+# frozen_string_literal: true
+
+# SB-2140 Stage 3 — fail-loud hardening for commit_seq.
+#
+# Installs a second DEFERRABLE INITIALLY DEFERRED, statement-level constraint
+# trigger that runs AFTER the assignment trigger (its name sorts later, so it
+# fires later among same-event deferred triggers) and raises at COMMIT if any
+# row inserted by the statement still has a NULL commit_seq. That only happens if
+# the assignment trigger (outbox_relay_commit_seq_trg) was dropped/disabled — in
+# which case we want a loud, fail-closed error rather than silently un-fetchable
+# NULL rows.
+#
+# Deploy ONLY after add_commit_seq is verified in production (zero committed NULL
+# commit_seq rows).
+#
+# Run with: rails generate outbox_relay:harden_commit_seq
+class HardenCommitSeqOnOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migration_version %>
+  def up
+    execute <<~SQL
+      CREATE OR REPLACE FUNCTION outbox_relay_assert_commit_seq()
+      RETURNS trigger LANGUAGE plpgsql AS $fn$
+      DECLARE
+        missing bigint;
+      BEGIN
+        SELECT count(*) INTO missing FROM inserted WHERE commit_seq IS NULL;
+        IF missing > 0 THEN
+          RAISE EXCEPTION
+            'outbox_relay: commit_seq unassigned for % row(s) — assignment trigger missing or disabled (SB-2140)',
+            missing;
+        END IF;
+        RETURN NULL;
+      END;
+      $fn$;
+    SQL
+
+    # Name sorts after outbox_relay_commit_seq_trg so it fires after assignment.
+    execute <<~SQL
+      CREATE CONSTRAINT TRIGGER outbox_relay_commit_seq_verify_trg
+        AFTER INSERT ON outbox_relay_outbox_events
+        DEFERRABLE INITIALLY DEFERRED
+        REFERENCING NEW TABLE AS inserted
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION outbox_relay_assert_commit_seq();
+    SQL
+  end
+
+  def down
+    execute "DROP TRIGGER IF EXISTS outbox_relay_commit_seq_verify_trg ON outbox_relay_outbox_events"
+    execute "DROP FUNCTION IF EXISTS outbox_relay_assert_commit_seq()"
+  end
+end
