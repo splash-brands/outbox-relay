@@ -112,9 +112,15 @@ same `last_consumed_sequence` column to store `commit_seq` — no data migration
 
 ## Staged rollout
 
-1. **Stage 1 — `rails generate outbox_relay:add_commit_seq`.** DB-only. Consumers
-   still read `sequence`. Verify in prod: `SELECT count(*) FROM
-   outbox_relay_outbox_events WHERE commit_seq IS NULL` is ~0 for committed rows.
+1. **Stage 1 — `rails generate outbox_relay:add_commit_seq` + `rake
+   outbox_relay:backfill_commit_seq`.** The migration is schema-only (column,
+   sequencer, trigger, `CONCURRENTLY` index — no row rewrite); run it in a quiet
+   window or with a short `lock_timeout` since `CREATE TRIGGER` briefly locks the
+   table. Then run the backfill task (batched by PK, idempotent, resumable,
+   throttleable via `[batch_size,sleep_ms]`) to set `commit_seq = sequence` on
+   historical rows. Consumers still read `sequence`. Verify before Stage 2:
+   `SELECT count(*) FROM outbox_relay_outbox_events WHERE commit_seq IS NULL` is 0
+   for committed rows.
 2. **Stage 2 — gem release that flips consumers to `commit_seq`** (fetch, offset
    guard, `update_offset!`, `:latest` seed, all lag queries, cleanup gate).
 3. **Stage 3 — `rails generate outbox_relay:harden_commit_seq`** once verified.

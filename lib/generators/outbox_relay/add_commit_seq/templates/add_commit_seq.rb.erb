@@ -18,6 +18,12 @@
 # * A DEFERRABLE INITIALLY DEFERRED, per-ROW, AFTER INSERT constraint trigger that
 #   assigns commit_seq at the COMMIT edge.
 #
+# This migration is SCHEMA-ONLY and fast — it does NOT backfill existing rows.
+# After it runs, new inserts get commit_seq via the trigger; backfill the
+# historical rows out of band with `rake outbox_relay:backfill_commit_seq`
+# (throttleable, resumable). The backfill must finish before the Stage 2 consumer
+# flip.
+#
 # ## Trigger shape (why per-row + advisory lock)
 #
 # PostgreSQL only allows DEFERRABLE on a CONSTRAINT TRIGGER, and a CONSTRAINT
@@ -47,8 +53,6 @@
 class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migration_version %>
   disable_ddl_transaction!
 
-  BACKFILL_BATCH_SIZE = 10_000
-
   def up
     create_partition_seq_table
     unless column_exists?(:outbox_relay_outbox_events, :commit_seq)
@@ -73,8 +77,18 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
       execute create_trigger_sql
     end
 
-    backfill_historical_rows
     add_commit_seq_index
+
+    # NOTE: historical rows are NOT backfilled here. From now on new inserts get a
+    # commit_seq via the trigger; existing rows stay NULL until you run the
+    # throttleable, resumable backfill task OUT of band:
+    #
+    #   bundle exec rake outbox_relay:backfill_commit_seq
+    #
+    # Keeping a 1M+ row rewrite out of the migration avoids a long, unmonitorable,
+    # un-resumable deploy step. The backfill MUST complete (zero committed NULL
+    # commit_seq) before the Stage 2 consumer flip — Stage 1 consumers still read
+    # `sequence`, so NULLs are harmless until then.
   end
 
   def down
@@ -102,39 +116,6 @@ class AddCommitSeqToOutboxRelayOutboxEvents < ActiveRecord::Migration<%= migrati
         ALTER TABLE outbox_relay_partition_seq
           ADD CONSTRAINT outbox_relay_partition_seq_pkey PRIMARY KEY (topic, partition_id)
       SQL
-    end
-  end
-
-  # Historical rows: commit_seq = sequence. The global sequence ascends, so this
-  # is per-partition monotonic and globally unique → satisfies the partial unique
-  # index, and stays below the trigger's lazily-seeded new values (which start at
-  # the global high-water), so there is no collision and no race with the live
-  # trigger.
-  #
-  # Batched by PRIMARY KEY range (NOT `WHERE commit_seq IS NULL LIMIT n`): the
-  # IS-NULL form re-scans the growing already-filled prefix every batch — O(n^2)
-  # on a large table. Range batching uses the PK index, stays O(n), and each batch
-  # is its own short autocommit statement (disable_ddl_transaction!). New rows
-  # inserted during the backfill get ids beyond max_id and already have a
-  # commit_seq, so they are never touched (the IS NULL guard double-protects).
-  def backfill_historical_rows
-    bounds = safety_assured do
-      exec_query("SELECT MIN(id) AS lo, MAX(id) AS hi FROM outbox_relay_outbox_events WHERE commit_seq IS NULL").first
-    end
-    return if bounds.nil? || bounds["lo"].nil?
-
-    lo = bounds["lo"].to_i
-    max_id = bounds["hi"].to_i
-    while lo <= max_id
-      hi = lo + BACKFILL_BATCH_SIZE - 1
-      safety_assured do
-        execute(<<~SQL)
-          UPDATE outbox_relay_outbox_events
-             SET commit_seq = sequence
-           WHERE id BETWEEN #{lo} AND #{hi} AND commit_seq IS NULL
-        SQL
-      end
-      lo = hi + 1
     end
   end
 
