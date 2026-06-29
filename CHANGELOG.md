@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-06-29
+
+### Added
+
+- **Consumer-group kill switch** — DB-flag enforcement that lets operators disable a consumer group without a deploy (SB-2198).
+  - New model `OutboxRelay::ConsumerControl` reads the `outbox_relay_consumer_controls` table, keyed on the **base** `consumer_group` (no `_pN` partition suffix). The `disabled` boolean is the source of truth (scope `disabled` = `where(disabled: true)`); the `disabled_at` timestamp is audit metadata for when the switch was last flipped. Class helpers `.disabled_consumer_groups` (Set) and `.disabled?(consumer_group)`. Queries defensively rescue `ActiveRecord::StatementInvalid`, so the gem boots and runs normally before the host app provisions the table (kill switch simply inert). The table itself is owned/migrated by the host application (SB-2199).
+  - `Supervisor` enforces the flag: disabled groups are skipped at boot (`#start_workers`), and on every health-check tick (`HEALTH_CHECK_INTERVAL`) the supervisor stops running workers of a newly-disabled group and (re)starts workers of a newly-enabled group — other consumer groups are left untouched. Guards in `#start_worker` and `#restart_fork` ensure crash/backoff restarts cannot revive a disabled group. A flipped row takes effect within one health-check tick.
+  - Instrumentation: emits `outbox_relay.consumer_group.disabled` / `outbox_relay.consumer_group.enabled` notifications on transition (and `disabled` with `phase: 'boot'` for groups already disabled at startup), following the existing `outbox_relay.<category>.<event>` convention so subscribers on `/^outbox_relay\./` (e.g. Datadog) pick them up.
+
 ## [0.9.5] - 2026-06-29
 
 ### Changed

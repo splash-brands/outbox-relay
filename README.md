@@ -767,6 +767,10 @@ outbox_relay.supervisor.boot_incomplete           # Error: Failed worker starts
 outbox_relay.supervisor.fork_error                # Critical: Fork system error
 outbox_relay.supervisor.restart_abandoned         # Error: Excessive restarts
 
+# Consumer Group Kill-Switch Events
+outbox_relay.consumer_group.disabled              # Warning: Group disabled, workers stopped
+outbox_relay.consumer_group.enabled               # Info: Group re-enabled, workers restarting
+
 # Poller Events
 outbox_relay.poller.poll_error                    # Warning: Polling error
 outbox_relay.poller.instrumentation_error         # High: Framework error

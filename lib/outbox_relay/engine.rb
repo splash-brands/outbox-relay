@@ -58,6 +58,7 @@ module OutboxRelay
         # Ensure models are loaded
         require "outbox_relay/models/outbox_event"
         require "outbox_relay/models/consumer_offset"
+        require "outbox_relay/models/consumer_control"
         require "outbox_relay/models/dead_letter_event"
         require "outbox_relay/models/outbox_consumer"
       end
