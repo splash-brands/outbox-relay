@@ -7,9 +7,12 @@ module OutboxRelay
   #
   # Backed by the `outbox_relay_consumer_controls` table (created by the host
   # application, see SB-2199). Each row keys off the BASE consumer_group name
-  # (no `_pN` partition suffix). A row whose `disabled_at` is non-NULL means the
-  # consumer group is currently disabled and the Supervisor must not run any of
-  # its workers.
+  # (no `_pN` partition suffix).
+  #
+  # The `disabled` boolean is the source of truth read by the Supervisor: when
+  # true, the consumer group is disabled and none of its workers may run. The
+  # `disabled_at` timestamp is audit metadata (when the kill switch was last
+  # flipped on) and is maintained by the host app alongside the boolean.
   #
   # ## Defensive table-absence handling
   #
@@ -23,7 +26,8 @@ module OutboxRelay
     validates :consumer_group, presence: true
 
     # Rows representing a currently-disabled consumer group.
-    scope :disabled, -> { where.not(disabled_at: nil) }
+    # Driven by the boolean for a simple, unambiguous read.
+    scope :disabled, -> { where(disabled: true) }
 
     # Set of base consumer_group names that are currently disabled.
     #

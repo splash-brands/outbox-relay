@@ -12,26 +12,33 @@ RSpec.describe OutboxRelay::ConsumerControl do
   end
 
   describe ".disabled scope" do
-    it "returns only rows with a non-NULL disabled_at" do
-      enabled = described_class.create!(consumer_group: "billing", disabled_at: nil)
-      disabled = described_class.create!(consumer_group: "shipping", disabled_at: Time.current)
+    it "returns only rows whose disabled boolean is true" do
+      enabled = described_class.create!(consumer_group: "billing", disabled: false)
+      disabled = described_class.create!(consumer_group: "shipping", disabled: true, disabled_at: Time.current)
 
       expect(described_class.disabled).to include(disabled)
       expect(described_class.disabled).not_to include(enabled)
+    end
+
+    it "ignores disabled_at when the boolean is false" do
+      # disabled_at may linger as audit metadata after re-enabling; the boolean wins.
+      row = described_class.create!(consumer_group: "billing", disabled: false, disabled_at: Time.current)
+
+      expect(described_class.disabled).not_to include(row)
     end
   end
 
   describe ".disabled_consumer_groups" do
     it "returns a Set of base consumer_group names that are disabled" do
-      described_class.create!(consumer_group: "shipping", disabled_at: Time.current)
-      described_class.create!(consumer_group: "monday", disabled_at: Time.current)
-      described_class.create!(consumer_group: "billing", disabled_at: nil)
+      described_class.create!(consumer_group: "shipping", disabled: true, disabled_at: Time.current)
+      described_class.create!(consumer_group: "monday", disabled: true, disabled_at: Time.current)
+      described_class.create!(consumer_group: "billing", disabled: false)
 
       expect(described_class.disabled_consumer_groups).to eq(Set["shipping", "monday"])
     end
 
     it "returns an empty Set when nothing is disabled" do
-      described_class.create!(consumer_group: "billing", disabled_at: nil)
+      described_class.create!(consumer_group: "billing", disabled: false)
 
       expect(described_class.disabled_consumer_groups).to eq(Set.new)
     end
@@ -48,12 +55,12 @@ RSpec.describe OutboxRelay::ConsumerControl do
 
   describe ".disabled?" do
     it "is true for a disabled consumer group" do
-      described_class.create!(consumer_group: "shipping", disabled_at: Time.current)
+      described_class.create!(consumer_group: "shipping", disabled: true, disabled_at: Time.current)
       expect(described_class.disabled?("shipping")).to be(true)
     end
 
     it "is false for an enabled consumer group" do
-      described_class.create!(consumer_group: "billing", disabled_at: nil)
+      described_class.create!(consumer_group: "billing", disabled: false)
       expect(described_class.disabled?("billing")).to be(false)
     end
 

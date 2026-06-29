@@ -80,11 +80,12 @@ ActiveRecord::Schema.define do
 
   create_table :outbox_relay_consumer_controls, force: true do |t|
     t.string :consumer_group, null: false
+    t.boolean :disabled, null: false, default: false
     t.datetime :disabled_at
     t.timestamps
 
     t.index :consumer_group, unique: true, name: "index_consumer_controls_unique"
-    t.index :disabled_at
+    t.index :disabled
   end
 
   create_table :outbox_relay_processes, force: true do |t|
