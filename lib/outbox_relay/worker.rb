@@ -21,12 +21,11 @@ module OutboxRelay
   # ## Dynamic Polling (Solid Queue Pattern)
   #
   # Workers adjust their polling interval based on workload:
-  #   - Significant backlog (lag > batch_size): 10ms delay
-  #   - Some backlog (lag > 0): 100ms delay
+  #   - Backlog or some pending work (lag > 0): 100ms delay
   #   - No backlog: Full polling_interval (default 1s)
   #
   # This provides:
-  #   - Low latency when busy (10ms-100ms)
+  #   - Low latency when busy (100ms)
   #   - Low CPU usage when idle (1s between polls)
   #
   # ## Safety Mechanisms
@@ -185,19 +184,17 @@ module OutboxRelay
     # ## Solid Queue Pattern
     #
     # Instead of fixed polling interval, dynamically adjust based on workload:
-    #   - Heavy load: Poll fast (10ms) for low latency
-    #   - Some load: Poll medium (100ms) for balance
+    #   - Backlog or some load: Poll medium (100ms) for balance
     #   - Idle: Poll slow (1s default) for low CPU usage
     #
     # ## Delay Values Explained
     #
-    # - **10ms**: Minimum safe delay to prevent tight loop (1% CPU overhead)
-    #   Used when lag > batch_size (significant backlog detected)
-    #   Achieves ~10-20ms end-to-end latency under load
-    #
-    # - **100ms**: Balanced delay for moderate workload
-    #   Used when lag > 0 (some events pending)
-    #   Good compromise: responsive but not aggressive
+    # - **100ms**: Balanced delay for any pending work (floor)
+    #   Used when lag > batch_size (significant backlog) and when lag > 0.
+    #   A 10ms floor here hammered PG at ~6700 lag-count qps cluster-wide
+    #   (10ms × 67 workers/task × 3 tasks) even when consumers were dead.
+    #   100ms drops that to ~670 qps total (~10x cheaper) with no perceptible
+    #   latency cost: batch_size rows/poll = ~1000 events/sec/worker headroom.
     #
     # - **1s** (polling_interval): Idle polling
     #   Used when lag = 0 (no backlog)
@@ -206,10 +203,10 @@ module OutboxRelay
     # ## Performance Characteristics
     #
     # Under load (1000 events/sec):
-    #   - Polls every 10ms → 100 polls/sec
-    #   - Each batch processes 100 events
-    #   - Throughput: 10,000 events/sec/worker
-    #   - Latency: 10-20ms average
+    #   - Polls every 100ms → 10 polls/sec
+    #   - Each batch processes 100 events (batch_size)
+    #   - Throughput: ~1000 events/sec/worker headroom
+    #   - Latency: ~100ms average
     #
     # When idle (0 events):
     #   - Polls every 1s → 1 poll/sec
@@ -221,8 +218,11 @@ module OutboxRelay
         lag = consumer.lag
 
         if lag > batch_size
-          # Significant backlog - poll again immediately
-          0.01 # 10ms delay to prevent tight loop
+          # Significant backlog - poll on the 100ms floor.
+          # 10ms hammered PG at ~6700 lag-count qps cluster-wide even when
+          # consumers were dead; 100ms is ~10x cheaper with no perceptible
+          # latency cost (batch_size rows/poll = 1000 events/sec/worker headroom).
+          0.1 # 100ms floor
         elsif lag.positive?
           # Some events pending - poll quickly
           0.1 # 100ms delay
