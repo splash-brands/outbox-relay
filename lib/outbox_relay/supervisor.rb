@@ -38,6 +38,7 @@ module OutboxRelay
       @restart_backoff_until = {}      # Track when worker can restart
       @failed_worker_starts = []       # Track workers that failed to start
       @last_health_check = Time.current # Track last partition health check
+      @disabled_consumer_groups = Set.new # Base consumer_groups disabled via kill switch
 
       super()
     end
@@ -99,7 +100,15 @@ module OutboxRelay
     def start_workers
       total_expected = configuration.workers.sum(&:partition_count)
 
+      # Load the kill-switch state once before forking. Disabled consumer groups
+      # are skipped here and guarded again in #start_worker so crash/backoff
+      # restarts cannot bring them back while disabled.
+      @disabled_consumer_groups = ConsumerControl.disabled_consumer_groups
+      announce_disabled_consumer_groups_at_boot
+
       configuration.workers.each do |worker_config|
+        next if consumer_group_disabled?(worker_config.consumer_group)
+
         worker_config.partitions.each do |partition_key|
           start_worker(worker_config, partition_key)
         end
@@ -214,6 +223,12 @@ module OutboxRelay
     #   Total: ~1.3GB RAM minimum
     #
     def start_worker(worker_config, partition_key)
+      # Kill switch: never fork a worker whose consumer group is disabled.
+      # This single guard covers the initial boot, crash restarts, and
+      # backoff restarts. Re-enable works because #enforce_consumer_controls
+      # removes the group from @disabled_consumer_groups before restarting.
+      return if consumer_group_disabled?(worker_config.consumer_group)
+
       worker_params = worker_config.instantiate(partition_key: partition_key).merge(
         polling_interval: configuration.polling_interval,
         batch_size: configuration.batch_size,
@@ -301,7 +316,10 @@ module OutboxRelay
 
         reap_and_restart_terminated_forks
         restart_workers_after_backoff
-        check_partition_health if should_check_health?
+        if should_check_health?
+          enforce_consumer_controls
+          check_partition_health
+        end
         interruptible_sleep(1.second)
       end
     ensure
@@ -323,6 +341,104 @@ module OutboxRelay
 
     def health_check_interval
       configuration.monitoring_config[:orphan_check_interval]&.seconds || DEFAULT_HEALTH_CHECK_INTERVAL
+    end
+
+    # ============================================================================
+    # Consumer Group Kill Switch
+    # ============================================================================
+    # DB-flag enforcement: the `outbox_relay_consumer_controls` table (managed by
+    # the host app) marks base consumer_groups as disabled. On each health-check
+    # tick we diff the current disabled set against what we last enforced and:
+    #   - stop running workers of newly-disabled groups (they are not restarted,
+    #     thanks to the guards in #start_worker / #restart_fork)
+    #   - restart workers of newly-enabled groups
+    #   - emit a transition notification for each change
+    # Other consumer groups are left untouched.
+
+    def consumer_group_disabled?(consumer_group)
+      @disabled_consumer_groups.include?(consumer_group)
+    end
+
+    def enforce_consumer_controls
+      previous = @disabled_consumer_groups
+      current = ConsumerControl.disabled_consumer_groups
+      @disabled_consumer_groups = current
+
+      newly_disabled = current - previous
+      newly_enabled = previous - current
+      return if newly_disabled.empty? && newly_enabled.empty?
+
+      newly_disabled.each do |consumer_group|
+        Instrumentation::ConsumerGroup.disabled(consumer_group: consumer_group)
+        stop_workers_for_consumer_group(consumer_group)
+      end
+
+      newly_enabled.each do |consumer_group|
+        Instrumentation::ConsumerGroup.enabled(consumer_group: consumer_group)
+        start_workers_for_consumer_group(consumer_group)
+      end
+    rescue StandardError => e
+      # Never let kill-switch enforcement take down the supervisor.
+      OutboxRelay.logger.error(
+        event_name: 'consumer_control_enforcement_failed',
+        error: e.message,
+        error_class: e.class.name,
+        backtrace: e.backtrace&.first(5)&.join("\n")
+      )
+    end
+
+    # Send TERM to every running worker belonging to the given consumer group.
+    # Terminated workers are reaped by the main loop and NOT restarted, because
+    # the group is now in @disabled_consumer_groups (see #restart_fork).
+    def stop_workers_for_consumer_group(consumer_group)
+      pids = worker_configs.select { |_pid, wc| wc.consumer_group == consumer_group }.keys
+      return if pids.empty?
+
+      OutboxRelay.logger.info(
+        event_name: 'consumer_group_workers_stopping',
+        consumer_group: consumer_group,
+        worker_pids: pids,
+        reason: 'kill switch disabled consumer group'
+      )
+
+      signal_processes(pids, :TERM)
+    end
+
+    # Start all configured workers for a consumer group that was just re-enabled.
+    # @disabled_consumer_groups no longer contains it, so the #start_worker guard
+    # passes. Partition claiming prevents duplicate processing if a stopped
+    # worker has not finished terminating yet.
+    def start_workers_for_consumer_group(consumer_group)
+      OutboxRelay.logger.info(
+        event_name: 'consumer_group_workers_starting',
+        consumer_group: consumer_group,
+        reason: 'kill switch re-enabled consumer group'
+      )
+
+      configuration.workers.each do |worker_config|
+        next unless worker_config.consumer_group == consumer_group
+
+        worker_config.partitions.each do |partition_key|
+          start_worker(worker_config, partition_key)
+        end
+      end
+    end
+
+    # At boot, surface any consumer groups that are already disabled so monitoring
+    # reflects the kill-switch state. These are already in @disabled_consumer_groups
+    # so the first health-check tick will not re-emit them as "newly disabled".
+    def announce_disabled_consumer_groups_at_boot
+      configured_groups = configuration.workers.map(&:consumer_group).uniq
+      configured_groups.each do |consumer_group|
+        next unless consumer_group_disabled?(consumer_group)
+
+        OutboxRelay.logger.warn(
+          event_name: 'consumer_group_disabled_at_boot',
+          consumer_group: consumer_group,
+          message: 'Consumer group disabled via kill switch - workers will not start'
+        )
+        Instrumentation::ConsumerGroup.disabled(consumer_group: consumer_group, phase: 'boot')
+      end
     end
 
     def check_partition_health
@@ -448,6 +564,22 @@ module OutboxRelay
 
           # Restart the worker unless we're shutting down
           unless stopped?
+            # Kill switch: if this worker's consumer group has been disabled,
+            # let it stay dead. Clear any restart bookkeeping so it neither
+            # restarts now nor lingers in the backoff queue.
+            if consumer_group_disabled?(worker_config.consumer_group)
+              @restart_attempts.delete(worker_key)
+              @restart_backoff_until.delete(worker_key)
+              OutboxRelay.logger.info(
+                event_name: 'worker_not_restarted_consumer_group_disabled',
+                supervisor_pid: ::Process.pid,
+                worker_name: fork_info[:worker]&.name,
+                consumer_group: worker_config.consumer_group,
+                partition_key: fork_info[:partition_key]
+              )
+              return
+            end
+
             if status.success?
               # Reset backoff on successful exit
               @restart_attempts.delete(worker_key)

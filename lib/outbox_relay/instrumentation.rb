@@ -397,6 +397,46 @@ module OutboxRelay
       end
     end
 
+    # ConsumerGroup - Kill-switch lifecycle events for consumer groups.
+    #
+    # Emitted by the Supervisor when a consumer group is disabled or re-enabled
+    # via the `outbox_relay_consumer_controls` kill switch. Applications subscribe
+    # to route these to their monitoring backend (e.g. Datadog).
+    #
+    # @example Subscribe to kill-switch transitions
+    #   ActiveSupport::Notifications.subscribe(/^outbox_relay\.consumer_group\./) do |name, _, _, _, payload|
+    #     StatsD.event("OutboxRelay #{name}", "consumer_group=#{payload[:consumer_group]}")
+    #   end
+    module ConsumerGroup
+      # Emitted when a consumer group is disabled and its workers are stopped.
+      #
+      # @param consumer_group [String] base consumer group name (no `_pN` suffix)
+      # @param context [Hash] extra payload (e.g. phase: 'boot')
+      def self.disabled(consumer_group:, **context)
+        Instrumentation.message(
+          'consumer_group.disabled',
+          'Consumer group disabled via kill switch - workers stopped',
+          consumer_group: consumer_group,
+          severity: 'warning',
+          **context
+        )
+      end
+
+      # Emitted when a consumer group is re-enabled and its workers are restarted.
+      #
+      # @param consumer_group [String] base consumer group name (no `_pN` suffix)
+      # @param context [Hash] extra payload
+      def self.enabled(consumer_group:, **context)
+        Instrumentation.message(
+          'consumer_group.enabled',
+          'Consumer group re-enabled via kill switch - workers restarting',
+          consumer_group: consumer_group,
+          severity: 'info',
+          **context
+        )
+      end
+    end
+
     module Runnable
       def self.reconnect_error(exception, process_id:, attempt:, max_attempts:)
         Instrumentation.error(

@@ -78,6 +78,15 @@ ActiveRecord::Schema.define do
     t.index :created_at
   end
 
+  create_table :outbox_relay_consumer_controls, force: true do |t|
+    t.string :consumer_group, null: false
+    t.datetime :disabled_at
+    t.timestamps
+
+    t.index :consumer_group, unique: true, name: "index_consumer_controls_unique"
+    t.index :disabled_at
+  end
+
   create_table :outbox_relay_processes, force: true do |t|
     t.string :kind, null: false
     t.string :name, null: false
@@ -147,6 +156,7 @@ RSpec.configure do |config|
   config.before(:each) do
     OutboxRelay::OutboxEvent.delete_all
     OutboxRelay::ConsumerOffset.delete_all
+    OutboxRelay::ConsumerControl.delete_all
     OutboxRelay::DeadLetterEvent.delete_all
     OutboxRelay::Process.delete_all
   end
