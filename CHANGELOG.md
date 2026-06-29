@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-06-29
+
+### Changed
+
+- **Worker high-lag polling floor raised from 10ms to 100ms** (`Worker#calculate_next_delay`). When `lag > batch_size`, workers previously polled every 10ms. At 67 workers/task × 3 tasks that sustained ~6700 lag-count queries/sec cluster-wide even when consumers were dead. The 100ms floor cuts this ~10× to ~670 qps with no perceptible latency cost: `batch_size` rows per poll still gives ~1000 events/sec/worker of headroom (SB-1981).
+
 ## [0.9.4] - 2026-05-15
 
 ### Added
